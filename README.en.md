@@ -4,9 +4,9 @@
 
 **Your library, wherever you read.** A standalone Linux desktop application for organizing ebooks, reading EPUBs, and preparing files for ereaders.
 
-[Français](README.md) · [Downloads](https://github.com/QrCommunication/library-manager/releases) · [Architecture](docs/BLUEPRINT.md) · [Issues](https://github.com/QrCommunication/library-manager/issues)
+[Français](README.md) · [Downloads](https://github.com/QrCommunication/library-manager/releases/tag/v0.1.0) · [Architecture](docs/BLUEPRINT.md) · [Issues](https://github.com/QrCommunication/library-manager/issues)
 
-Developed by QR Communication under **GPL-3.0**. The Rust engine, SQLite database, and MOBI converter are bundled. **Calibre, Node, and Python are not required to run release packages.**
+Developed by QR Communication under **GPL-3.0**. The Rust engine, SQLite database, and MOBI converter are bundled. **Calibre, Node, Rust, and Python are not required to run release packages.**
 
 ## Library
 
@@ -61,9 +61,36 @@ The EPUB reader includes a table of contents and saved position. Book HTML is sa
 
 ## Installation
 
-**DEB and RPM** packages are published in [GitHub releases](https://github.com/QrCommunication/library-manager/releases). Release notes specify architecture, tested distributions, and SHA-256 checksums.
+Download the **DEB, RPM, or AppImage** from the [v0.1.0 release](https://github.com/QrCommunication/library-manager/releases/tag/v0.1.0). These packages target **Linux x86_64 (AMD64)** and are built on **Ubuntu 22.04 with glibc 2.35**. They require glibc 2.35 or newer and compatible GTK/WebKit system libraries. See [the validation report](docs/QUALITY.md) for the environments actually tested and the remaining limits.
 
-On Debian, Ubuntu, and derivatives, install the downloaded DEB using `sudo apt install ./package.deb`. On Fedora and RPM distributions, use `sudo dnf install ./package.rpm`. Replace the filename with the downloaded package. The package manager installs required GTK/WebKit system libraries. Launch **Library Manager** from the applications menu.
+On Debian, Ubuntu, and derivatives, install the downloaded DEB:
+
+```sh
+sudo apt install ./library-manager_0.1.0_amd64.deb
+```
+
+On Fedora and compatible RPM distributions:
+
+```sh
+sudo dnf install ./library-manager-0.1.0-1.x86_64.rpm
+```
+
+The package manager installs required GTK/WebKit system libraries and `ca-certificates` for HTTPS connections. Launch **Library Manager** from the applications menu.
+
+For the AppImage, make the downloaded file executable and start it:
+
+```sh
+chmod +x ./library-manager_0.1.0_amd64.AppImage
+./library-manager_0.1.0_amd64.AppImage
+```
+
+The AppImage uses the host operating system's libraries, services, and trusted certificate store. If FUSE is unavailable, start it in extraction mode:
+
+```sh
+APPIMAGE_EXTRACT_AND_RUN=1 ./library-manager_0.1.0_amd64.AppImage
+```
+
+It needs no Calibre installation or Node, Rust, or Python runtime. Release assets include SHA-256 checksums.
 
 ## Localization
 
@@ -86,4 +113,4 @@ Library data and conversations are stored locally. AI requests send relevant met
 
 Never attach keys or private books to an issue. See [SECURITY.md](SECURITY.md) and [THIRD_PARTY.md](docs/THIRD_PARTY.md) for bundled-engine licensing.
 
-Automated tests, package verification, and physical-device tests are separate evidence. Release notes describe their actual scope.
+Automated tests, package verification, and physical-device tests are separate evidence. The [validation report](docs/QUALITY.md) records their actual scope, known dependency alerts, and device-testing limits.

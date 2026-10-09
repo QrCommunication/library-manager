@@ -12,13 +12,14 @@ Application Linux autonome : aucun Calibre externe à installer. GPL-3.0, dépô
 - [x] Appareils USB/SD, détection des livres présents et transferts.
 - [x] Connecteurs CrossPoint HTTP et protocole Calibre sans fil autonome.
 - [x] Identité graphique, bibliothèque, lecteur, filtres, paramètres et langues.
-- [ ] Tests, revue sécurité, non-régression et vérification de l’interface.
-- [ ] Documentation FR/EN, packaging DEB/RPM et publication vérifiée.
+- [x] Tests, revue sécurité, non-régression et interface native sur le périmètre documenté.
+- [x] Documentation FR/EN et packaging DEB/RPM/AppImage.
+- [ ] Publication de la version et vérification des téléchargements publics.
 
 ## Avancement vérifié
 
 - 33 commandes IPC, cinq événements et 356 traductions FR/EN ; contrôle TypeScript/Svelte sans erreur ni avertissement, 22 tests frontend réussis.
-- Noyau SQLite/recherche/EPUB/optimisation/stockage/appareils/Web/conversion/fournisseurs/lecteur/enrichissement/import/chat/paramètres/Manager : 157 tests intégrés réussis sous Rust 1.99.0, Clippy all-targets sans avertissement ; un smoke réseau explicitement ignoré par défaut.
+- Noyau SQLite/recherche/EPUB/optimisation/stockage/appareils/Web/conversion/fournisseurs/lecteur/enrichissement/import/chat/paramètres/Manager : 158 tests intégrés réussis sous Rust 1.99.0 ; un smoke réseau explicitement ignoré par défaut. Les huit tests du shell Tauri passent et Clippy workspace/all-targets ne rapporte aucun avertissement.
 - Collection réelle : 133 EPUB catalogués en lecture seule, 133 aperçus textuels, 130 validations de structure et 3 avertissements explicites.
 - Import réel dans un profil temporaire privé : 133 livres et originaux, 130 variantes normalisées, 133 couvertures, zéro erreur ; 133 réimports dédoublonnés avec IDs identiques, SHA-256 des 133 sources inchangés et concordants avec les originaux. Sept livres restent à revoir (huit avertissements), sans appel IA ni écriture sur carte.
 - Moteur MOBI embarqué : libmobi 0.12 compilé, testé et sans dépendance Calibre ; MOBI6 natif validé par un second parseur, dont texte multilingue et image.
@@ -29,13 +30,19 @@ Application Linux autonome : aucun Calibre externe à installer. GPL-3.0, dépô
 - Identité graphique, tokens CSS, shell et vues bibliothèque, fiche du livre, appareils, chat, paramètres, activité et lecteur intégrés ; parcours de démonstration vérifiés dans le navigateur.
 - Calibre sans fil : cinq tests de protocole réussis, dont conservation d’un fichier modifié après interruption et vérification de taille/SHA-256 avant nettoyage.
 - Revue de sécurité et seconde vérification : le défaut de nettoyage identifié est corrigé et couvert ; limites du protocole et de la revue documentées.
-- Scripts de notices et de smoke natif : cinq tests purs réussis chacun ; 648 dépendances inventoriées, notices Linux runtime manquantes intégrées et 43 limites d’inventaire de sources explicitement indiquées.
+- Scripts de notices : sept tests purs réussis ; smoke natif : neuf tests purs réussis. Les 647 dépendances du graphe actif sont inventoriées, les notices Linux runtime manquantes sont intégrées et les 43 limites d’inventaire de sources restent explicitement indiquées.
 - Chat persistant : neuf tests ciblés réussis, recherche de bibliothèque validée et contexte borné ; aucune exécution de commandes ou de SQL produit par le modèle.
 - Bibliothèque : huit tests de parcours réussis, variantes et journal transactionnels, corrections avec contrôle de révision, annulation avant publication et conservation de la progression de lecture.
 - Environnement de packaging Ubuntu 22.04 isolé, Node 26.11.1, pnpm 10.33.0, Rust 1.99.0 ; aucune installation Calibre dans cet environnement.
+- Paquets finaux DEB, RPM et AppImage construits depuis [3e6177b](https://github.com/QrCommunication/library-manager/commit/3e6177b1241e35e3ef1cdf2ac6b6466d5742f775). Démarrage CLI, chargeur dynamique et moteur MOBI vérifiés sans installation Calibre, Node ou Rust.
+- DEB final installé sur Ubuntu 22.04 vierge : certificats `ca-certificates` installés automatiquement depuis un magasin absent, puis dix étapes GUI réussies, deux cartes visibles et capture sauvegardée.
+- RPM final installé dans Fedora 44 : dix étapes GUI réussies, deux cartes visibles et capture sauvegardée.
+- DEB natif : dix parcours réussis, dont import/dédoublonnage, conversions explicites, lecteur/progression, optimisation Xteink, contrôle de révision/annulation d’opération, attente IA sans configuration et langue conservée après redémarrage. Deux cartes de livres sont rendues et la capture est sauvegardée.
+- Contenu de l’AppImage extrait et lancé via AppRun : dix parcours réussis. Le redémarrage de l’enveloppe extract-and-run reste une limite du harness WebDriver documentée ; ce résultat ne vaut pas validation de ce parcours de l’enveloppe.
+- CI de 3e6177b : analyse CodeQL terminée avec succès ; construction Linux des paquets encore en cours. Ce statut d’exécution ne ferme pas les alertes ouvertes décrites dans le rapport de qualité.
 - Dépôt public initialisé, licence GPL-3.0 reconnue par GitHub.
 
-Les éléments ci-dessus ne constituent pas encore une validation de l'application native complète.
+Le [rapport de qualité](QUALITY.md) détaille ces preuves, les avertissements de sécurité et les limites du périmètre. Aucun appel fournisseur payant ni essai d’écriture sur liseuse physique n’est revendiqué. La publication et le téléchargement public des artefacts restent à vérifier.
 
 ## Règles de validation
 

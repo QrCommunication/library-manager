@@ -63,21 +63,36 @@ Le lecteur EPUB propose un sommaire et une position sauvegardée. Le contenu du 
 
 ## Installation
 
-Les paquets **DEB et RPM** sont publiés dans les [versions GitHub](https://github.com/QrCommunication/library-manager/releases). Consultez les notes de la version pour l’architecture, les distributions testées et les sommes SHA-256.
+Téléchargez les paquets **DEB, RPM ou AppImage** dans la [version v0.1.0](https://github.com/QrCommunication/library-manager/releases/tag/v0.1.0). Cette version cible Linux **x86_64 (64 bits)** et utilise Ubuntu 22.04, avec glibc 2.35, comme base de compilation. Les notes de version indiquent les distributions testées et les sommes SHA-256.
 
 Debian, Ubuntu et dérivés :
 
 ```sh
-sudo apt install ./paquet.deb
+sudo apt install ./library-manager_0.1.0_amd64.deb
 ```
 
 Fedora et distributions RPM :
 
 ```sh
-sudo dnf install ./paquet.rpm
+sudo dnf install ./library-manager-0.1.0-1.x86_64.rpm
 ```
 
-Remplacez le nom par celui du paquet téléchargé. Le gestionnaire de paquets installe les bibliothèques système GTK/WebKit nécessaires. Après installation, lancez **Library Manager** depuis le menu des applications.
+Le gestionnaire de paquets installe les bibliothèques système GTK/WebKit, leurs dépendances et le magasin de certificats TLS `ca-certificates`, nécessaire aux connexions HTTPS. Après installation, lancez **Library Manager** depuis le menu des applications. Aucun environnement Node, Python, Rust ou Calibre n’est requis.
+
+AppImage, sans installation du paquet :
+
+```sh
+chmod +x ./library-manager_0.1.0_amd64.AppImage
+./library-manager_0.1.0_amd64.AppImage
+```
+
+L’AppImage utilise les bibliothèques compatibles et le magasin de certificats du système. Son montage classique nécessite FUSE. Si FUSE n’est pas disponible, essayez le mode d’extraction et d’exécution :
+
+```sh
+APPIMAGE_EXTRACT_AND_RUN=1 ./library-manager_0.1.0_amd64.AppImage
+```
+
+Consultez le [rapport de qualité](docs/QUALITY.md) pour les vérifications effectuées et les limites des essais.
 
 ## Français, anglais et autres langues
 
