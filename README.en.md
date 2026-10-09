@@ -4,7 +4,7 @@
 
 **Your library, wherever you read.** A standalone Linux desktop application for organizing ebooks, reading EPUBs, and preparing files for ereaders.
 
-[Français](README.md) · [Downloads](https://github.com/QrCommunication/library-manager/releases/tag/v0.1.0) · [Architecture](docs/BLUEPRINT.md) · [Issues](https://github.com/QrCommunication/library-manager/issues)
+[Français](README.md) · [Downloads](https://github.com/QrCommunication/library-manager/releases/tag/v0.1.1) · [Architecture](docs/BLUEPRINT.md) · [Issues](https://github.com/QrCommunication/library-manager/issues)
 
 Developed by QR Communication under **GPL-3.0**. The Rust engine, SQLite database, and MOBI converter are bundled. **Calibre, Node, Rust, and Python are not required to run release packages.**
 
@@ -33,9 +33,11 @@ See [provider documentation](docs/PROVIDERS.md) and [metadata policy](docs/METAD
 
 Mounted USB/SD volumes are detected and indexed. Books already present on a connected device are highlighted and filterable. Disconnecting removes current-device presence immediately. MTP devices are available when the Linux desktop has already mounted them through GVfs.
 
+USB inventory progress follows the amount of data actually read. Detected books appear as the inventory advances. Books stored only on the reader are marked in the library: import one book or all books missing from the local catalog, while preserving the files on the card. Results distinguish successful imports, duplicates, and rejected files.
+
 The **CrossPoint** connector talks directly to the firmware's HTTP transfer service on your LAN. Enable file-transfer mode on the reader and enter its address. No Calibre installation is needed. Transfers verify their contents and do not silently overwrite existing files.
 
-An **integrated Calibre wireless server** also accepts compatible clients such as KOReader's Calibre plugin. Start it explicitly in Readers, using the computer's LAN address and port 9090. This version uses an address configured manually; UDP discovery and physical-reader trials are not yet validated. The protocol is implemented inside Library Manager, with no Calibre installation.
+An **integrated Calibre wireless server** also accepts compatible clients such as KOReader's Calibre plugin. Start it explicitly in Readers, using the computer's LAN address and port 9090. This version uses an address configured manually; UDP discovery and physical trials of this wireless protocol are not yet validated. The protocol is implemented inside Library Manager, with no Calibre installation.
 
 | EPUB profile | Purpose |
 | --- | --- |
@@ -61,18 +63,18 @@ The EPUB reader includes a table of contents and saved position. Book HTML is sa
 
 ## Installation
 
-Download the **DEB, RPM, or AppImage** from the [v0.1.0 release](https://github.com/QrCommunication/library-manager/releases/tag/v0.1.0). These packages target **Linux x86_64 (AMD64)** and are built on **Ubuntu 22.04 with glibc 2.35**. They require glibc 2.35 or newer and compatible GTK/WebKit system libraries. See [the validation report](docs/QUALITY.md) for the environments actually tested and the remaining limits.
+Download the **DEB, RPM, or AppImage** from the [v0.1.1 release](https://github.com/QrCommunication/library-manager/releases/tag/v0.1.1). These packages target **Linux x86_64 (AMD64)** and are built on **Ubuntu 22.04 with glibc 2.35**. They require glibc 2.35 or newer and compatible GTK/WebKit system libraries. See [the validation report](docs/QUALITY.md) for the environments actually tested and the remaining limits.
 
 On Debian, Ubuntu, and derivatives, install the downloaded DEB:
 
 ```sh
-sudo apt install ./library-manager_0.1.0_amd64.deb
+sudo apt install ./library-manager_0.1.1_amd64.deb
 ```
 
 On Fedora and compatible RPM distributions:
 
 ```sh
-sudo dnf install ./library-manager-0.1.0-1.x86_64.rpm
+sudo dnf install ./library-manager-0.1.1-1.x86_64.rpm
 ```
 
 The package manager installs required GTK/WebKit system libraries and `ca-certificates` for HTTPS connections. Launch **Library Manager** from the applications menu.
@@ -80,14 +82,14 @@ The package manager installs required GTK/WebKit system libraries and `ca-certif
 For the AppImage, make the downloaded file executable and start it:
 
 ```sh
-chmod +x ./library-manager_0.1.0_amd64.AppImage
-./library-manager_0.1.0_amd64.AppImage
+chmod +x ./library-manager_0.1.1_amd64.AppImage
+./library-manager_0.1.1_amd64.AppImage
 ```
 
 The AppImage uses the host operating system's libraries, services, and trusted certificate store. If FUSE is unavailable, start it in extraction mode:
 
 ```sh
-APPIMAGE_EXTRACT_AND_RUN=1 ./library-manager_0.1.0_amd64.AppImage
+APPIMAGE_EXTRACT_AND_RUN=1 ./library-manager_0.1.1_amd64.AppImage
 ```
 
 It needs no Calibre installation or Node, Rust, or Python runtime. Release assets include SHA-256 checksums.

@@ -1,8 +1,61 @@
-# Qualité et validations de Library Manager 0.1.0
+# Qualité et validations de Library Manager
+
+## Version 0.1.1 — inventaire USB et import depuis la liseuse
+
+État au 9 octobre 2026. Les sources de cette correction sont figées dans [739d3dd](https://github.com/QrCommunication/library-manager/commit/739d3ddf874b794dbe762027dd3df7c4ee1d3269). L’inventaire USB publie les étapes et les octets effectivement lus ; les livres présents uniquement sur la liseuse apparaissent dans la bibliothèque et peuvent être importés individuellement ou par lot. Les détails du suivi figurent dans [DEVICE_INVENTORY_PLAN.md](DEVICE_INVENTORY_PLAN.md).
+
+### Tests et construction
+
+| Périmètre | Résultat de la correction 0.1.1 |
+| --- | --- |
+| Moteur Rust `library-core` | 170 tests réussis ; un test réseau ignoré explicitement ; aucun échec |
+| Coque Tauri | Huit tests réussis |
+| Interface TypeScript/Svelte | 24 tests réussis ; contrôle sans erreur ni avertissement |
+| Format et analyse Rust | `cargo fmt --all -- --check` et Clippy workspace/toutes cibles avec `-D warnings` réussis |
+| Construction frontend | Build Vite réussi |
+| Revue de non-régression | `findings: []` sur les modifications inspectées ; cette revue ne remplace pas les essais matériels |
+| [CI Linux](https://github.com/QrCommunication/library-manager/actions/runs/37922847251) | Réussie sur les sources de la correction ; construction des paquets Linux terminée |
+| [CodeQL](https://github.com/QrCommunication/library-manager/actions/runs/37922845867) | Exécution réussie ; ce statut ne ferme pas les alertes historiques documentées plus bas |
+
+Les nouveaux tests utilisent des fichiers synthétiques et des montages simulés. Ils couvrent la progression mesurée et monotone, les résultats partiels, l’annulation, les chemins et fichiers modifiés, le contrôle du SHA-256 attendu avant insertion locale, le rapprochement de présence, les doublons et l’import complet au-delà de 200 livres. Le scénario de lot sélectionne 202 livres : 201 sont importés et un fichier modifié après inventaire est refusé avec une erreur distincte. Les tests de démonstration conservent la séparation entre livres locaux et fichiers présents uniquement sur liseuse et refusent toute copie réelle.
+
+### Paquets et parcours natif du DEB
+
+Le DEB 0.1.1 exact produit par la CI a été exécuté dans l’application native. Son [rapport native-report.json](https://github.com/QrCommunication/library-manager/releases/download/v0.1.1/native-report.json) indique `status: passed`, dix contrôles réussis, deux cartes de livres rendues dans le DOM et zéro appel API payant ou écriture sur appareil physique. Les contrôles portent sur démarrage, paramètres et six adaptateurs, import/dédoublonnage, conversion TXT vers EPUB et lecteur/progression, optimisation Xteink, compagnon MOBI, révisions/annulation d’opération, attente de configuration IA, langue après redémarrage et bibliothèque rendue. L’empreinte SHA-256 du binaire exécuté est `b0fb95ede150f2d373ab0e991771226a03e5e7199332673f6957dd149bf45ad2`.
+
+`screenshotSaved` vaut `false`. Une tentative de capture facultative a échoué ; une nouvelle exécution stricte sans capture a réussi les dix contrôles. La présence des deux cartes est établie par le DOM natif ; aucune capture de ce parcours standard n’est jointe au rapport.
+
+Les trois formats DEB, RPM et AppImage ont passé l’inspection des paquets. Le binaire de l’application et son compagnon exigent au plus GLIBC 2.34 ; les 172 ELF inspectés dans l’AppImage exigent au plus GLIBC 2.35. Les licences et le compagnon libmobi 0.12 sont présents. L’inspection du RPM ne constitue pas un parcours GUI de ce paquet dans cette correction.
+
+### Parcours du contenu extrait de l’AppImage
+
+Le contenu exact de l’AppImage produit par la CI a été exécuté via son `AppRun` extrait. Le [rapport appimage-extracted-report.json](https://github.com/QrCommunication/library-manager/releases/download/v0.1.1/appimage-extracted-report.json) indique `status: passed`, version 0.1.1, dix contrôles réussis et deux cartes de livres rendues dans le DOM. Le redémarrage et la conservation de la langue passent également. L’essai fonctionne avec réseau désactivé, sans appel API payant ni écriture sur appareil physique.
+
+Le rapport confirme la correspondance des empreintes du binaire et du compagnon au manifeste de construction. L’empreinte du binaire embarqué est `8bd501b95376146d3f74856d301c1bb057ceab602c406fd9d434ab6b0fed6ca0` ; celle du paquet AppImage est `b320ca0d0feeafd9b3633169f919036bfd2756a92089a1acb03c91533498b00a`. La capture reste absente (`screenshotSaved: false`). `fuseMountTested` vaut `false` : ce résultat valide le contenu lancé par extraction, sans valider le montage FUSE ni le cycle de l’enveloppe AppImage.
+
+### Inventaire et import sur la Xteink X4 Pro physique
+
+Le DEB exact de la CI a été exécuté avec la Xteink X4 Pro connectée en mode carte SD et un profil local temporaire isolé. Le [rapport device-native-report.json](https://github.com/QrCommunication/library-manager/releases/download/v0.1.1/device-native-report.json) indique `status: passed` pour les cinq contrôles matériels, avec provenance CI 37922847251/artifact 11612354741, version 0.1.1 et même empreinte de binaire que le parcours DEB ci-dessus.
+
+L’inventaire automatique a terminé la lecture de 134 livres, soit 167 643 422 octets, en 304,279 secondes (environ cinq minutes et quatre secondes). Le rapport conserve 543 échantillons de progression ; les octets lus augmentent réellement jusqu’au total attendu. Les livres déjà analysés deviennent accessibles avant la complétion. La bibliothèque locale commence vide : le panneau contient 50 lignes de livres présents uniquement sur liseuse dans le DOM, dont sept visibles et importables dans la fenêtre.
+
+L’essai importe vers le profil local un livre TXT de 3 455 octets. Le catalogue passe de zéro à un livre, sa présence sur la liseuse est reconnue et le nombre de livres absents du catalogue passe de 134 à 133. Un second import du même fichier produit un doublon, avec source inchangée après les deux opérations. Le montage physique est en lecture seule (`readOnlyPhysicalMount: true`) : aucune écriture sur la carte n’a été effectuée. L’import groupé au-delà de 200 livres est vérifié par tests synthétiques ; cet essai matériel porte sur l’import individuel et sa répétition.
+
+Une capture du parcours matériel a été enregistrée en privé. Elle reste hors des fichiers publics parce qu’elle contient la bibliothèque de l’utilisateur. Le réseau externe est désactivé et aucun appel API payant n’a été effectué. Ces résultats valident cette liseuse et cette connexion, sans généraliser à tous les volumes, firmwares ou transports.
+
+### Publication et vérification publique
+
+La [version v0.1.1](https://github.com/QrCommunication/library-manager/releases/tag/v0.1.1) a été publiée le 9 octobre 2026 à 11:40:46 UTC. Son tag pointe vers les sources `739d3ddf874b794dbe762027dd3df7c4ee1d3269`, qui ont produit les paquets testés.
+
+Le contrôle initial a téléchargé les onze fichiers alors publiés sans authentification, avec HTTP 200 et correspondance aux originaux locaux. Les dix empreintes du manifeste initial sont conformes. Le [rapport public-verification.json](https://github.com/QrCommunication/library-manager/releases/download/v0.1.1/public-verification.json) consigne ce premier état de onze fichiers ; son ajout porte la version à douze fichiers. Le [SHA256SUMS final](https://github.com/QrCommunication/library-manager/releases/download/v0.1.1/SHA256SUMS) contient désormais onze empreintes, dont celle du rapport public, toutes vérifiées conformes. Le rapport publié et le manifeste final ont également été téléchargés sans authentification avec HTTP 200 et correspondent aux fichiers locaux.
+
+Le [manifeste de construction](https://github.com/QrCommunication/library-manager/releases/download/v0.1.1/BUILD_MANIFEST.json) relie source, CI, paquets et binaires. Les douze fichiers publics comprennent trois paquets Linux, l’archive de sources, les licences/notices, le manifeste, les trois rapports natifs, le rapport de vérification publique et les sommes SHA-256. La capture matérielle privée reste hors publication. Les preuves de v0.1.0 ci-dessous restent conservées comme historique distinct.
+
+## Historique — version 0.1.0
 
 Compte rendu du 9 octobre 2026. Les paquets Linux, le moteur et l’interface ont été vérifiés dans les périmètres décrits ci-dessous. Les alertes de sécurité ouvertes, les limites du test AppImage et les fonctions sans essai matériel restent explicites.
 
-## Sources et preuves
+### Sources et preuves
 
 Les paquets finaux ont été construits depuis [3e6177b](https://github.com/QrCommunication/library-manager/commit/3e6177b1241e35e3ef1cdf2ac6b6466d5742f775). Le code Rust et JavaScript exécuté reste celui de [8f4de47](https://github.com/QrCommunication/library-manager/commit/8f4de47ab7800f69e3faf02c9d1fc10ea34b6b68) : les changements suivants portent sur les fixtures de test, la CI, le script de validation native, le générateur et le contenu des notices, ainsi que la déclaration de `ca-certificates` comme dépendance des paquets DEB/RPM. La [CI Linux de 3e6177b](https://github.com/QrCommunication/library-manager/actions/runs/37887629001) a réussi en 18 min 36 s : tests, Clippy, notices, construction des trois bundles, collecte et dépôt des artefacts. Les trois paquets et leurs parcours natifs décrits ici ont terminé leur validation. Le tag public v0.1.0 pointe vers [47f9149](https://github.com/QrCommunication/library-manager/commit/47f9149), qui ajoute uniquement la documentation de livraison aux sources des paquets.
 
@@ -21,7 +74,7 @@ Ce rapport de vérification a ensuite été publié comme quatorzième fichier d
 
 Les scripts de contrôle sont publics : [validation native](../scripts/native-smoke.py), [génération des notices](../scripts/third-party-notices.py) et [CI](../.github/workflows/ci.yml). [BUILD.md](BUILD.md) donne les commandes et l’environnement nécessaires à leur reproduction. Les parcours locaux et les téléchargements publics ont été vérifiés séparément.
 
-## Vérifications automatisées
+### Vérifications automatisées
 
 | Périmètre | Résultat |
 | --- | --- |
@@ -35,7 +88,7 @@ Les scripts de contrôle sont publics : [validation native](../scripts/native-sm
 
 Les tests couvrent notamment les chemins et liens symboliques, les collisions, la conservation des originaux, l’import et la déduplication, les révisions concurrentes, les tâches persistantes, l’annulation, les filtres, le lecteur isolé, les formats et les contrats des fournisseurs. Les 43 limites d’inventaire de sources sont décrites dans [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Ce nombre concerne l’inventaire de dépendances toutes plateformes ; il ne signifie pas que 43 bibliothèques sont livrées sans licence dans les paquets Linux.
 
-## Parcours natif du DEB
+### Parcours natif du DEB
 
 Le vrai binaire du DEB final a été exécuté dans un environnement Ubuntu 22.04 isolé avec GTK/WebKit, Xvfb et WebDriver, puis dans un Ubuntu 22.04 vierge après installation par `apt`. Le script utilise le pont IPC de l’application. Il ne charge pas la démonstration et n’ajoute aucun plugin de test à la production.
 
@@ -54,7 +107,7 @@ Le rapport final indique `status: passed`, `renderedBookCount: 2` et `screenshot
 
 Le format source effectif de la sortie MOBI est TXT dans ce parcours. Le test ne présente donc pas cette étape comme une conversion EPUB vers MOBI. Les livres et les contenus utilisés dans le rapport natif sont synthétiques. L’empreinte du binaire DEB exécuté est `37305efbbf10183252279f6c00cf4ae417f4165aab58e1f55bae8d65cc278dc8`.
 
-## Installation et AppImage
+### Installation et AppImage
 
 Le DEB final a été installé dans un Ubuntu 22.04 vierge et le RPM final dans Fedora 44. Les contrôles de version, de présence du moteur compagnon et de résolution des bibliothèques système passent. Dans Ubuntu, `ca-certificates` était absent avant l’installation : `apt` l’a installé automatiquement avec les dépendances GTK/WebKit déclarées par le DEB. Les métadonnées effectives des deux paquets contiennent les dépendances certificats, GTK et WebKit. Ces environnements n’installent ni Calibre, ni Node.js, ni Rust pour utiliser Library Manager.
 
@@ -72,7 +125,7 @@ Le contenu de l’AppImage finale a été extrait et lancé par son `AppRun`. Av
 | Binaire principal extrait de l’AppImage | `7054446b0de9b88f40a64470ec4453bb24edc7c34b694377f7f50d480313de4f` |
 | Enveloppe `AppRun` extraite | `eb0b254ac0dae6543e6dd7cd02e1baf40a060de95b927313122d6b46323c00aa` |
 
-## Livres, réseau et appareils
+### Livres, réseau et appareils
 
 Une collection privée de 133 EPUB a servi au contrôle d’import. Les 133 empreintes SHA-256 des sources sont conservées. La réimportation des 133 fichiers produit 133 détections de doublon et aucune erreur. Les livres, leurs noms, leurs métadonnées privées et les fichiers du profil restent hors du dépôt et de la publication ; seuls ces nombres agrégés sont documentés.
 
@@ -80,7 +133,7 @@ La recherche Web anonyme a été exercée réellement, ainsi que le catalogue pu
 
 Aucune écriture sur un appareil physique n’a été effectuée. La détection, l’indexation et les protocoles de transfert disposent de tests et de fixtures, mais la compatibilité avec toutes les liseuses, tous les firmwares Xteink/CrossPoint et tous les clients Calibre sans fil n’est pas établie par cette livraison. Voir [DEVICE_PROTOCOL.md](DEVICE_PROTOCOL.md).
 
-## Sécurité et limites ouvertes
+### Sécurité et limites ouvertes
 
 Les relevés locaux `pnpm audit` et `cargo audit` rapportent zéro vulnérabilité dans leur compteur de vulnérabilités. Cette mesure ne couvre pas les avertissements d’absence de maintenance ou d’intégrité mémoire, ni les alertes GitHub décrites ci-dessous. Elle ne constitue pas une validation de sécurité sans réserve.
 

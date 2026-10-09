@@ -1,6 +1,6 @@
 # Contrat IPC de Library Manager
 
-Ce document est la référence commune à `crates/library-core/src/models.rs`, aux commandes Tauri et à `src/lib/contracts.ts`. Les propriétés JSON sont en `camelCase`. Les enums sont les chaînes ci-dessous. Les `Option<T>` Rust deviennent `T | null`, jamais une valeur inventée. Les dates sont des chaînes RFC 3339 UTC, les tailles des nombres entiers sûrs et les identifiants des chaînes opaques générées par le backend. Les livres et tâches utilisent des UUID ; les appareils peuvent employer une identité stable dérivée du volume ou du protocole. Une pagination est bornée à 200 livres.
+Ce document est la référence commune à `crates/library-core/src/models.rs` et `devices.rs`, aux commandes Tauri et à `src/lib/contracts.ts`. Les propriétés JSON sont en `camelCase`. Les enums sont les chaînes ci-dessous. Les `Option<T>` Rust deviennent `T | null`, jamais une valeur inventée. Les dates sont des chaînes RFC 3339 UTC, les tailles des nombres entiers sûrs et les identifiants des chaînes opaques générées par le backend. Les livres et tâches utilisent des UUID ; les appareils peuvent employer une identité stable dérivée du volume ou du protocole. Une pagination est bornée à 200 livres.
 
 ## Types de bibliothèque
 
@@ -93,6 +93,19 @@ interface Device {
   mountPath: string | null; address: string | null;
   totalBytes: number | null; freeBytes: number | null;
   bookCount: number; matchedBookCount: number; lastSeenAt: string;
+}
+interface DeviceInventoryBook {
+  deviceId: string; relativePath: string; bookId: string | null; sha256: string | null;
+  title: string; authors: string[]; format: BookFormat; sizeBytes: number;
+  lastSeenAt: string; warnings: string[];
+}
+interface DeviceInventoryPage {
+  items: DeviceInventoryBook[]; total: number; offset: number; limit: number;
+}
+interface DeviceIndexProgress {
+  phase: 'discovering' | 'reading' | 'finalizing';
+  visitedEntries: number; processedBooks: number; totalBooks: number;
+  bytesRead: number; totalBytes: number; currentPath: string | null;
 }
 type JobKind = 'import' | 'enrich' | 'optimize' | 'convert' | 'deviceIndex' | 'transfer' | 'chat';
 type JobStatus = 'queued' | 'running' | 'waitingForConfiguration' | 'waitingForNetwork' | 'completed' | 'failed' | 'cancelled';
@@ -220,6 +233,8 @@ Les noms ci-dessous sont les chaînes exactes utilisées par `invoke`. Les param
 | `optimization_profiles` | aucun | `OptimizationProfile[]` |
 | `devices_scan` | aucun | `Device[]` |
 | `device_index` | `{ id }` | `Job` |
+| `device_inventory` | `{ id, offset: number, limit: number, unknownOnly: boolean }` | `DeviceInventoryPage` |
+| `device_import` | `{ id, relativePaths: string[] \| null }` | `Job` |
 | `device_connect_wireless` | `{ address, transport, label, password: string | null }` | `Device` |
 | `device_disconnect` | `{ id }` | `null` |
 | `device_transfer` | `{ id, bookIds: string[], profileId: string | null }` | `Job` |
@@ -240,9 +255,15 @@ Les noms ci-dessous sont les chaînes exactes utilisées par `invoke`. Les param
 | `operations_list` | aucun | `Operation[]` |
 | `operation_undo` | `{ id }` | `Operation` |
 
-Seule l’importation accepte des chemins sources, validés comme fichiers réguliers. Un appel accepte au plus 200 chemins ; l’interface découpe les sélections plus importantes en lots séquentiels. La racine de bibliothèque est le dossier de données de l’application, affiché en lecture seule et imposé côté backend. Les destinations, variantes et fichiers d’appareil sont calculés depuis des IDs autoritatifs. Les commandes n’acceptent ni commande shell, ni SQL, ni chemin de destination fourni pour contourner le stockage.
+`import_books` accepte des chemins sources absolus, validés comme fichiers réguliers. Un appel accepte au plus 200 chemins ; l’interface découpe les sélections plus importantes en lots séquentiels. `device_import` reçoit uniquement des chemins relatifs issus de l’inventaire de l’appareil connecté. La racine de bibliothèque est le dossier de données de l’application, affiché en lecture seule et imposée côté backend. Les destinations, variantes et fichiers d’appareil sont calculés depuis des IDs autoritatifs. Les commandes n’acceptent ni commande shell, ni SQL, ni chemin de destination fourni pour contourner le stockage.
+
+`device_inventory` exige un appareil connecté, un offset entier positif ou nul et une limite de 1 à 200. `unknownOnly` retient les entrées sans livre local correspondant. Pendant un inventaire USB, les livres dont la lecture est terminée sont accessibles avant la publication finale. Ces entrées ont un chemin relatif et peuvent avoir un `bookId` ou `sha256` nul ; elles ne sont pas des objets `Book` du catalogue local.
+
+Pour `device_import`, `relativePaths: null` sélectionne dans le worker tous les livres sans correspondance locale. La sélection utilise l’inventaire backend complet, borné à 20 000 livres, et reste indépendante de la page affichée ou du résultat limité de `deviceIndex`. Chaque source est revalidée et son contenu copié doit correspondre au SHA-256 inventorié avant l’insertion locale. Un fichier sans empreinte vérifiable est refusé. Le résultat du job porte `deviceId` dès enqueue, puis `imported`, `duplicates`, `total`, `processed`, `errorsByCode`, `bookIds`, `warnings`, `warningCount`, `bookIdsTruncated` et `warningsTruncated`. Les tableaux de diagnostics sont limités à 500 entrées ; les compteurs restent exacts. Les erreurs par fichier n’empêchent pas le traitement des sources valides suivantes.
 
 `deviceIndex` conserve un résultat `{ deviceId, books, total, truncated, warnings }`. L’aperçu renvoyé à l’interface est limité à 500 lignes et 768 KiB ; l’index et le calcul des présences en base restent complets. `transfer` renvoie les comptes `copied`, `skipped`, `failed`, les résultats par livre et les avertissements. Une tâche `chat` conserve son `conversationId` dès sa mise en file, même lorsqu’elle attend une configuration.
+
+Pendant un job USB `deviceIndex`, `result` expose `{ deviceId, indexProgress: DeviceIndexProgress }`. La phase `discovering` publie les compteurs d’énumération sans pourcentage estimé sur la durée. Après découverte, `progress` suit les octets lus, de façon monotone et plafonnée à 0,99 jusqu’à la complétion du job. Les mises à jour sont limitées à une toutes les 200 ms, avec publication immédiate aux changements de phase ou du nombre de livres traités. `message` reste vide pour laisser l’interface traduire les étapes. La raison `deviceIndexProgress` de `library:changed` demande de recharger l’inventaire partiel sans ajouter un nouveau type d’événement.
 
 ## Événements
 

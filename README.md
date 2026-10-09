@@ -33,9 +33,11 @@ Voir [les fournisseurs et leurs sources officielles](docs/PROVIDERS.md) et [la p
 
 Les volumes USB/SD montés sont détectés et indexés. Les livres déjà présents sont mis en évidence et peuvent être filtrés. La déconnexion retire immédiatement cette présence du catalogue courant. Les appareils MTP sont accessibles lorsqu’ils sont déjà montés par le bureau Linux via GVfs.
 
+La barre de progression de l’inventaire USB suit la quantité de données réellement lue. Les livres détectés apparaissent au fil de l’inventaire. Ceux qui sont présents uniquement sur la liseuse sont signalés dans la bibliothèque : importez un livre ou tous les livres absents du catalogue local, sans modifier les fichiers sur la carte. Le résultat indique les imports réussis, les doublons et les fichiers refusés.
+
 Le connecteur **CrossPoint** utilise directement le transfert HTTP du firmware sur le réseau local. Activez le mode de transfert sur la liseuse puis indiquez son adresse dans l’application. L’installation de Calibre n’est pas nécessaire. Les copies sont vérifiées et les fichiers déjà présents ne sont pas écrasés implicitement.
 
-Un serveur **Calibre sans fil intégré** permet aussi de connecter un client compatible tel que le module Calibre de KOReader. Il s’active explicitement dans le panneau Liseuses, sur l’adresse locale du PC et le port 9090. Cette version utilise une connexion configurée par adresse IP ; la découverte UDP et les essais sur appareil physique ne sont pas encore validés. Le protocole reste autonome, sans installer Calibre.
+Un serveur **Calibre sans fil intégré** permet aussi de connecter un client compatible tel que le module Calibre de KOReader. Il s’active explicitement dans le panneau Liseuses, sur l’adresse locale du PC et le port 9090. Cette version utilise une connexion configurée par adresse IP ; la découverte UDP et les essais matériels de ce protocole sans fil ne sont pas encore validés. Le protocole reste autonome, sans installer Calibre.
 
 | Profil EPUB | Usage |
 | --- | --- |
@@ -63,18 +65,18 @@ Le lecteur EPUB propose un sommaire et une position sauvegardée. Le contenu du 
 
 ## Installation
 
-Téléchargez les paquets **DEB, RPM ou AppImage** dans la [version v0.1.0](https://github.com/QrCommunication/library-manager/releases/tag/v0.1.0). Cette version cible Linux **x86_64 (64 bits)** et utilise Ubuntu 22.04, avec glibc 2.35, comme base de compilation. Les notes de version indiquent les distributions testées et les sommes SHA-256.
+Téléchargez les paquets **DEB, RPM ou AppImage** dans la [version v0.1.1](https://github.com/QrCommunication/library-manager/releases/tag/v0.1.1). Cette version cible Linux **x86_64 (64 bits)** et utilise Ubuntu 22.04, avec glibc 2.35, comme base de compilation. Les notes de version indiquent les distributions testées et les sommes SHA-256.
 
 Debian, Ubuntu et dérivés :
 
 ```sh
-sudo apt install ./library-manager_0.1.0_amd64.deb
+sudo apt install ./library-manager_0.1.1_amd64.deb
 ```
 
 Fedora et distributions RPM :
 
 ```sh
-sudo dnf install ./library-manager-0.1.0-1.x86_64.rpm
+sudo dnf install ./library-manager-0.1.1-1.x86_64.rpm
 ```
 
 Le gestionnaire de paquets installe les bibliothèques système GTK/WebKit, leurs dépendances et le magasin de certificats TLS `ca-certificates`, nécessaire aux connexions HTTPS. Après installation, lancez **Library Manager** depuis le menu des applications. Aucun environnement Node, Python, Rust ou Calibre n’est requis.
@@ -82,14 +84,14 @@ Le gestionnaire de paquets installe les bibliothèques système GTK/WebKit, leur
 AppImage, sans installation du paquet :
 
 ```sh
-chmod +x ./library-manager_0.1.0_amd64.AppImage
-./library-manager_0.1.0_amd64.AppImage
+chmod +x ./library-manager_0.1.1_amd64.AppImage
+./library-manager_0.1.1_amd64.AppImage
 ```
 
 L’AppImage utilise les bibliothèques compatibles et le magasin de certificats du système. Son montage classique nécessite FUSE. Si FUSE n’est pas disponible, essayez le mode d’extraction et d’exécution :
 
 ```sh
-APPIMAGE_EXTRACT_AND_RUN=1 ./library-manager_0.1.0_amd64.AppImage
+APPIMAGE_EXTRACT_AND_RUN=1 ./library-manager_0.1.1_amd64.AppImage
 ```
 
 Consultez le [rapport de qualité](docs/QUALITY.md) pour les vérifications effectuées et les limites des essais.

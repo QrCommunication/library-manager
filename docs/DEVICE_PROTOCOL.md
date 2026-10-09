@@ -10,6 +10,16 @@ Les dossiers système du lecteur, dont `.crosspoint`, sont exclus du classement 
 
 Un appareil MTP doit fournir un montage accessible via l’environnement de bureau. Une connexion USB qui n’expose ni stockage de masse ni montage GVfs n’est pas annoncée comme compatible.
 
+### Inventaire et import USB/SD depuis la version 0.1.1
+
+L’inventaire commence par parcourir les dossiers et affiche le nombre d’entrées découvertes. Il lit ensuite les livres avec une barre calculée sur les octets effectivement lus. Le pourcentage reste inférieur à 100 % jusqu’à la fin de l’enregistrement de l’inventaire. Une liaison USB lente peut donc prolonger la lecture ; la barre suit le travail mesuré.
+
+Les livres déjà analysés deviennent visibles pendant l’inventaire. Ceux qui n’existent pas dans la bibliothèque locale sont présentés séparément dans la bibliothèque, avec une indication de leur présence uniquement sur la liseuse. Un livre ainsi détecté reste un fichier de la carte jusqu’à son import. Une déconnexion retire sa présence active ; un inventaire interrompu n’est pas présenté comme terminé.
+
+L’action d’import individuel copie le livre choisi vers la bibliothèque locale. L’action groupée importe tous les livres absents du catalogue, y compris ceux qui dépassent la page affichée. Les résultats indiquent les livres importés, les doublons et les erreurs. Un fichier refusé n’empêche pas l’import des autres fichiers valides.
+
+L’import conserve la source sur la carte. Avant chaque copie, le backend vérifie l’identité du volume et le fichier inventorié. Il compare l’empreinte de la copie au SHA-256 relevé pendant l’inventaire avant d’ajouter le livre au catalogue. Un fichier modifié entre inventaire et copie est refusé ; un contenu déjà local réutilise le livre existant. Ces garanties sont couvertes par tests automatisés. Un essai réel sur Xteink X4 Pro en mode carte SD a validé l’inventaire de 134 livres, la progression mesurée, l’affichage des livres absents du catalogue, un import individuel et son réimport sans doublon local ni modification de la source. La carte était montée en lecture seule ; les preuves et limites sont détaillées dans [QUALITY.md](QUALITY.md).
+
 ## CrossPoint sans fil
 
 CrossPoint expose un serveur HTTP sur le port 80 et un canal WebSocket sur le port 81. Il utilise notamment `/api/status`, `/api/files`, `/upload` et `/mkdir`. Sa découverte UDP répond sur le port 8134. Ces interfaces permettent une connexion directe depuis Library Manager, sans exécuter le plugin ou le programme Calibre.
