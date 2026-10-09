@@ -168,7 +168,10 @@ class Driver:
             raise SmokeFailure("webdriverResponseInvalid") from None
         require(isinstance(response, dict) and "value" in response, "webdriverResponseShapeInvalid")
         value = response["value"]
-        if isinstance(value, dict) and value.get("error"):
+        # W3C WebDriver failures carry a string error discriminator. The IPC
+        # envelope deliberately uses an error object, including expected CAS
+        # rejections, which invoke() must inspect rather than the transport.
+        if isinstance(value, dict) and isinstance(value.get("error"), str):
             raise SmokeFailure("webdriverCommandRejected")
         return value
 
@@ -421,6 +424,45 @@ def smoke(driver: Driver, binary: Path, profile: Path, screenshot: Path | None, 
 
 
 class SmokeTests(unittest.TestCase):
+    def test_transport_distinguishes_ipc_error_object_from_webdriver_error_string(self) -> None:
+        class Response:
+            def __init__(self, value):
+                self.payload = json.dumps({"value": value}).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, maximum):
+                return self.payload[:maximum]
+
+        class Opener:
+            def __init__(self, value):
+                self.value = value
+
+            def open(self, request, timeout):
+                return Response(self.value)
+
+        driver = Driver("http://localhost:4444", 3)
+        driver.session_id = "synthetic-session"
+        driver.opener = Opener({"ok": False, "error": {"code": "revisionConflict", "message": "private path and token"}})
+        with self.assertRaises(IpcFailure) as captured:
+            driver.invoke("book_update", {"id": "synthetic", "patch": {}, "expectedRevision": 1})
+        self.assertEqual(str(captured.exception), "revisionConflict")
+        self.assertNotIn("private", str(captured.exception))
+
+        driver.opener = Opener({"error": "javascript error", "message": "private path and token", "stacktrace": "private arguments"})
+        with self.assertRaises(SmokeFailure) as captured:
+            driver.invoke("book_update")
+        self.assertNotIsInstance(captured.exception, IpcFailure)
+        self.assertEqual(str(captured.exception), "webdriverCommandRejected")
+        self.assertNotIn("private", str(captured.exception))
+
+        driver.opener = Opener({"ok": True, "value": {"revision": 2}})
+        self.assertEqual(driver.invoke("book_get", {"id": "synthetic"}), {"revision": 2})
+
     def test_reader_preparation_waits_for_completed_conversion_before_using_variant(self) -> None:
         for source_format in ("txt", "mobi"):
             driver = Driver("http://localhost:4444", 3)
