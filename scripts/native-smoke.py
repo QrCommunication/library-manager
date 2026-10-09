@@ -14,6 +14,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
@@ -50,6 +51,37 @@ if (!bridge || typeof bridge.invoke !== 'function') {
     }})
   );
 }
+"""
+LIBRARY_RENDER_SCRIPT = """
+const expectedTitles = arguments[0];
+const main = document.querySelector('#main-content');
+const page = main?.querySelector('section.page[aria-busy="false"]');
+const visible = element => {
+  if (!element) return false;
+  const rect = element.getBoundingClientRect();
+  const style = getComputedStyle(element);
+  return rect.width > 0 && rect.height > 0 && rect.bottom > 0 &&
+    rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth &&
+    style.display !== 'none' && style.visibility === 'visible' &&
+    Number(style.opacity) > 0;
+};
+const cards = page ? [...page.querySelectorAll('.book-grid .book-card, .data-table tbody tr')].filter(visible) : [];
+const titles = cards.map(card => card.querySelector('.book-title, .table-title')?.textContent?.trim());
+return {
+  ready: document.readyState === 'complete' && document.visibilityState === 'visible' &&
+    visible(page) && !main?.querySelector('[role="alert"]') &&
+    expectedTitles.every(title => titles.includes(title)) && cards.length === expectedTitles.length,
+  visibleBookCount: cards.length
+};
+"""
+PAINT_FRAMES_SCRIPT = """
+const finish = arguments[arguments.length - 1];
+let remaining = 4;
+const next = () => {
+  if (--remaining === 0) finish(true);
+  else requestAnimationFrame(next);
+};
+requestAnimationFrame(next);
 """
 
 
@@ -249,6 +281,28 @@ class Driver:
 
         return self.wait(terminal, "jobTimedOut")
 
+    def rendered_library(self, expected_titles: list[str]) -> dict:
+        """Require stable visible cards, then let WebKit paint before capture."""
+        stable_since = None
+
+        def rendered():
+            nonlocal stable_since
+            snapshot = self.execute(LIBRARY_RENDER_SCRIPT, [expected_titles])
+            require(isinstance(snapshot, dict) and isinstance(snapshot.get("ready"), bool), "nativeRenderStateInvalid")
+            if not snapshot["ready"]:
+                stable_since = None
+                return False
+            if stable_since is None:
+                stable_since = time.monotonic()
+            return snapshot if time.monotonic() - stable_since >= 0.7 else False
+
+        self.wait(rendered, "nativeLibraryCardsNotVisibleAndStable", 25)
+        painted = self.request("POST", self.endpoint("/execute/async"), {"script": PAINT_FRAMES_SCRIPT, "args": []})
+        require(painted is True, "nativePaintFramesNotCompleted")
+        final_snapshot = self.execute(LIBRARY_RENDER_SCRIPT, [expected_titles])
+        require(isinstance(final_snapshot, dict) and final_snapshot.get("ready") is True, "nativeLibraryChangedBeforeCapture")
+        return final_snapshot
+
 
 def prepare_reader_epub(driver: Driver, book_id: str, source_format: str) -> dict:
     """Non-EPUB imports remain originals until an explicit conversion completes."""
@@ -408,8 +462,9 @@ def smoke(driver: Driver, binary: Path, profile: Path, screenshot: Path | None, 
             report["providerCount"] = 6
 
         with checked(report, "nativeRenderedLibrary"):
-            title = driver.invoke("book_get", {"id": book_id})["title"]
-            driver.wait(lambda: driver.execute("return document.body?.innerText?.includes(arguments[0]) === true;", [title]), "nativeLibraryDidNotRenderImportedBook", 20)
+            expected_titles = [driver.invoke("book_get", {"id": value})["title"] for value in (book_id, mobi_book_id)]
+            render_state = driver.rendered_library(expected_titles)
+            report["renderedBookCount"] = render_state["visibleBookCount"]
             if screenshot:
                 encoded = driver.request("GET", driver.endpoint("/screenshot"))
                 require(isinstance(encoded, str), "nativeScreenshotResponseInvalid")
@@ -424,6 +479,48 @@ def smoke(driver: Driver, binary: Path, profile: Path, screenshot: Path | None, 
 
 
 class SmokeTests(unittest.TestCase):
+    def test_library_capture_waits_for_stable_cards_and_rechecks_after_paint(self) -> None:
+        for final_ready in (True, False):
+            with self.subTest(final_ready=final_ready):
+                driver = Driver("http://localhost:4444", 3)
+                driver.session_id = "synthetic-session"
+                states = [False, True, False, True, True, final_ready]
+                calls = []
+
+                def execute(script, arguments):
+                    self.assertEqual(script, LIBRARY_RENDER_SCRIPT)
+                    self.assertEqual(arguments, [["Synthetic TXT", "Synthetic MOBI"]])
+                    ready = states.pop(0)
+                    calls.append("ready" if ready else "loading")
+                    return {"ready": ready, "visibleBookCount": 2 if ready else 0}
+
+                def wait(predicate, failure, seconds):
+                    self.assertEqual(failure, "nativeLibraryCardsNotVisibleAndStable")
+                    self.assertEqual(seconds, 25)
+                    for _ in range(4):
+                        self.assertFalse(predicate())
+                    result = predicate()
+                    self.assertTrue(result)
+                    return result
+
+                def request(method, endpoint, payload):
+                    self.assertEqual(calls, ["loading", "ready", "loading", "ready", "ready"])
+                    self.assertEqual(method, "POST")
+                    self.assertTrue(endpoint.endswith("/execute/async"))
+                    self.assertEqual(payload, {"script": PAINT_FRAMES_SCRIPT, "args": []})
+                    calls.append("paint")
+                    return True
+
+                driver.execute, driver.wait, driver.request = execute, wait, request
+                with patch("time.monotonic", side_effect=[10, 10, 11, 11, 11.8]):
+                    if final_ready:
+                        self.assertEqual(driver.rendered_library(["Synthetic TXT", "Synthetic MOBI"])["visibleBookCount"], 2)
+                    else:
+                        with self.assertRaisesRegex(SmokeFailure, "nativeLibraryChangedBeforeCapture"):
+                            driver.rendered_library(["Synthetic TXT", "Synthetic MOBI"])
+                self.assertFalse(states)
+                self.assertEqual(calls[-2:], ["paint", "ready" if final_ready else "loading"])
+
     def test_transport_distinguishes_ipc_error_object_from_webdriver_error_string(self) -> None:
         class Response:
             def __init__(self, value):
