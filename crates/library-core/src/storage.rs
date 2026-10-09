@@ -905,7 +905,8 @@ mod tests {
         let (temporary, storage) = fixture()?;
         let path = source(&temporary, b"Before")?;
         let opened = Source::open(&path)?;
-        fs::write(&path, b"After!")?;
+        // Equal-size writes may share a filesystem clock tick; this exercises the metadata guard.
+        fs::write(&path, b"After a deliberate size change")?;
         assert!(matches!(opened.verify(), Err(AppError::Conflict(_))));
         let old_root = temporary.path().join("old-library");
         fs::rename(storage.root(), &old_root)?;
@@ -915,6 +916,28 @@ mod tests {
             Err(AppError::Conflict(_))
         ));
         assert!(!storage.root().join("book.epub").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_reads_detect_source_content_changes_of_the_same_size() -> Result<()> {
+        let (temporary, _storage) = fixture()?;
+        let path = source(&temporary, b"Before")?;
+        let mut opened = Source::open(&path)?;
+        let first = digest_reader(&mut opened.file, None)?;
+        fs::write(&path, b"After!")?;
+        opened.file.rewind()?;
+        let second = digest_reader(&mut opened.file, None)?;
+        assert_eq!(first.size_bytes, second.size_bytes);
+        assert_ne!(first.sha256, second.sha256);
+        assert_eq!(
+            first.sha256,
+            hex_digest(Sha256::digest(b"Before").as_slice())
+        );
+        assert_eq!(
+            second.sha256,
+            hex_digest(Sha256::digest(b"After!").as_slice())
+        );
         Ok(())
     }
 

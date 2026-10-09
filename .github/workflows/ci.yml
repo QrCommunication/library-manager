@@ -68,7 +68,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             build-essential pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev \
-            librsvg2-dev libssl-dev libdbus-1-dev patchelf rpm curl ca-certificates
+            librsvg2-dev libssl-dev libdbus-1-dev patchelf rpm file curl ca-certificates
 
       - name: Install locked dependencies
         run: |

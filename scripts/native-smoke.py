@@ -247,6 +247,17 @@ class Driver:
         return self.wait(terminal, "jobTimedOut")
 
 
+def prepare_reader_epub(driver: Driver, book_id: str, source_format: str) -> dict:
+    """Non-EPUB imports remain originals until an explicit conversion completes."""
+    completed = driver.job(driver.invoke("book_convert", {"id": book_id, "format": "epub"}))
+    result = completed.get("result")
+    require(isinstance(result, dict), "epubConversionReportMissing")
+    require(result.get("sourceFormat") == source_format and result.get("targetFormat") == "epub" and result.get("afterBytes", 0) > 0, "explicitEpubConversionFailed")
+    variants = driver.invoke("book_files", {"id": book_id})
+    require(any(file["format"] == "epub" and file["bookId"] == book_id for file in variants), "explicitEpubVariantMissing")
+    return result
+
+
 @contextmanager
 def checked(report: dict, name: str):
     start = time.monotonic()
@@ -301,15 +312,18 @@ def smoke(driver: Driver, binary: Path, profile: Path, screenshot: Path | None, 
             files = driver.invoke("book_files", {"id": book_id})
             require(any(file["variant"] == "original" and file["sha256"] == fixture_hash for file in files), "originalHashNotPreserved")
 
-        with checked(report, "readerContentAndSavedProgress"):
+        with checked(report, "explicitTxtToEpubAndReaderContentAndSavedProgress"):
+            converted = prepare_reader_epub(driver, book_id, "txt")
+            report["readerPreparationSourceFormat"] = converted["sourceFormat"]
             manifest = driver.invoke("reader_open", {"id": book_id})
             require(manifest["bookId"] == book_id and len(manifest["sections"]) > 0, "readerSpineMissing")
             section = driver.invoke("reader_section", {"id": book_id, "sectionIndex": 0})
             text = section_text(section)
             require("SMOKE_NATIVE_PARAGRAPH_A" in text and "SMOKE_NATIVE_PARAGRAPH_B" in text and "cœur" in text, "readerLostSyntheticText")
+            before_progress = driver.invoke("book_get", {"id": book_id})
             driver.invoke("reader_save_progress", {"id": book_id, "location": "section:0", "progress": 0.25})
             progress = driver.invoke("book_get", {"id": book_id})
-            require(progress["readingProgress"] == 0.25 and progress["readStatus"] == "reading" and progress["revision"] > book["revision"], "readerProgressNotSaved")
+            require(progress["readingProgress"] == 0.25 and progress["readStatus"] == "reading" and progress["revision"] > before_progress["revision"], "readerProgressNotSaved")
 
         with checked(report, "xteinkOptimizationPreservesTextAndSource"):
             profiles = driver.invoke("optimization_profiles")
@@ -320,11 +334,12 @@ def smoke(driver: Driver, binary: Path, profile: Path, screenshot: Path | None, 
             after = section_text(driver.invoke("reader_section", {"id": book_id, "sectionIndex": 0}))
             require("SMOKE_NATIVE_PARAGRAPH_A" in after and "SMOKE_NATIVE_PARAGRAPH_B" in after, "optimizedReaderLostText")
 
-        with checked(report, "nativeEpubToMobiAndBundledMobiReconstruction"):
+        with checked(report, "nativeMobiOutputAndExplicitBundledMobiToEpub"):
             capabilities = driver.invoke("conversion_capabilities")
             require({"epub", "mobi"}.issubset(capabilities["inputs"]) and {"epub", "mobi"}.issubset(capabilities["outputs"]), "bundledConversionEngineUnavailable")
             conversion = driver.job(driver.invoke("book_convert", {"id": book_id, "format": "mobi"}))["result"]
-            require(conversion["sourceFormat"] == "epub" and conversion["targetFormat"] == "mobi" and conversion["afterBytes"] > 0, "nativeMobiConversionFailed")
+            require(conversion["sourceFormat"] in {"txt", "epub"} and conversion["targetFormat"] == "mobi" and conversion["afterBytes"] > 0, "nativeMobiConversionFailed")
+            report["mobiOutputSourceFormat"] = conversion["sourceFormat"]
             mobi_files = [path for path in library_root.rglob("*.mobi") if path.is_file() and not path.is_symlink()]
             require(len(mobi_files) == 1, "generatedMobiVariantNotUnique")
             roundtrip = Path(temporary) / "MOBI input smoke fixture.mobi"
@@ -334,6 +349,8 @@ def smoke(driver: Driver, binary: Path, profile: Path, screenshot: Path | None, 
             second_ids = reconstructed["result"]["bookIds"]
             require(len(second_ids) == 1 and second_ids[0] != book_id, "mobiInputNotIndependentlyReconstructed")
             mobi_book_id = second_ids[0]
+            reconstructed_epub = prepare_reader_epub(driver, mobi_book_id, "mobi")
+            report["mobiReconstructionSourceFormat"] = reconstructed_epub["sourceFormat"]
             mobi_manifest = driver.invoke("reader_open", {"id": mobi_book_id})
             require(len(mobi_manifest["sections"]) > 0, "mobiReconstructionSpineMissing")
             mobi_text = section_text(driver.invoke("reader_section", {"id": mobi_book_id, "sectionIndex": 0}))
@@ -404,6 +421,40 @@ def smoke(driver: Driver, binary: Path, profile: Path, screenshot: Path | None, 
 
 
 class SmokeTests(unittest.TestCase):
+    def test_reader_preparation_waits_for_completed_conversion_before_using_variant(self) -> None:
+        for source_format in ("txt", "mobi"):
+            driver = Driver("http://localhost:4444", 3)
+            calls = []
+            pending = [{"id": "conversion", "status": "running"}, {"id": "conversion", "status": "completed", "result": {"sourceFormat": source_format, "targetFormat": "epub", "afterBytes": 1024}}]
+
+            def invoke(command, parameters=None):
+                calls.append((command, parameters))
+                if command == "book_convert":
+                    return {"id": "conversion", "status": "queued"}
+                if command == "jobs_list":
+                    return [pending.pop(0)]
+                if command == "book_files":
+                    self.assertFalse(pending, "The EPUB variant must not be used before the conversion finishes")
+                    return [{"bookId": "book", "format": source_format}, {"bookId": "book", "format": "epub"}]
+                self.fail("Unexpected command in reader preparation")
+
+            driver.invoke = invoke
+            result = prepare_reader_epub(driver, "book", source_format)
+            self.assertEqual(result["sourceFormat"], source_format)
+            self.assertEqual(calls[0], ("book_convert", {"id": "book", "format": "epub"}))
+            self.assertEqual([command for command, _parameters in calls], ["book_convert", "jobs_list", "jobs_list", "book_files"])
+
+    def test_reader_preparation_refuses_wrong_report_and_missing_epub_variant(self) -> None:
+        driver = Driver("http://localhost:4444", 3)
+        driver.job = lambda job: {"status": "completed", "result": {"sourceFormat": "txt", "targetFormat": "mobi", "afterBytes": 1024}}
+        driver.invoke = lambda *args: {"id": "conversion"}
+        with self.assertRaises(SmokeFailure):
+            prepare_reader_epub(driver, "book", "txt")
+        driver.job = lambda job: {"status": "completed", "result": {"sourceFormat": "mobi", "targetFormat": "epub", "afterBytes": 1024}}
+        driver.invoke = lambda command, parameters: [] if command == "book_files" else {"id": "conversion"}
+        with self.assertRaises(SmokeFailure):
+            prepare_reader_epub(driver, "book", "mobi")
+
     def test_profile_guard_rejects_existing_data_and_generic_home(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "fresh-profile"
