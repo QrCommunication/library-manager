@@ -1,0 +1,38 @@
+[package]
+name = "library-core"
+description = "Standalone ebook library, metadata, optimization, conversion and device engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+zip.workspace = true
+quick-xml.workspace = true
+image.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+roxmltree.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+sha1.workspace = true
+chrono.workspace = true
+url.workspace = true
+walkdir.workspace = true
+unicode-normalization.workspace = true
+keyring.workspace = true
+ammonia = "4.2.1"
+base64 = "0.23.1"
+mime_guess = "2.0.5"
+regex = "1.13.1"
+rustix = { version = "1.1.5", features = ["fs", "process"] }
+
+[dev-dependencies]
+tempfile.workspace = true

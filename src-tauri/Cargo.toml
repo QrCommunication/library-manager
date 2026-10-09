@@ -1,0 +1,31 @@
+[package]
+name = "library-manager"
+description = "Standalone ebook library manager for Linux desktops and connected ereaders"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lib]
+name = "library_manager_lib"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "library-manager"
+path = "src/main.rs"
+
+[dependencies]
+tauri.workspace = true
+library-core = { path = "../crates/library-core" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tauri-plugin-dialog = "2.8.1"
+tauri-plugin-opener = "2.7.0"
+tauri-plugin-single-instance = "2.5.2"
+
+[build-dependencies]
+tauri-build = { version = "2.7.1", features = [] }

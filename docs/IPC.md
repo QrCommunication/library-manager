@@ -1,6 +1,6 @@
 # Contrat IPC de Library Manager
 
-Ce document est la référence commune à `crates/library-core/src/models.rs`, aux commandes Tauri et à `src/lib/contracts.ts`. Les propriétés JSON sont en `camelCase`. Les enums sont les chaînes ci-dessous. Les `Option<T>` Rust deviennent `T | null`, jamais une valeur inventée. Les dates sont des chaînes RFC 3339 UTC, les tailles des nombres entiers sûrs et les identifiants des UUID. Une pagination est bornée à 200 livres.
+Ce document est la référence commune à `crates/library-core/src/models.rs`, aux commandes Tauri et à `src/lib/contracts.ts`. Les propriétés JSON sont en `camelCase`. Les enums sont les chaînes ci-dessous. Les `Option<T>` Rust deviennent `T | null`, jamais une valeur inventée. Les dates sont des chaînes RFC 3339 UTC, les tailles des nombres entiers sûrs et les identifiants des chaînes opaques générées par le backend. Les livres et tâches utilisent des UUID ; les appareils peuvent employer une identité stable dérivée du volume ou du protocole. Une pagination est bornée à 200 livres.
 
 ## Types de bibliothèque
 
@@ -171,14 +171,14 @@ interface AppError {
     | 'invalidEpub' | 'unsafePath' | 'revisionConflict' | 'deviceDisconnected'
     | 'insufficientSpace' | 'networkUnavailable' | 'providerNotConfigured'
     | 'providerError' | 'rateLimited' | 'secretStoreUnavailable'
-    | 'conversionFailed' | 'operationConflict' | 'cancelled' | 'internal';
+    | 'conversionFailed' | 'operationConflict' | 'profileInUse' | 'cancelled' | 'internal';
   message: string;
   retryable: boolean;
   detail: string | null;
 }
 ```
 
-Le fournisseur `codex` utilise l’API OpenAI dans le mode autonome ; une liaison à un CLI Codex déjà présent est une capacité optionnelle. Le fournisseur `claude` suit la même séparation. Les capacités affichées sont découvertes ou documentées ; une valeur inconnue reste `null`. Le moteur web commun fournit des sources à tous les connecteurs. `webEnabled=false` est un choix utilisateur explicite, affiché dans le chat et empêchant de prétendre que l’information a été vérifiée en ligne.
+Les six fournisseurs utilisent leur API dans cette version. `codex` correspond à l’API OpenAI Responses ; aucun CLI Codex ou Claude n’est invoqué. Les valeurs `localCli` du contrat sont réservées à une extension et ne sont pas annoncées comme disponibles. Les capacités affichées sont découvertes ou documentées ; une valeur inconnue reste `null`. Le moteur web commun fournit des sources à tous les connecteurs. `webEnabled=false` est un choix utilisateur explicite, affiché dans le chat et empêchant de prétendre que l’information a été vérifiée en ligne.
 
 `settings_get` et `providers_list` ne retournent jamais une clé. Une clé est envoyée uniquement à `provider_set_secret`, conservée dans le trousseau Linux ou en mémoire pour la session, et supprimée des erreurs/journaux. Les erreurs publiques sont des objets ; l’interface localise leur code et montre un détail borné sans donnée sensible.
 
@@ -194,6 +194,7 @@ interface ReaderManifest {
 interface ReaderSection {
   bookId: string; sectionIndex: number; html: string;
   resources: { id: string; url: string; mediaType: string }[];
+  warnings: string[];
 }
 ```
 
@@ -239,7 +240,9 @@ Les noms ci-dessous sont les chaînes exactes utilisées par `invoke`. Les param
 | `operations_list` | aucun | `Operation[]` |
 | `operation_undo` | `{ id }` | `Operation` |
 
-Seule l’importation accepte des chemins sources, validés comme fichiers réguliers. La racine de bibliothèque est un réglage validé depuis le dialogue natif. Les destinations, variantes et fichiers d’appareil sont calculés depuis des IDs autoritatifs. Les commandes n’acceptent ni commande shell, ni SQL, ni chemin de destination fourni pour contourner le stockage.
+Seule l’importation accepte des chemins sources, validés comme fichiers réguliers. Un appel accepte au plus 200 chemins ; l’interface découpe les sélections plus importantes en lots séquentiels. La racine de bibliothèque est le dossier de données de l’application, affiché en lecture seule et imposé côté backend. Les destinations, variantes et fichiers d’appareil sont calculés depuis des IDs autoritatifs. Les commandes n’acceptent ni commande shell, ni SQL, ni chemin de destination fourni pour contourner le stockage.
+
+`deviceIndex` conserve un résultat `{ deviceId, books, total, truncated, warnings }`. L’aperçu renvoyé à l’interface est limité à 500 lignes et 768 KiB ; l’index et le calcul des présences en base restent complets. `transfer` renvoie les comptes `copied`, `skipped`, `failed`, les résultats par livre et les avertissements. Une tâche `chat` conserve son `conversationId` dès sa mise en file, même lorsqu’elle attend une configuration.
 
 ## Événements
 

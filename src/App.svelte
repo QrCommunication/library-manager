@@ -1,0 +1,361 @@
+<script lang="ts">
+  import { onDestroy, onMount } from 'svelte';
+  import { getCurrentWebview } from '@tauri-apps/api/webview';
+  import type { UnlistenFn } from '@tauri-apps/api/event';
+  import {
+    Activity, BookOpen, Heart, Layers, Library, LoaderCircle, MessageSquare,
+    Plus, RefreshCw, Search, Settings as SettingsIcon, Tablet, Tags, Users, X,
+  } from '@lucide/svelte';
+  import LibraryView, { type LibraryViewState } from './lib/components/LibraryView.svelte';
+  import BookPanel from './lib/components/BookPanel.svelte';
+  import DevicesView from './lib/components/DevicesView.svelte';
+  import ChatView from './lib/components/ChatView.svelte';
+  import SettingsView from './lib/components/SettingsView.svelte';
+  import ReaderView from './lib/components/ReaderView.svelte';
+  import ActivityView from './lib/components/ActivityView.svelte';
+  import { chooseBooks, isNative, isPreview, normalizePublicError, request, subscribe } from './lib/api';
+  import { defaultQuery } from './lib/contracts';
+  import type { AppBootstrap, AppError, Book, BookQuery, Device, Job, Settings } from './lib/contracts';
+  import { setLanguage, t } from './lib/i18n';
+
+  type View = 'library' | 'devices' | 'chat' | 'activity' | 'settings';
+  type NavigationKey = View | 'authors' | 'series' | 'genres' | 'reading' | 'favorites';
+  type GroupBy = 'none' | 'author' | 'series' | 'genre';
+
+  const navigation = [
+    { key: 'library', label: 'sidebar.library', icon: Library },
+    { key: 'authors', label: 'filters.authors', icon: Users },
+    { key: 'series', label: 'filters.series', icon: Layers },
+    { key: 'genres', label: 'filters.genres', icon: Tags },
+    { key: 'reading', label: 'sidebar.reading', icon: BookOpen },
+    { key: 'favorites', label: 'sidebar.favorites', icon: Heart },
+    { key: 'devices', label: 'sidebar.devices', icon: Tablet },
+    { key: 'chat', label: 'sidebar.chat', icon: MessageSquare },
+    { key: 'activity', label: 'sidebar.activity', icon: Activity },
+  ] as const;
+
+  let bootstrap = $state<AppBootstrap | null>(null);
+  let devices = $state<Device[]>([]);
+  let jobs = $state<Job[]>([]);
+  let startupBusy = $state(true);
+  let importing = $state(false);
+  let choosingBooks = $state(false);
+  let importGeneration = 0;
+  const IMPORT_BATCH_SIZE = 200;
+  let dragging = $state(false);
+  let activeView = $state<View>('library');
+  let navigationKey = $state<NavigationKey>('library');
+  let initialQuery = $state<BookQuery>(defaultQuery());
+  let libraryState = $state<LibraryViewState | null>(null);
+  let groupBy = $state<GroupBy>('none');
+  let search = $state('');
+  let selectedBookIds = $state<string[]>([]);
+  let detailBook = $state<Book | null>(null);
+  let readingBook = $state<Book | null>(null);
+  let refreshVersion = $state(0);
+  let error = $state<AppError | null>(null);
+  let toast = $state<string | null>(null);
+  let searchInput = $state<HTMLInputElement>();
+  let toastTimer: ReturnType<typeof setTimeout> | undefined;
+  let destroyed = false;
+  const unlisteners: UnlistenFn[] = [];
+
+  const connectedDevice = $derived(devices.find((device) => device.connected) ?? null);
+  const activeJobCount = $derived(jobs.filter((job) => job.status === 'queued' || job.status === 'running').length);
+  const preview = isPreview();
+
+  function notify(message: string): void {
+    if (destroyed) return;
+    if (toastTimer) clearTimeout(toastTimer);
+    toast = message;
+    toastTimer = setTimeout(() => { toast = null; }, 6000);
+  }
+
+  function reportError(cause: unknown): void {
+    if (!destroyed) error = normalizePublicError(cause);
+  }
+
+  function applySettings(settings: Settings): void {
+    setLanguage(settings.language, bootstrap?.systemLanguage);
+    document.documentElement.dataset.theme = settings.theme;
+  }
+
+  function changeSettings(settings: Settings): void {
+    if (bootstrap) bootstrap.settings = settings;
+    applySettings(settings);
+    refreshVersion += 1;
+  }
+
+  function navigate(key: NavigationKey): void {
+    navigationKey = key;
+    readingBook = null;
+    detailBook = null;
+    if (key === 'devices' || key === 'chat' || key === 'activity' || key === 'settings') {
+      activeView = key;
+      return;
+    }
+    activeView = 'library';
+    libraryState = null;
+    const query = defaultQuery();
+    groupBy = key === 'authors' ? 'author' : key === 'series' ? 'series' : key === 'genres' ? 'genre' : 'none';
+    if (key === 'authors') query.sort = 'author';
+    if (key === 'series') query.sort = 'series';
+    if (key === 'reading') query.readStatus = 'reading';
+    if (key === 'favorites') query.favorite = true;
+    initialQuery = query;
+  }
+
+  function openReader(book: Book): void {
+    detailBook = null;
+    readingBook = book;
+  }
+
+  async function loadBootstrap(): Promise<void> {
+    startupBusy = true;
+    error = null;
+    try {
+      const result = await request('app_bootstrap', undefined);
+      if (destroyed) return;
+      bootstrap = result;
+      devices = result.devices;
+      jobs = result.pendingJobs;
+      applySettings(result.settings);
+    } catch (cause: unknown) {
+      reportError(cause);
+    } finally {
+      if (!destroyed) startupBusy = false;
+    }
+  }
+
+  async function importPaths(paths: string[]): Promise<void> {
+    if (destroyed || importing || choosingBooks) return;
+    const uniquePaths = [...new Set(paths.filter((path) => path.length > 0))];
+    if (uniquePaths.length === 0) return;
+    const generation = ++importGeneration;
+    importing = true;
+    let queued = 0;
+    try {
+      for (let offset = 0; offset < uniquePaths.length; offset += IMPORT_BATCH_SIZE) {
+        if (destroyed || generation !== importGeneration) return;
+        const batch = uniquePaths.slice(offset, offset + IMPORT_BATCH_SIZE);
+        const job = await request('import_books', { paths: batch });
+        if (destroyed || generation !== importGeneration) return;
+        jobs = [...jobs.filter((existing) => existing.id !== job.id), job];
+        queued += batch.length;
+        if (offset === 0) navigate('library');
+        notify($t('library.importQueued', { count: queued, total: uniquePaths.length }));
+        refreshVersion += 1;
+      }
+    } catch (cause: unknown) {
+      if (generation === importGeneration) reportError(cause);
+    } finally {
+      if (!destroyed && generation === importGeneration) importing = false;
+    }
+  }
+
+  async function importBooks(): Promise<void> {
+    if (destroyed || importing || choosingBooks) return;
+    choosingBooks = true;
+    try {
+      const paths = await chooseBooks($t('library.import'));
+      choosingBooks = false;
+      await importPaths(paths);
+    } catch (cause: unknown) {
+      reportError(cause);
+    } finally {
+      if (!destroyed) choosingBooks = false;
+    }
+  }
+
+  function keepSubscription(unlisten: UnlistenFn): void {
+    if (destroyed) void Promise.allSettled([Promise.resolve().then(unlisten)]);
+    else unlisteners.push(unlisten);
+  }
+
+  function updateJob(job: Job): void {
+    if (destroyed) return;
+    const previous = jobs.find((candidate) => candidate.id === job.id);
+    jobs = [...jobs.filter((candidate) => candidate.id !== job.id), job];
+    if (previous?.status !== job.status && ['completed', 'failed', 'cancelled'].includes(job.status)) {
+      refreshVersion += 1;
+      if (job.error) reportError(job.error);
+      else notify(`${$t(`jobs.${job.kind}`)} · ${$t(`jobs.${job.status}`)}`);
+    }
+  }
+
+  function focusSearch(event: KeyboardEvent): void {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+      event.preventDefault();
+      searchInput?.focus();
+      searchInput?.select();
+    }
+  }
+
+  onMount(() => {
+    void loadBootstrap();
+    document.addEventListener('keydown', focusSearch);
+    if (isNative() || preview) {
+      void Promise.allSettled([
+        subscribe('library:changed', () => { if (!destroyed) refreshVersion += 1; }),
+        subscribe('devices:changed', (event) => { if (!destroyed) devices = event.devices; }),
+        subscribe('job:updated', (event) => updateJob(event.job)),
+      ]).then((results) => {
+        for (const result of results) {
+          if (result.status === 'fulfilled') keepSubscription(result.value);
+          else reportError(result.reason);
+        }
+      });
+    }
+    if (isNative()) {
+      void getCurrentWebview().onDragDropEvent(({ payload }) => {
+        if (destroyed) return;
+        dragging = payload.type === 'enter' || payload.type === 'over';
+        if (payload.type === 'drop') void importPaths(payload.paths);
+      }).then(keepSubscription).catch(reportError);
+    }
+  });
+
+  onDestroy(() => {
+    destroyed = true;
+    importGeneration += 1;
+    if (toastTimer) clearTimeout(toastTimer);
+    if (typeof document !== 'undefined') document.removeEventListener('keydown', focusSearch);
+    void Promise.allSettled(unlisteners.map((unlisten) => Promise.resolve().then(unlisten)));
+  });
+</script>
+
+<a class="skip-link" href="#main-content">{$t('library.title')}</a>
+
+<div class="app-shell">
+  <aside class="sidebar" aria-label={$t('app.name')}>
+    <div class="sidebar-brand">
+      <img src="/library-manager.png" alt="" width="42" height="42" />
+      <div class="brand-text">Library<br />Manager<span class="brand-subtitle">{$t('sidebar.library')}</span></div>
+    </div>
+    <nav class="sidebar-nav" aria-label={$t('app.name')}>
+      {#each navigation as item (item.key)}
+        <button
+          class="nav-item"
+          class:active={navigationKey === item.key}
+          aria-current={navigationKey === item.key ? 'page' : undefined}
+          aria-label={$t(item.label)}
+          title={$t(item.label)}
+          onclick={() => navigate(item.key)}
+        >
+          <item.icon size={19} aria-hidden="true" />
+          <span class="nav-label">{$t(item.label)}</span>
+          {#if item.key === 'activity' && activeJobCount > 0}<span class="nav-count">{activeJobCount}</span>{/if}
+        </button>
+      {/each}
+    </nav>
+    <div class="sidebar-footer">
+      <div class="sidebar-card">
+        <span class="eyebrow">{$t('devices.title')}</span>
+        <strong>{connectedDevice?.label ?? $t('devices.disconnected')}</strong>
+        <span>{connectedDevice ? $t('devices.connected') : $t('devices.emptyDescription')}</span>
+      </div>
+      <button class="nav-item" class:active={navigationKey === 'settings'} aria-current={navigationKey === 'settings' ? 'page' : undefined} aria-label={$t('sidebar.settings')} title={$t('sidebar.settings')} onclick={() => navigate('settings')}>
+        <SettingsIcon size={19} aria-hidden="true" /><span class="nav-label">{$t('sidebar.settings')}</span>
+      </button>
+      <span class="small muted nav-label">{$t('settings.version', { name: bootstrap?.version ?? '0.1.0' })}</span>
+    </div>
+  </aside>
+
+  <div class="main-panel">
+    {#if preview}
+      <div class="preview-banner" role="status">
+        <strong>{$t('app.preview')}</strong><span>{$t('app.previewDescription')}</span>
+      </div>
+    {/if}
+    <header class="topbar">
+      <div class="global-search">
+        <Search size={18} aria-hidden="true" />
+        <input
+          class="input"
+          type="search"
+          bind:this={searchInput}
+          bind:value={search}
+          aria-label={$t('search.label')}
+          placeholder={$t('search.placeholder')}
+          oninput={() => { if (activeView !== 'library' || readingBook) navigate('library'); }}
+        />
+      </div>
+      <div class="row">
+        <button class="device-indicator" onclick={() => navigate('devices')} title={$t('devices.title')}>
+          <span class="status-dot" class:connected={connectedDevice !== null}></span>
+          <span>{connectedDevice?.label ?? $t('devices.disconnected')}</span>
+        </button>
+        <button class="icon-button" aria-label={$t('library.import')} title={$t('library.import')} disabled={preview || startupBusy || !bootstrap || importing || choosingBooks} onclick={() => void importBooks()}><Plus size={19} aria-hidden="true" /></button>
+      </div>
+    </header>
+
+    <main id="main-content" tabindex="-1">
+      {#if error}
+        <div class="shell-error">
+          <div class="error-banner" role="alert">
+            <div class="grow"><strong>{$t(`errors.${error.code}`)}</strong>{#if !isNative() && !preview}<p>{$t('app.previewDescription')}</p>{/if}</div>
+            <button class="icon-button" aria-label={$t('actions.close')} onclick={() => { error = null; }}><X size={18} aria-hidden="true" /></button>
+          </div>
+        </div>
+      {/if}
+      {#if startupBusy}
+        <div class="empty-state" role="status"><LoaderCircle size={28} aria-hidden="true" /><h2>{$t('app.loading')}</h2></div>
+      {:else if !bootstrap}
+        <div class="empty-state">
+          <Library size={48} aria-hidden="true" /><h2>{$t('app.initializationError')}</h2>
+          <p>{$t('app.previewDescription')}</p>
+          <div class="row wrap">
+            <button class="button primary" onclick={() => void loadBootstrap()}><RefreshCw size={17} aria-hidden="true" />{$t('actions.retry')}</button>
+            {#if !isNative() && !preview}<a class="button secondary" href="?demo=1">{$t('app.preview')}</a>{/if}
+          </div>
+        </div>
+      {:else if readingBook}
+        <ReaderView book={readingBook} onClose={() => { readingBook = null; }} onNotify={notify} onError={reportError} />
+      {:else if activeView === 'library'}
+        <LibraryView
+          {initialQuery} {search} {groupBy} {refreshVersion} {selectedBookIds} {importing}
+          initialState={libraryState} onStateChange={(state: LibraryViewState) => { libraryState = state; }}
+          onSelectionChange={(ids: string[]) => { selectedBookIds = ids; }}
+          onOpenBook={(book: Book) => { detailBook = book; }}
+          onReadBook={openReader} onImport={importBooks} onNotify={notify} onError={reportError}
+        />
+      {:else if activeView === 'devices'}
+        <DevicesView
+          {devices} {selectedBookIds} {refreshVersion}
+          onDevicesChange={(next: Device[]) => { devices = next; }} onNotify={notify} onError={reportError}
+        />
+      {:else if activeView === 'chat'}
+        <ChatView {selectedBookIds} {refreshVersion} onNotify={notify} onError={reportError} />
+      {:else if activeView === 'activity'}
+        <ActivityView {refreshVersion} onNotify={notify} onError={reportError} />
+      {:else if activeView === 'settings'}
+        <SettingsView settings={bootstrap.settings} onSettingsChange={changeSettings} onNotify={notify} onError={reportError} />
+      {/if}
+    </main>
+  </div>
+</div>
+
+{#if detailBook}
+  <BookPanel
+    book={detailBook} {refreshVersion} onClose={() => { detailBook = null; }} onReadBook={openReader}
+    onUpdated={(book: Book) => { detailBook = book; refreshVersion += 1; }} onNotify={notify} onError={reportError}
+  />
+{/if}
+
+{#if dragging}
+  <div class="drop-overlay" role="status"><div class="drop-zone active"><Plus size={32} aria-hidden="true" /><h2>{$t('library.dropTitle')}</h2><p>{$t('library.dropDescription')}</p></div></div>
+{/if}
+
+{#if toast}
+  <div class="toast" role="status"><span class="grow">{toast}</span><button class="icon-button" aria-label={$t('actions.close')} onclick={() => { toast = null; }}><X size={18} aria-hidden="true" /></button></div>
+{/if}
+
+<style>
+  .sidebar { overflow-y: auto; }
+  .shell-error { padding: 22px 40px 0; }
+  .shell-error .error-banner { margin-bottom: 0; }
+  .drop-overlay { position: fixed; inset: 0; z-index: var(--z-drawer); display: grid; place-items: center; padding: 32px; background: var(--overlay); pointer-events: none; }
+  .drop-overlay .drop-zone { width: min(560px, 100%); box-shadow: var(--shadow-md); }
+  @media (max-width: 1200px) { .shell-error { padding-inline: 28px; } }
+  @media (max-width: 680px) { .shell-error { padding-inline: 18px; } }
+</style>

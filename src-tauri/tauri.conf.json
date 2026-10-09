@@ -1,0 +1,65 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Library Manager",
+  "version": "0.1.0",
+  "identifier": "fr.qrcommunication.librarymanager",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Library Manager",
+        "width": 1440,
+        "height": 940,
+        "minWidth": 1100,
+        "minHeight": 700
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src ipc: http://ipc.localhost; frame-src 'self' about: blob:; object-src 'none'; base-uri 'none'; form-action 'none'",
+      "devCsp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src ipc: http://ipc.localhost ws://127.0.0.1:1420; frame-src 'self' about: blob:; object-src 'none'; base-uri 'none'; form-action 'none'",
+      "assetProtocol": {
+        "enable": false,
+        "scope": []
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb", "rpm", "appimage"],
+    "category": "Education",
+    "publisher": "QRCommunication",
+    "homepage": "https://github.com/QrCommunication/library-manager",
+    "license": "GPL-3.0-only",
+    "licenseFile": "../LICENSE",
+    "shortDescription": "Standalone ebook library manager with AI metadata and ereader optimization",
+    "longDescription": "Library Manager is a standalone desktop ebook library manager with an integrated reader, AI-assisted metadata, EPUB optimization, and USB or wireless ereader transfers.\nLibrary Manager est une application autonome de gestion des livres numériques avec lecteur intégré, métadonnées assistées par IA, optimisation EPUB et transferts vers les liseuses en USB ou sans fil.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png"
+    ],
+    "externalBin": ["binaries/library-manager-mobitool"],
+    "resources": {
+      "../vendor/libmobi-0.12/COPYING": "licenses/libmobi-COPYING",
+      "../LICENSE": "licenses/Library-Manager-GPL3",
+      "../docs/THIRD_PARTY_NOTICES.md": "licenses/THIRD_PARTY_NOTICES.md",
+      "../assets/brand/": "brand/"
+    },
+    "linux": {
+      "deb": {
+        "section": "education",
+        "priority": "optional"
+      },
+      "rpm": {
+        "release": "1"
+      }
+    }
+  }
+}

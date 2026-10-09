@@ -1,0 +1,2 @@
+# Preserve the corresponding upstream source archive, including its formatting.
+vendor/libmobi-0.12/** -whitespace

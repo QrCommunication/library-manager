@@ -1,0 +1,39 @@
+[workspace]
+members = ["crates/library-core", "src-tauri"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "GPL-3.0-only"
+authors = ["QRCommunication"]
+repository = "https://github.com/QrCommunication/library-manager"
+homepage = "https://github.com/QrCommunication/library-manager"
+
+[workspace.dependencies]
+tauri = "2.12.1"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+quick-xml = "0.42"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "multipart", "stream", "form"] }
+tokio = { version = "1.53.2", features = ["full"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+uuid = { version = "1.27", features = ["v4", "serde"] }
+roxmltree = "0.21.1"
+thiserror = "2.0.21"
+sha2 = "0.11.0"
+sha1 = "0.11.0"
+chrono = { version = "0.4.45", features = ["serde"] }
+tempfile = "3.27.0"
+url = "2.5.8"
+walkdir = "2.5.0"
+unicode-normalization = "0.1.25"
+keyring = { version = "4.2.0", default-features = false, features = ["v1"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

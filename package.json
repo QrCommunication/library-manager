@@ -1,0 +1,44 @@
+{
+  "name": "library-manager",
+  "version": "0.1.0",
+  "description": "Standalone desktop ebook library manager with AI metadata, reader optimization, and USB or wireless transfers.",
+  "license": "GPL-3.0-only",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=26.11.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/QrCommunication/library-manager.git"
+  },
+  "bugs": {
+    "url": "https://github.com/QrCommunication/library-manager/issues"
+  },
+  "homepage": "https://github.com/QrCommunication/library-manager",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 1420",
+    "build": "vite build",
+    "check": "svelte-check --tsgo --tsconfig ./tsconfig.json",
+    "test": "vitest run",
+    "test:core": "cargo test -p library-core",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.12.1",
+    "@tauri-apps/plugin-dialog": "2.8.1",
+    "@tauri-apps/plugin-opener": "2.7.0",
+    "@lucide/svelte": "1.53.0"
+  },
+  "devDependencies": {
+    "@typescript/native": "npm:typescript@7.0.2",
+    "@sveltejs/vite-plugin-svelte": "7.3.1",
+    "@tauri-apps/cli": "2.12.1",
+    "svelte": "5.57.2",
+    "svelte-check": "4.7.6",
+    "typescript": "6.0.3",
+    "vite": "8.3.4",
+    "vitest": "5.0.3"
+  }
+}

@@ -1,135 +1,127 @@
-# Architecture de Library Manager
+# Architecture réalisée de Library Manager
 
-Décision du 9 octobre 2026. Voir [IPC.md](IPC.md) pour le contrat de l’application et [MASTER_PLAN.md](MASTER_PLAN.md) pour l’état réel de livraison.
+État du 9 octobre 2026. [IPC.md](IPC.md) décrit les 33 commandes et les cinq événements. [MASTER_PLAN.md](MASTER_PLAN.md) conserve les preuves de validation et l’état des paquets ; ce document décrit les composants présents.
 
-## Principes retenus
+## Application et frontières
 
-Library Manager est une application Linux autonome, distribuée sous GPL-3.0. Tauri 2 héberge une interface Svelte 5 et TypeScript stricte. Un crate Rust `library-core` contient les opérations sur les livres, SQLite, les appareils et les fournisseurs IA. Le noyau n’importe aucune API Tauri : `cargo test -p library-core` vérifie les fonctions métier sans WebView.
+Library Manager est une application Linux autonome sous GPL-3.0-only : Tauri 2, Svelte 5, TypeScript stricte et SQLite embarqué. Le moteur Rust `library-core` ne dépend pas de Tauri ou d’une WebView. Calibre n’est ni installé ni exécuté ; le moteur MOBI est distribué avec l’application.
 
-Le dossier de départ était vide : aucun modèle, service, schéma ou convention de code antérieur n’est à prolonger. Les règles globales AGENTS.md imposent la cartographie persistante, la séparation des responsabilités, une analyse d’impact et une validation de non-régression. La cartographie autorisée est dans `~/.Codex/projects/library-manager/memory/`.
+`src-tauri/src/main.rs` appelle `library_manager_lib::run()`. La bibliothèque desktop est produite uniquement en `rlib`, puis liée au binaire `library-manager`. La distribution Linux n’expose aucune bibliothèque native mobile et ne produit plus les sorties ABI staticlib/cdylib. Les configurations DEB/RPM/AppImage conservent ce binaire et le sidecar. Voir la [structure Tauri](https://v2.tauri.app/start/project-structure/) et les [types de liaison Rust](https://doc.rust-lang.org/reference/linkage.html).
 
-SQLite est compilé avec l’application, avec WAL, clés étrangères, JSON1, FTS5 et un délai de contention de cinq secondes. Les requêtes utilisent des paramètres liés. Les listes d’auteurs, genres et étiquettes sont des tableaux JSON validés ; des requêtes `json_each` construisent les facettes. Cette structure évite des tables d’administration inutiles tout en permettant des filtres combinés. Les fichiers ont leurs propres lignes : un même livre peut avoir un original, un EPUB corrigé et plusieurs variantes optimisées.
+Les commandes IPC font l’entrée/sortie et délèguent aux services. `LibraryManager` compose les services et exécute les jobs ; `BookRepository` possède les transactions métier. Les contrôleurs n’exécutent pas de SQL. Fichiers/ZIP/images utilisent `spawn_blocking`, le réseau reste async ; concurrence réglable de 1 à 4.
 
-Les originaux importés sont copiés dans un stockage privé et restent immuables. Les nouveaux fichiers sont construits dans un répertoire temporaire de même volume, validés, puis renommés atomiquement. Les chemins de fichiers gérés sont relatifs dans SQLite. Aucun contenu privé, jeton ou historique de lecture ne fait partie du dépôt public.
+Le Manager détient un verrou privé `runtime.lock` sans suivi de symlink, conservé par tous ses clones. La reprise des jobs intervient après acquisition. Une deuxième ouverture produit `profileInUse`. Le plugin d’instance unique ramène la fenêtre quand le bus de session est disponible ; les erreurs d’initialisation restent affichables. La cartographie autorisée se trouve dans `~/.Codex/projects/library-manager/memory/`.
 
-## Organisation des fichiers
+## Carte des fichiers présents
 
-| Fichier | Responsabilité et dépendances |
+| Fichier | Responsabilité |
 | --- | --- |
-| `Cargo.toml` | Workspace `crates/library-core` et `src-tauri`, versions et profil de livraison. |
-| `crates/library-core/Cargo.toml` | SQLite bundled, Tokio, Serde, XML, ZIP, images, HTTP et erreurs structurées ; aucun Tauri. |
-| `crates/library-core/src/lib.rs` | Exports, `LibraryManager` et assemblage des services ; pas de logique de contrôleur. |
-| `crates/library-core/src/models.rs` | Types du contrat, filtres, appareils, jobs, propositions IA, réglages et profils. |
-| `crates/library-core/src/error.rs` | Codes stables et erreurs internes ; conversion en erreurs publiques sans secret. |
-| `crates/library-core/migrations/001_initial.sql` | Schéma versionné décrit ci-dessous. |
-| `crates/library-core/src/database.rs` | Connexions, migrations, transactions et accès aux lignes persistantes. |
-| `crates/library-core/src/storage.rs` | Stockage privé, SHA-256, chemins bornés, écriture atomique, journal et annulation. |
-| `crates/library-core/src/library.rs` | Imports idempotents, facettes, filtrage, mises à jour et révisions. |
-| `crates/library-core/src/epub.rs` | Inspection ZIP/XML, métadonnées EPUB 2/3, manifeste, spine, couvertures et réécriture OPF. |
-| `crates/library-core/src/reader.rs` | Sections assainies, ressources autorisées, sommaire et positions de lecture. |
-| `crates/library-core/src/optimizer.rs` | Profils, images, compression et contrôle d’intégrité des dérivés. |
-| `crates/library-core/src/conversion.rs` | Matrice de conversion, génération EPUB/HTML/TXT/FB2 et invocation bornée du moteur MOBI embarqué. |
-| `crates/library-core/src/mobi.rs` | Export MOBI 6 simple lorsqu’il est proposé, sans DRM ni promesse d’export KF8. |
-| `crates/library-core/src/devices.rs` | Montages Linux, identification USB/SD, inventaires et rapprochement des livres. |
-| `crates/library-core/src/transfer.rs` | Plans auteur → série, espace libre, copies vérifiées et annulation conditionnelle. |
-| `crates/library-core/src/crosspoint.rs` | Client LAN HTTP/WebSocket CrossPoint, authentification et inventaire distant. |
-| `crates/library-core/src/calibre_wireless.rs` | Adaptateur du protocole appareil sans fil, distinct du serveur HTTP CrossPoint. |
-| `crates/library-core/src/providers.rs` | Six fournisseurs configurables, catalogue de modèles et adaptateurs de messages. |
-| `crates/library-core/src/web.rs` | Recherche bibliographique et récupération de pages publiques avec limites et protection SSRF. |
-| `crates/library-core/src/enrichment.rs` | Sources, proposition structurée, confiance, validation et application des métadonnées. |
-| `crates/library-core/src/chat.rs` | Conversations, contexte des livres, appels aux fournisseurs et sources affichables. |
-| `crates/library-core/src/jobs.rs` | File durable, reprise, progression, annulation et limitation de concurrence. |
-| `src-tauri/src/lib.rs` | Configuration Tauri, état partagé, commandes, événements et ressources du lecteur. |
-| `src-tauri/src/main.rs` | Entrée native minimale. |
-| `src-tauri/src/commands.rs` | Validation des entrées IPC et délégation au noyau. |
-| `src-tauri/tauri.conf.json` | Identifiant, CSP, icônes, ressources embarquées et bundles DEB/RPM/AppImage. |
-| `src-tauri/capabilities/default.json` | Fenêtre principale et dialogue natif ; aucune permission shell arbitraire. |
-| `src/lib/contracts.ts` | Types de `IPC.md` et unions des commandes/événements. |
-| `src/lib/api.ts` | Façade typée `invoke`/`listen` ; aperçu navigateur explicitement identifié. |
-| `src/lib/i18n.ts` | Langue système normalisée, choix utilisateur et fallback de clés. |
-| `src/locales/fr.json`, `src/locales/en.json` | Dictionnaires complets de même structure. |
-| `src/lib/components/LibraryView.svelte` | Grille et table, recherche, tri, facettes, sélection et badges appareil. |
-| `src/lib/components/BookDetails.svelte` | Métadonnées, provenance, révisions, variantes et actions sur le livre. |
-| `src/lib/components/ReaderView.svelte` | Sommaire, réglages de lecture, progression et iframe de contenu isolée. |
-| `src/lib/components/DevicesView.svelte` | Appareils connectés, profils, inventaires, surbrillance et transfert. |
-| `src/lib/components/ChatView.svelte` | Conversation, contexte sélectionné, fournisseur, modèle et citations. |
-| `src/lib/components/SettingsView.svelte` | Langue, stockage, fournisseurs, secrets masqués et profils. |
-| `src/App.svelte` | Shell immédiatement visible et navigation ; chargements et erreurs isolés par panneau. |
-| `src/app.css` | Identité visuelle, contraste, thèmes, focus clavier et mouvement réduit. |
-| `scripts/build-mobi-engine.sh` | Construction reproductible du moteur embarqué depuis une source vérifiée. |
-| `scripts/check-locales.mjs` | Parité des clés et validité des paramètres de traduction. |
-| `.github/workflows/ci.yml` | Format, Clippy, tests Rust, tests UI, types et build. |
-| `.github/workflows/release.yml` | Construction des paquets, sommes SHA-256 et publication de versions. |
+| `Cargo.toml`, `rust-toolchain.toml` | Workspace core/desktop, versions partagées, Rust 1.99 et profil de livraison. |
+| `crates/library-core/src/lib.rs` | Façade publique du moteur et interdiction unsafe. |
+| `crates/library-core/src/models.rs`, `error.rs` | Contrats Serde, filtres, patches nullable et erreurs publiques sans secrets. |
+| `crates/library-core/migrations/001_initial.sql`, `database.rs` | Schéma versionné, connexions privées et migrations SQLite. |
+| `crates/library-core/src/book_repository.rs` | Livres, variantes, recherche, facettes, présence, révisions, progression et journal transactionnel. |
+| `crates/library-core/src/storage.rs` | Originaux immuables, SHA-256, capacités de chemin et publication atomique sans écrasement. |
+| `crates/library-core/src/library.rs` | Import, normalisation, couverture, corrections, conversion, optimisation et undo. |
+| `crates/library-core/src/settings.rs` | Préférences validées ; racine de bibliothèque fixée à la construction. |
+| `crates/library-core/src/manager.rs` | Cycle de vie, dispatch, annulation, attente configuration, scans et événements. |
+| `crates/library-core/src/epub.rs` | ZIP/XML bornés, EPUB 2/3, rôles bibliographiques, OPF, manifeste, spine et sommaire. |
+| `crates/library-core/src/reader.rs` | Sections assainies, images locales bornées et positions. |
+| `crates/library-core/src/optimizer.rs` | Quatre profils, images/polices/compression et validation des dérivés. |
+| `crates/library-core/src/conversion.rs` | Matrice réelle, conversions natives et processus MOBI embarqué borné. |
+| `crates/library-core/src/devices.rs` | Montages USB/SD/MTP accessibles, identité, inventaire et rapprochement par contenu. |
+| `crates/library-core/src/transfer.rs` | Copies USB et client HTTP CrossPoint, staging, vérification et annulation. |
+| `crates/library-core/src/calibre_wireless.rs` | Serveur TCP smart-device autonome compatible Calibre/KOReader. |
+| `crates/library-core/src/providers.rs` | Six API, catalogues dynamiques et secrets session/coffre Linux. |
+| `crates/library-core/src/web.rs` | Recherche et pages publiques, protection SSRF et budgets. |
+| `crates/library-core/src/enrichment.rs` | Propositions bibliographiques avec preuves ; aucune mutation directe. |
+| `crates/library-core/src/chat.rs` | Conversations, plans de recherche validés, contexte et citations obtenues. |
+| `crates/library-core/src/jobs.rs` | File durable, tentatives, reprise, attente, résultats et tokens d’annulation. |
+| `src-tauri/src/lib.rs`, `main.rs`, `commands.rs` | Shell, état d’initialisation, plugins et pont IPC/événements. |
+| `src-tauri/build.rs`, `vendor/libmobi-0.12/` | Construction native du sidecar depuis les sources versionnées. |
+| `src-tauri/tauri.conf.json`, `capabilities/default.json` | Fenêtre, CSP, dialogue natif et bundles Linux ; aucune permission shell arbitraire. |
+| `src/lib/contracts.ts`, `api.ts`, `preview.ts` | IPC typée et aperçu navigateur explicitement identifié avec fixtures synthétiques. |
+| `src/lib/i18n.ts`, `locales/fr.json`, `locales/en.json` | Langue système, sélection, fallback et découverte des dictionnaires. |
+| `src/lib/components/LibraryView.svelte` | Grille/table, recherche, tris, facettes, pagination, sélection et présence. |
+| `src/lib/components/BookPanel.svelte` | Fiche, propositions IA, variantes et actions. |
+| `src/lib/components/ReaderView.svelte` | Sommaire, préférences, progression et iframe opaque srcdoc. |
+| `src/lib/components/DevicesView.svelte` | Appareils, connexion manuelle, inventaire et transferts. |
+| `src/lib/components/ChatView.svelte`, `SettingsView.svelte` | Chat, fournisseurs/modèles, sources, langue, thème et préférences. |
+| `src/lib/components/ActivityView.svelte` | Jobs, résultats, attentes/erreurs, annulation et opérations réversibles. |
+| `src/App.svelte`, `src/app.css` | Navigation, session de recherche conservée au retour du lecteur, identité et thèmes. |
+| `src/lib/api.test.ts`, `i18n.test.ts`, `preview.test.ts` | Tests frontend des contrats, traductions et aperçu. |
+| `scripts/native-smoke.py` | Parcours du vrai binaire avec tauri-driver, profil isolé et rapport/capture optionnels. |
+| `scripts/third-party-notices.py`, `vendor/licenses/` | Inventaire verrouillé et notices originales vérifiables. |
+| `.github/workflows/ci.yml` | Contrôles, paquets, contenu distribué, source correspondante, SHA-256 et artefacts CI. |
 
-Les fichiers de service restent focalisés. Si un module dépasse son rôle, la subdivision se fait par responsabilité réelle, sans imposer une interface abstraite à chaque fonction. Les adaptateurs sont justifiés pour les six fournisseurs IA et les trois transports d’appareils.
+## Persistance et intégrité
 
-## Schéma SQLite
+SQLite utilise WAL, clés étrangères, JSON1, FTS5, tables strictes et requêtes liées. `books` conserve bibliographie, données personnelles, progression et révision ; `book_files` conserve variantes, chemins relatifs, formats, profils, tailles et hash. Le format et la taille affichés viennent de l’original. Les listes sont des JSON validés.
 
-`books` contient `id`, `title`, `authors_json`, `author_sort`, `series`, `series_index`, `genres_json`, `tags_json`, `language`, `description`, `isbn`, `publisher`, `published`, `cover_relative_path`, `read_status`, `reading_progress`, `reader_location`, `favorite`, `rating`, `notes`, `metadata_status`, `metadata_confidence`, `revision`, `added_at`, `updated_at`. Les indices portent sur auteur/titre, série/numéro, langue et statut. Les tableaux JSON ont un `CHECK(json_valid(...))`. La progression est dans `[0,1]`, la note dans `[0,5]` et la confiance dans `[0,1]`.
+`devices`/`device_books` conservent identités et inventaires ; un ancien chemin seul n’autorise jamais une écriture. `jobs` conserve une enveloppe privée versionnée, tentative, résultat et erreur publique. `operations` conserve les snapshots avant/après du livre et de ses variantes actives. `settings`, `provider_catalogs`, `conversations` et `messages` stockent préférences non secrètes, catalogues et chat.
 
-`book_files` contient `id`, `book_id`, `format`, `variant`, `profile`, `relative_path`, `sha256`, `size_bytes`, `created_at`. `relative_path` est unique ; la déduplication d’un original se fait par SHA-256. Les formats et tailles affichés dans `Book` sont dérivés du fichier principal, sans colonne redondante dans `books`.
+La recherche combine FTS5 sur titre/auteurs/série/genres/description et recherche littérale sur ISBN, éditeur et notes. Les notes sont recherchables localement et exclues des contextes IA. Les filtres utilisent OR dans une dimension et AND entre dimensions. Livre, FTS, variantes et journal sont modifiés dans une même transaction.
 
-`devices` contient `id`, `label`, `transport`, `profile`, `mount_identity`, `last_seen_at`. Une racine de montage est redécouverte à chaque connexion : un ancien chemin seul n’autorise jamais une écriture. `device_books` contient `device_id`, `relative_path`, `book_id` nullable, `sha256`, `title`, `authors_json`, `format`, `size_bytes`, `last_seen_at`, avec clé composée appareil/chemin. Le lien au livre est supprimé avec `SET NULL` ; les informations d’un livre distant restent disponibles.
+Les originaux sont conservés dans `books/originals/<sha256>.<format>`. Les variantes ont des chemins auteur → série avec indices zéro/fractionnaires et identifiant évitant les collisions. Undo restaure les variantes actives du snapshot précédent, garde les artefacts historiques et refuse une révision récente. Les preuves/propositions IA restent dans les résultats de jobs ; le journal conserve les snapshots, pas un registre supplémentaire de preuve par champ.
 
-`jobs` contient `id`, `kind`, `status`, `progress`, `payload_json`, `result_json`, `error_json`, `created_at`, `updated_at`. `operations` contient `id`, `kind`, `status`, `before_json`, `after_json`, `backup_relative_path`, `created_at`. `settings` stocke les réglages non secrets. `provider_catalogs` conserve modèles, source, date et dernière erreur. `conversations` et `messages` conservent le chat et ses sources. La provenance des corrections est conservée dans le journal de l’opération, avec ancienne valeur, nouvelle valeur, source et confiance par champ.
+## Import et enrichissement
 
-`books_search` est une table FTS5 de titre, auteurs, série, genres et description, avec identifiant de livre non indexé. La transaction d’écriture met à jour livre, fichiers, recherche et journal ensemble. Une requête utilisateur n’est jamais interprétée comme du SQL ; les tokens FTS sont échappés.
+Le dialogue natif sélectionne les fichiers. Le service valide un fichier régulier et ses bornes, identifie le format par extension contrôlée, calcule le hash, déduplique, copie l’original puis catalogue le livre. Un EPUB compatible reçoit une couverture privée si disponible et une variante normalisée avec métadonnées et nom auteur → série. Certains EPUB imparfaits restent catalogués avec avertissements ; une transformation peut être refusée sans bloquer le reste du lot.
 
-## Flux métier
+Les autres formats sont conservés avec une bibliographie initiale prudente. Ils ne sont pas convertis automatiquement à l’import. Le glisser-déposer n’est pas un point d’entrée implémenté ; la conversion est une action explicite.
 
-### Import et enrichissement
+Avec enrichissement automatique activé, chaque nouvel import planifie un job durable. Fournisseur/clé/modèle absents : attente configuration ; réseau indisponible : reprises bornées. Les livres restent utilisables. Un import partiel conserve ses compteurs succès/doublons/erreurs. Le chat persiste son véritable conversationId avant génération.
 
-Dialogue/drag-and-drop → validation du fichier régulier et de ses limites → détection du format par signature → SHA-256 et déduplication → copie immuable → conversion interne vers EPUB si nécessaire → inspection OPF/spine/couverture → enregistrement → job d’enrichissement durable → sources bibliographiques publiques → fournisseur choisi → proposition JSON validée → application sûre ou état `needsReview` → EPUB dérivé et chemin auteur → série → événement de bibliothèque.
+L’enrichissement récupère des sources publiques puis demande une proposition JSON. ISBN, dates, langues, listes, champs nullable, indices et confiance sont validés. L’application automatique exige des preuves réellement récupérées et le seuil réglé ; les changements identitaires nécessitent des domaines indépendants. Sinon, la proposition reste disponible pour revue.
 
-Un fournisseur non configuré ou un réseau indisponible laisse le livre utilisable et le job `waitingForConfiguration` ou `waitingForNetwork`. La bibliothèque ne fabrique pas des informations vérifiées. Chaque ajout déclenche effectivement le pipeline ; un échec n’empêche pas les autres imports.
+Un job d’import conserve sa révision de départ. Une correction humaine durant une attente de clé ou une requête empêche l’application automatique ; une fiche vérifiée manuellement n’est pas rétrogradée. Seul `LibraryService` applique un patch, avec contrôle de révision du repository. Notes, favoris, évaluations et progression ne sont pas modifiables par le LLM.
 
-Les ISBN et rôles auteur/contributeur sont distingués. Un numéro décimal permet préquelles et nouvelles intercalées. Une édition scindée, une intégrale et une traduction sont des éditions du même univers : le nom de série ne dépend pas du découpage éditorial. Une proposition doit justifier une fusion de série et ne supprime jamais un fichier supposé doublon sans opération visible.
+Événements : `library:changed`, `devices:changed`, `job:updated`, `chat:delta`, `reader:progress`. Un AtomicBool partage l’annulation avec les travaux bloquants ; les contrôles avant publication et transaction empêchent les fins tardives de ressusciter un job.
 
-### Lecteur
+## Lecteur et optimisation
 
-Identifiant de livre → EPUB géré → sommaire et section → XML/HTML assaini → ressources locales résolues par identifiants opaques → iframe `sandbox` sans scripts ni accès au bridge → position persistée. La CSP bloque scripts, formulaires, frames supplémentaires et connexions distantes. Les liens externes sont des actions explicites de l’utilisateur, traitées par l’application. Le lecteur possède un état de chargement et d’erreur qui ne masque jamais le shell.
+Le lecteur choisit une variante EPUB gérée ou l’original EPUB. Un autre format doit avoir une variante EPUB issue d’une conversion explicite. Le backend assainit chaque section : scripts, handlers, formulaires, frames et ressources réseau retirés ; images locales en data URI bornées ; ressources vectorielles incompatibles signalées.
 
-### Optimisation et transfert
+`ReaderView` utilise `iframe srcdoc` avec `sandbox=""` et CSP restrictive, sans origine partagée, scripts ou bridge. Le sommaire imbriqué et les préférences sont disponibles. Section et fragment sont mémorisés ; une position avec fragment ouvre le début du chapitre avec avertissement. Filtres, tri, page et mode grille/table restent conservés après fermeture du lecteur.
 
-Livres sélectionnés + appareil identifié + profil → prévision des tailles et destinations → variante optimisée séparée → ZIP/OPF/spine et texte contrôlés → nouvelle vérification du montage et de l’espace libre → copie temporaire sur le même volume → SHA-256 → renommage final → journal et index de présence → événement.
+Profils : `lossless` recomprime sans changer les ressources ; `balanced` conserve les illustrations avec images limitées à 1200×1600 ; `xteink` utilise 480×800, niveaux de gris et qualité JPEG 75 ; `textOnly` retire les images en préservant texte et légendes accessibles. Les dimensions décrivent le profil, pas tous les modèles Xteink. La suppression sûre des polices met à jour CSS/manifeste/obfuscation ; les ressources impossibles à retirer sans risque restent avec avertissement.
 
-Le profil `lossless` recomprime sans perte. `balanced` réduit les images trop grandes tout en gardant toutes les illustrations. `xteink` vise les petites liseuses avec images adaptées et réglages EPUB simples. Une variante sans images ou sans polices demande une sélection explicite et porte un nom qui décrit cette perte. Les caches de progression, polices et réglages `.crosspoint` ne sont pas effacés. La mise à jour d’un fichier existant conserve une sauvegarde et ne change pas son chemin sans nécessité.
-
-Un appareil débranché annule proprement la copie en cours. L’annulation d’un transfert restaure uniquement les chemins dont le hash correspond encore au journal ; elle refuse d’écraser une modification extérieure.
-
-### IA et Internet
-
-Les connecteurs Z.ai, Kimi/Moonshot, MiniMax, OpenAI/Codex, Claude et Mistral implémentent modèles et messages. La découverte à la volée conserve sa provenance ; un catalogue officiel téléchargé et un endpoint authentifié sont distingués. Un échec montre l’erreur et la date du cache, pas une fausse liste présentée comme actuelle.
-
-L’accès Internet appartient au moteur commun. L’enrichissement récupère des sources avant l’appel au modèle, quel que soit le fournisseur. Les modèles capables d’appels d’outils reçoivent aussi `web_search` et `web_fetch`. Les outils sont bornés, publics et sans accès aux fichiers privés. Les APIs autonomes sont le chemin principal ; une connexion à un abonnement via un CLI déjà présent est un mode optionnel identifié et ne devient jamais une dépendance d’installation.
-
-Les requêtes web suivent seulement des URLs HTTP(S) publiques après validation DNS et à chaque redirection, limitent taille, durée et nombre de réponses, et ignorent les instructions trouvées dans un livre ou une page. Le client LAN d’appareil est séparé : seule une adresse d’appareil configurée peut être privée.
+Un dérivé séparé est produit, son texte/spine est comparé et son conteneur rouvert. L’optimisation peut être sélectionnée avant transfert. Aucun original n’est remplacé.
 
 ## Conversions autonomes
 
-EPUB est le format pivot. TXT, HTML et FB2 sont inspectés et empaquetés nativement. EPUB peut être exporté vers TXT, HTML et FB2 en conservant les chapitres, avec avertissement explicite lorsque le format cible perd de la mise en page.
+EPUB/TXT/HTML/FB2 peuvent être convertis vers EPUB/TXT/HTML/FB2/MOBI6. HTML est assaini, ses images locales contrôlées ; TXT conserve Unicode et paragraphes ; FB2 conserve sections et images compatibles. Le rapport signale les pertes de mise en page liées au format cible.
 
-Pour MOBI et KF8/AZW3 non chiffrés, embarquer `mobitool` construit depuis libmobi v0.12 LGPL-3.0. Il sait reconstruire un EPUB avec `-e`. Configuration recommandée : `--disable-shared --enable-static --enable-tools-static --enable-xmlwriter --with-libxml2=no --with-zlib=no --disable-encryption`. Le source et sa licence sont inclus ou accessibles depuis la distribution ; le build vérifie la source et le binaire n’a pas besoin d’une installation Calibre. Le sous-processus reçoit uniquement des arguments structurés, dans un dossier temporaire privé, avec délai, sortie bornée et contrôle du fichier généré. Le résultat de `mobitool -e` est réinspecté : l’outil amont décrit son EPUB comme une reconstruction nécessitant validation.
+MOBI/KF8/AZW3 non chiffrés sont reconstruits par `mobitool -e`, construit depuis `vendor/libmobi-0.12/` par `src-tauri/build.rs`, puis réinspectés et réencapsulés en EPUB assaini. Arguments structurés, environnement nettoyé, dossier privé, délai et sorties bornées. L’écrivain natif MOBI6 produit PalmDOC UTF-8 non compressé, EXTH et images ; ses fixtures sont validées par le parseur libmobi embarqué.
 
-Un export MOBI depuis EPUB requiert un écrivain dédié : MOBI 6, UTF-8, enregistrements PalmDOC non compressés, EXTH et images compatibles. Il doit être vérifié par le lecteur libmobi et des fixtures publiques avant d’apparaître dans la matrice des capacités. Libmobi ne fournit pas un générateur complet KF8 ; ne pas annoncer un export AZW3. Les DRM sont signalés et refusés, sans tentative de contournement. Le PDF garde sa nature de document fixe ; aucune conversion fidèle de PDF en EPUB n’est promise.
+La matrice annonce les capacités réelles. Aucun export AZW3/KF8. PDF/CBZ sont stockés et filtrables, sans conversion reflow ni lecteur dédié. Les transformations de contenu chiffré sont refusées ; les destinations existantes sont préservées.
 
-Sources primaires : [libmobi](https://github.com/bfabiszewski/libmobi), [release v0.12](https://github.com/bfabiszewski/libmobi/releases/tag/v0.12), [implémentation de mobitool](https://github.com/bfabiszewski/libmobi/blob/public/tools/mobitool.c).
+## Fournisseurs et Internet
 
-## Connexions sans fil
+Z.ai, Kimi/Moonshot, MiniMax, OpenAI/Codex, Claude et Mistral utilisent leurs API officielles. Codex désigne OpenAI Responses. Les modèles proviennent d’endpoints/catalogues officiels avec provenance/date ; cache ancien et erreur de rafraîchissement sont explicites. Les clés restent en session ou dans le coffre Linux à la demande, sans fallback en texte clair dans SQLite.
 
-CrossPoint expose un serveur web HTTP et WebSocket ; ce transport est distinct du protocole d’appareil intelligent Calibre. L’adaptateur CrossPoint suit les endpoints et le schéma de sa version de firmware. Le mode compatible Calibre, s’il est exposé, implémente le protocole dans Library Manager ; il n’exécute ni n’installe Calibre. Aucun mode sans fil n’est marqué disponible avant handshake et inventaire réellement implémentés et testés.
+`WebClient` obtient des sources avant les appels LLM pour les six fournisseurs. Pages publiques uniquement en HTTPS sur le port 443 ; DNS/redirections revalidés, plages privées refusées, budgets taille/durée. Le client LAN est distinct. Le choix explicite `webEnabled=false` retire la recherche et son absence reste visible.
 
-## Ordre de construction et critères d’acceptation
+Aucune boucle modèle d’appels d’outils web_search/web_fetch. Le chat utilise le service commun, des plans de recherche validés et des résultats locaux réels ; les citations doivent correspondre aux sources obtenues. Contexte borné, sans notes/évaluations/favoris/progression automatiques.
 
-1. Figer modèles/IPC, schéma et erreurs ; migrer une base vide puis existante sans perte.
-2. Construire stockage, EPUB et bibliothèque ; prouver import, couverture, facettes, déduplication et conservation de l’original.
-3. Construire lecteur isolé, conversion et optimisation ; comparer chapitres/texte et ouvrir les dérivés avec un second parseur.
-4. Construire jobs, fournisseurs et web ; tester tous les contrats d’API, discovery, reprise, erreurs et provenance.
-5. Construire appareils et transfert ; tester faux montages, déconnexion, collision, espace insuffisant, rollback et lecture seule.
-6. Construire les panneaux Svelte et FR/EN ; vérifier recherches, sélection, appareil présent, chat et changement de langue au clavier.
-7. Tester l’application native et les paquets ; vérifier qu’aucune invocation Calibre ni dépendance métier extérieure n’est nécessaire.
-8. Revue sécurité et non-régression, documentation d’exploitation, publication du dépôt et téléchargements des paquets avec SHA-256.
+Les valeurs de contrat `localCli` sont réservées, sans capacité disponible. Aucun CLI Codex, Claude ou Calibre invoqué. La racine du stockage est fixée en lecture seule dans les paramètres ; aucune commande applicative de déplacement ou de sauvegarde du profil n’est distribuée.
 
-Chaque tâche d’implémentation possède un fichier ou une responsabilité atomique et met à jour la cartographie correspondante dans la même tâche. Les tests critiques portent sur le comportement : ZIP traversant/bombe, OPF invalide, DRM, scripts EPUB, import répété, metadata concurrentes, réseau privé/redirection, clés absentes, sortie de processus excessive, débranchement, ancien montage, cache de présence et annulation après modification externe.
+## Appareils et transports
 
-Les jobs CPU/ZIP/images utilisent un pool bloquant borné ; le réseau utilise Tokio. Les requêtes de bibliothèque sont paginées, les couvertures sont mises en cache et les gros EPUB ne sont pas envoyés au frontend en base64. La base et les originaux peuvent être sauvegardés depuis une commande documentée. Les clés IA sont conservées par le service de secrets Linux, jamais dans les exports ou journaux. Si le trousseau n’est pas disponible, l’interface l’explique et propose une session non persistante, sans repli silencieux en texte clair.
+Les montages Linux USB/SD et enfants MTP déjà accessibles sont redécouverts et revalidés. Liens symboliques, montages système, lecture seule et volumes ambigus ne donnent pas de capacité d’écriture. Présence rapprochée par contenu et filtrable pour les seuls appareils actuellement connectés. Le scan périodique indexe les nouvelles connexions sans copie automatique.
+
+L’inventaire complet reste en base. Le résultat UI d’un job est limité à 500 lignes et 768 KiB, avec total/truncated/avertissement ; cette limite ne tronque pas la présence enregistrée.
+
+CrossPoint utilise son serveur HTTP LAN port 80 : inventaire, upload temporaire UUID, relecture hash puis rename sans écrasement. WebSocket et découverte UDP du firmware ne sont pas des fonctions de découverte de cette version. Le firmware étudié n’offre pas d’authentification HTTP ; réseau local de confiance requis.
+
+Calibre sans fil est un serveur TCP smart-device autonome démarré explicitement sur l’IP locale de l’ordinateur, port 9090. L’utilisateur configure cette adresse/ce port dans KOReader ; aucune découverte UDP. L’appareil devient connecté après handshake réel, capacités/identité et challenge facultatif. Ce protocole historique est non chiffré. Copies dans des noms réservés à Library Manager, relecture SHA-256 et nettoyage limité à ces fichiers. Une rupture peut laisser une copie partielle : intention conservée et avertissement, sans fausse présence. Voir [DEVICE_PROTOCOL.md](DEVICE_PROTOCOL.md).
+
+## Contrôles et distribution
+
+Les tests Rust utilisent archives synthétiques, bases temporaires, faux montages, clients HTTP/TCP locaux et fixtures publiques libmobi. Les tests frontend sont `api.test.ts`, `i18n.test.ts`, `preview.test.ts`. `scripts/native-smoke.py` exerce le bridge natif avec profil isolé ; il ne remplace pas un essai physique USB/KOReader/CrossPoint.
+
+La CI unique `.github/workflows/ci.yml` vérifie frontend, format Rust, core et Clippy workspace, puis construit DEB/RPM/AppImage sur Ubuntu 22.04 avec deux jobs Cargo. Elle contrôle les licences/sidecar dans DEB/RPM, génère source correspondante et SHA-256 puis téléverse des artefacts de revue. Elle ne publie pas une GitHub Release.
+
+`scripts/third-party-notices.py` génère/vérifie les notices depuis dépendances verrouillées et textes originaux, avec --self-test/--check. Les paquets incluent GPL Library Manager, LGPL libmobi et notices. Node/pnpm/Rust et SDK Linux sont nécessaires à la construction ; les utilisateurs des paquets n’installent pas ces outils ni Calibre. Voir [BUILD.md](BUILD.md).
+
+Compilation, artefact CI, parcours natif et essai physique sont des preuves distinctes, consignées dans [MASTER_PLAN.md](MASTER_PLAN.md). Un build ne démontre pas à lui seul le fonctionnement sur une liseuse.

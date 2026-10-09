@@ -1,0 +1,138 @@
+name: Linux checks and packages
+
+on:
+  push:
+    branches: [main]
+    # Documentation-only pushes do not rebuild packages; bundled notices always do.
+    paths:
+      - '**'
+      - '!docs/**'
+      - 'docs/THIRD_PARTY_NOTICES.md'
+      - '!README*.md'
+      - '!CHANGELOG.md'
+      - '!CONTRIBUTING.md'
+      - '!SECURITY.md'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Standalone Linux build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TERM_COLOR: always
+      APPIMAGE_EXTRACT_AND_RUN: '1'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1
+        with:
+          version: 10.33.0
+          run_install: false
+
+      - name: Install Node.js build runtime
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1
+        with:
+          node-version: 26.11.1
+          cache: pnpm
+
+      - name: Install Rust build toolchain
+        uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # Rust 1.99
+        with:
+          toolchain: 1.99.0
+          components: rustfmt, clippy
+
+      - name: Cache Rust build dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: '. -> target'
+
+      - name: Install Linux build libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev \
+            librsvg2-dev libssl-dev libdbus-1-dev patchelf rpm curl ca-certificates
+
+      - name: Install locked dependencies
+        run: |
+          pnpm install --frozen-lockfile
+          cargo fetch --locked
+
+      - name: Check and build the interface
+        run: |
+          pnpm check
+          pnpm test
+          pnpm build
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Build workspace and bundled MOBI engine
+        run: |
+          cargo build --workspace --locked
+          test -x src-tauri/binaries/library-manager-mobitool-x86_64-unknown-linux-gnu
+
+      - name: Test core and lint the workspace
+        run: |
+          cargo test -p library-core --locked
+          cargo test -p library-manager --lib --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Verify original third-party notices
+        run: |
+          python3 scripts/third-party-notices.py --self-test
+          python3 scripts/third-party-notices.py --check
+
+      - name: Build standalone DEB, RPM and AppImage
+        run: pnpm tauri build --ci --bundles deb,rpm,appimage -- --locked
+
+      - name: Collect packages and corresponding source
+        run: |
+          mkdir -p artifacts
+          find target/release/bundle -type f \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \) -exec cp -- '{}' artifacts/ \;
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          root = Path('artifacts')
+          for suffix in ('deb', 'rpm', 'AppImage'):
+              packages = list(root.glob(f'*.{suffix}'))
+              if len(packages) != 1:
+                  raise SystemExit(f'Expected one {suffix} package, got {len(packages)}')
+              if suffix == 'AppImage':
+                  continue
+              argv = ['dpkg-deb', '--contents'] if suffix == 'deb' else ['rpm', '--query', '--list', '--package']
+              contents = subprocess.run([*argv, str(packages[0])], check=True, text=True, capture_output=True).stdout
+              for required in ('library-manager-mobitool', 'libmobi-COPYING', 'Library-Manager-GPL3', 'THIRD_PARTY_NOTICES.md'):
+                  if required not in contents:
+                      raise SystemExit(f'{suffix} package is missing {required}')
+          PY
+          git archive --format=tar.gz --prefix="library-manager-${GITHUB_SHA}/" HEAD > "artifacts/library-manager-source-${GITHUB_SHA}.tar.gz"
+          cp -- LICENSE docs/THIRD_PARTY_NOTICES.md artifacts/
+          cd artifacts
+          sha256sum -- *.deb *.rpm *.AppImage *.tar.gz LICENSE THIRD_PARTY_NOTICES.md > SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - name: Upload reviewable Linux packages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: library-manager-linux-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
