@@ -14,7 +14,7 @@ Application Linux autonome : aucun Calibre externe à installer. GPL-3.0, dépô
 - [x] Identité graphique, bibliothèque, lecteur, filtres, paramètres et langues.
 - [x] Tests, revue sécurité, non-régression et interface native sur le périmètre documenté.
 - [x] Documentation FR/EN et packaging DEB/RPM/AppImage.
-- [ ] Publication de la version et vérification des téléchargements publics.
+- [x] Publication de la version et vérification des téléchargements publics.
 
 ## Avancement vérifié
 
@@ -39,10 +39,11 @@ Application Linux autonome : aucun Calibre externe à installer. GPL-3.0, dépô
 - RPM final installé dans Fedora 44 : dix étapes GUI réussies, deux cartes visibles et capture sauvegardée.
 - DEB natif : dix parcours réussis, dont import/dédoublonnage, conversions explicites, lecteur/progression, optimisation Xteink, contrôle de révision/annulation d’opération, attente IA sans configuration et langue conservée après redémarrage. Deux cartes de livres sont rendues et la capture est sauvegardée.
 - Contenu de l’AppImage extrait et lancé via AppRun : dix parcours réussis. Le redémarrage de l’enveloppe extract-and-run reste une limite du harness WebDriver documentée ; ce résultat ne vaut pas validation de ce parcours de l’enveloppe.
-- CI de 3e6177b : analyse CodeQL terminée avec succès ; construction Linux des paquets encore en cours. Ce statut d’exécution ne ferme pas les alertes ouvertes décrites dans le rapport de qualité.
+- CI de 3e6177b : [construction Linux des paquets](https://github.com/QrCommunication/library-manager/actions/runs/37887629001) réussie en 18 min 36 s, avec collecte et téléversement des bundles réussis ; [analyse CodeQL](https://github.com/QrCommunication/library-manager/actions/runs/37887628523) réussie. Ces statuts d’exécution ne ferment pas les alertes ouvertes décrites dans le rapport de qualité.
 - Dépôt public initialisé, licence GPL-3.0 reconnue par GitHub.
+- [Version publique v0.1.0](https://github.com/QrCommunication/library-manager/releases/tag/v0.1.0) publiée : tag documentaire `47f9149`, paquets construits depuis `3e6177b`. Au contrôle de publication, les treize fichiers attachés répondent HTTP 200 en accès anonyme. Les empreintes SHA-256 des douze fichiers vérifiés correspondent aux originaux : trois paquets, une archive des sources, quatre rapports et quatre captures ; le fichier `SHA256SUMS` téléchargé est également identique à l’original.
 
-Le [rapport de qualité](QUALITY.md) détaille ces preuves, les avertissements de sécurité et les limites du périmètre. Aucun appel fournisseur payant ni essai d’écriture sur liseuse physique n’est revendiqué. La publication et le téléchargement public des artefacts restent à vérifier.
+Le [rapport de qualité](QUALITY.md) détaille ces preuves, les avertissements de sécurité et les limites du périmètre. Aucun appel fournisseur payant ni essai d’écriture sur liseuse physique n’est revendiqué. La publication et les téléchargements publics de la version ont été vérifiés ; les limites des essais restent applicables.
 
 ## Règles de validation
 

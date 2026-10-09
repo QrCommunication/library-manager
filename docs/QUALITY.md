@@ -4,20 +4,22 @@ Compte rendu du 9 octobre 2026. Les paquets Linux, le moteur et l’interface on
 
 ## Sources et preuves
 
-Les paquets finaux ont été construits depuis [3e6177b](https://github.com/QrCommunication/library-manager/commit/3e6177b1241e35e3ef1cdf2ac6b6466d5742f775). Le code Rust et JavaScript exécuté reste celui de [8f4de47](https://github.com/QrCommunication/library-manager/commit/8f4de47ab7800f69e3faf02c9d1fc10ea34b6b68) : les changements suivants portent sur les fixtures de test, la CI, le script de validation native, le générateur et le contenu des notices, ainsi que la déclaration de `ca-certificates` comme dépendance des paquets DEB/RPM. Les contrôles CI de tests, Clippy et notices sur 3e6177b ont réussi ; les constructions de paquets de cette CI sont encore en cours au moment du compte rendu. Les trois paquets locaux et leurs parcours natifs décrits ici ont terminé leur validation.
+Les paquets finaux ont été construits depuis [3e6177b](https://github.com/QrCommunication/library-manager/commit/3e6177b1241e35e3ef1cdf2ac6b6466d5742f775). Le code Rust et JavaScript exécuté reste celui de [8f4de47](https://github.com/QrCommunication/library-manager/commit/8f4de47ab7800f69e3faf02c9d1fc10ea34b6b68) : les changements suivants portent sur les fixtures de test, la CI, le script de validation native, le générateur et le contenu des notices, ainsi que la déclaration de `ca-certificates` comme dépendance des paquets DEB/RPM. La [CI Linux de 3e6177b](https://github.com/QrCommunication/library-manager/actions/runs/37887629001) a réussi en 18 min 36 s : tests, Clippy, notices, construction des trois bundles, collecte et dépôt des artefacts. Les trois paquets et leurs parcours natifs décrits ici ont terminé leur validation. Le tag public v0.1.0 pointe vers [47f9149](https://github.com/QrCommunication/library-manager/commit/47f9149), qui ajoute uniquement la documentation de livraison aux sources des paquets.
 
-Les rapports et captures ont été contrôlés localement. Leur publication avec les paquets et la vérification des téléchargements publics sont en cours au moment de ce compte rendu. La [page de publication v0.1.0](https://github.com/QrCommunication/library-manager/releases/tag/v0.1.0) est le point d’accès prévu aux preuves suivantes ; leur présence publique doit être vérifiée avant de présenter la livraison comme publiée :
+La [version publique v0.1.0](https://github.com/QrCommunication/library-manager/releases/tag/v0.1.0) a été publiée le 9 octobre 2026 à 05:32:29 UTC. Ses treize fichiers initiaux ont été téléchargés sans authentification par `curl`, avec réponse HTTP 200 pour chacun : trois paquets, une archive de sources, quatre rapports, quatre captures et `SHA256SUMS`. Les douze empreintes du manifeste initial correspondent aux fichiers téléchargés. Ce contrôle est consigné dans [public-verification.json](https://github.com/QrCommunication/library-manager/releases/download/v0.1.0/public-verification.json), qui conserve le compte initial de treize fichiers.
 
-| Preuve | Résultat contrôlé localement |
+Ce rapport de vérification a ensuite été publié comme quatorzième fichier de la version. Il a été téléchargé sans authentification avec réponse HTTP 200, ainsi que le `SHA256SUMS` final de 1 215 octets. Ce dernier contient treize empreintes, toutes conformes aux fichiers téléchargés, et est identique octet par octet à l’original local. Le contrôle du manifeste final a utilisé une requête sans cache pour éviter la réponse mise en cache de sa première version. Les rapports et captures publics sont donc les mêmes que les preuves contrôlées localement :
+
+| Preuve publique | Résultat contrôlé |
 | --- | --- |
-| `native-report.json` et `native-window.png` | Paquet DEB : dix étapes réussies, deux cartes visibles et capture enregistrée |
-| `ubuntu-clean-report.json` et sa capture | DEB final installé dans Ubuntu 22.04 vierge : certificats installés automatiquement, dix étapes réussies et deux cartes visibles |
-| `fedora-rpm-report.json` et sa capture | RPM final installé dans Fedora 44 : dix étapes réussies et deux cartes visibles |
-| `appimage-extracted-report.json` et sa capture | Contenu extrait de l’AppImage lancé par `AppRun` : dix étapes réussies et deux cartes visibles |
-| `SHA256SUMS` | Empreintes des trois paquets construits |
-| Archive des sources du tag | Source correspondant à la livraison, avec le moteur et les licences tierces |
+| [Rapport DEB](https://github.com/QrCommunication/library-manager/releases/download/v0.1.0/native-report.json) et [capture](https://github.com/QrCommunication/library-manager/releases/download/v0.1.0/native-window.png) | Paquet DEB : dix étapes réussies, deux cartes visibles et capture enregistrée |
+| [Rapport Ubuntu vierge](https://github.com/QrCommunication/library-manager/releases/download/v0.1.0/ubuntu-clean-report.json) et [capture](https://github.com/QrCommunication/library-manager/releases/download/v0.1.0/ubuntu-clean-window.png) | DEB final installé dans Ubuntu 22.04 vierge : certificats installés automatiquement, dix étapes réussies et deux cartes visibles |
+| [Rapport RPM Fedora](https://github.com/QrCommunication/library-manager/releases/download/v0.1.0/fedora-rpm-report.json) et [capture](https://github.com/QrCommunication/library-manager/releases/download/v0.1.0/fedora-rpm-window.png) | RPM final installé dans Fedora 44 : dix étapes réussies et deux cartes visibles |
+| [Rapport AppRun extrait](https://github.com/QrCommunication/library-manager/releases/download/v0.1.0/appimage-extracted-report.json) et [capture](https://github.com/QrCommunication/library-manager/releases/download/v0.1.0/appimage-extracted-window.png) | Contenu extrait de l’AppImage lancé par `AppRun` : dix étapes réussies et deux cartes visibles |
+| [SHA256SUMS](https://github.com/QrCommunication/library-manager/releases/download/v0.1.0/SHA256SUMS) | Treize empreintes finales vérifiées pour les paquets, sources, rapports, captures et preuve de vérification publique |
+| [Archive des sources](https://github.com/QrCommunication/library-manager/releases/download/v0.1.0/library-manager-0.1.0-source.tar.gz) | 8 172 465 octets ; sources de la livraison avec le moteur et les licences tierces |
 
-Les scripts de contrôle sont publics : [validation native](../scripts/native-smoke.py), [génération des notices](../scripts/third-party-notices.py) et [CI](../.github/workflows/ci.yml). [BUILD.md](BUILD.md) donne les commandes et l’environnement nécessaires à leur reproduction. Les résultats locaux et la disponibilité d’un téléchargement public sont deux validations distinctes.
+Les scripts de contrôle sont publics : [validation native](../scripts/native-smoke.py), [génération des notices](../scripts/third-party-notices.py) et [CI](../.github/workflows/ci.yml). [BUILD.md](BUILD.md) donne les commandes et l’environnement nécessaires à leur reproduction. Les parcours locaux et les téléchargements publics ont été vérifiés séparément.
 
 ## Vérifications automatisées
 
@@ -64,9 +66,9 @@ Le contenu de l’AppImage finale a été extrait et lancé par son `AppRun`. Av
 
 | Élément | SHA-256 |
 | --- | --- |
-| `library-manager_0.1.0_amd64.deb` | `79e810018b4c747354a92c4e3a214124ac0043d1133b2d884b430da9f04ef05f` |
-| `library-manager-0.1.0-1.x86_64.rpm` | `2d45b3c41c0ef1692348412a526111a2cac39968d374fc26b5acf7974a578fbb` |
-| `library-manager_0.1.0_amd64.AppImage` | `204390a19c180eefe5fab0e279e1ee7396f72a01766b4c3044ab2d526eafa959` |
+| [library-manager_0.1.0_amd64.deb](https://github.com/QrCommunication/library-manager/releases/download/v0.1.0/library-manager_0.1.0_amd64.deb) | `79e810018b4c747354a92c4e3a214124ac0043d1133b2d884b430da9f04ef05f` |
+| [library-manager-0.1.0-1.x86_64.rpm](https://github.com/QrCommunication/library-manager/releases/download/v0.1.0/library-manager-0.1.0-1.x86_64.rpm) | `2d45b3c41c0ef1692348412a526111a2cac39968d374fc26b5acf7974a578fbb` |
+| [library-manager_0.1.0_amd64.AppImage](https://github.com/QrCommunication/library-manager/releases/download/v0.1.0/library-manager_0.1.0_amd64.AppImage) | `204390a19c180eefe5fab0e279e1ee7396f72a01766b4c3044ab2d526eafa959` |
 | Binaire principal extrait de l’AppImage | `7054446b0de9b88f40a64470ec4453bb24edc7c34b694377f7f50d480313de4f` |
 | Enveloppe `AppRun` extraite | `eb0b254ac0dae6543e6dd7cd02e1baf40a060de95b927313122d6b46323c00aa` |
 
@@ -91,4 +93,4 @@ Les relevés locaux `pnpm audit` et `cargo audit` rapportent zéro vulnérabilit
 
 Les protections applicatives inspectées comprennent les originaux immuables, les variantes publiées sans écrasement, les contrôles de chemins et liens symboliques, le lecteur EPUB sans scripts ni ressources distantes, et la séparation entre [recherche Web publique](../crates/library-core/src/web.rs) et clients authentifiés des fournisseurs. Les livres et les pages Web sont des données non fiables, jamais des autorisations d’exécuter des commandes ou de supprimer des fichiers. La [politique de sécurité](../SECURITY.md) décrit le signalement privé et ces frontières.
 
-L’analyse CodeQL de 3e6177b a terminé avec succès. Les deux alertes GitHub existantes, concernant glib et le challenge SHA-1 historique, restent ouvertes et visibles. Leur publication dans ce compte rendu, les tests réussis et l’absence d’appel identifié à un type concerné ne valent pas correction de ces alertes.
+L’[analyse CodeQL de 3e6177b](https://github.com/QrCommunication/library-manager/actions/runs/37887628523) a terminé avec succès. Les deux alertes GitHub existantes, concernant glib et le challenge SHA-1 historique, restent ouvertes et visibles. Leur publication dans ce compte rendu, les tests réussis et l’absence d’appel identifié à un type concerné ne valent pas correction de ces alertes.
