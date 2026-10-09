@@ -2,6 +2,20 @@
 
 Les notes détaillées sont en français, suivies d’un résumé en anglais.
 
+## 0.1.1 — 2026-10-09
+
+### Français
+
+- Inventaire USB avec progression calculée sur les octets réellement lus, compteurs de découverte et annulation pendant la lecture. Le dernier inventaire complet est conservé si la carte est déconnectée ou si le scan échoue.
+- Lecture des seules métadonnées EPUB nécessaires à l’inventaire, sans décompresser les chapitres et images.
+- Affichage progressif dans la bibliothèque des livres présents uniquement sur une liseuse USB, avec indication visuelle et pagination.
+- Import individuel ou de tous les livres absents de la bibliothèque locale, sans modifier la carte SD. La sélection globale utilise l’inventaire complet du moteur, indépendamment des pages affichées.
+- Vérification du montage, du chemin et de l’empreinte avant l’ajout local ; déduplication et actualisation de la présence sur la liseuse après import.
+
+### English
+
+USB inventory now reports measured read progress and exposes identified device-only books in the library. Import one book or all missing books while preserving SD-card originals. Inventory metadata reads are lighter, interrupted scans preserve the last complete snapshot, and native imports validate their source and deduplicate local copies.
+
 ## 0.1.0 — 2026-10-09
 
 ### Français

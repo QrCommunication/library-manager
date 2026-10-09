@@ -2348,7 +2348,7 @@ dependencies = [
 
 [[package]]
 name = "library-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ammonia",
  "base64 0.23.1",
@@ -2378,7 +2378,7 @@ dependencies = [
 
 [[package]]
 name = "library-manager"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "library-core",
  "serde",

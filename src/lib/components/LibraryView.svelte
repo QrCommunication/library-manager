@@ -11,8 +11,9 @@
   import { ArrowDownWideNarrow, BookOpen, Check, ChevronLeft, ChevronRight, Grid2X2, Heart, ListFilter, NotebookText, Plus, RefreshCw, Star, Table2, Tablet, X } from '@lucide/svelte';
   import { isPreview, normalizePublicError, request } from '../api';
   import { defaultQuery } from '../contracts';
-  import type { AppError, Book, BookFormat, BookPage, BookQuery, BookSort, LibraryFacets } from '../contracts';
+  import type { AppError, Book, BookFormat, BookPage, BookQuery, BookSort, Device, Job, LibraryFacets } from '../contracts';
   import { formatDate, formatSize, locale, t } from '../i18n';
+  import DeviceOnlyBooks from './DeviceOnlyBooks.svelte';
 
   interface Props {
     initialQuery: BookQuery;
@@ -22,6 +23,8 @@
     refreshVersion: number;
     selectedBookIds: string[];
     importing: boolean;
+    devices?: Device[];
+    jobs?: Job[];
     onSelectionChange: (ids: string[]) => void;
     onOpenBook: (book: Book) => void;
     onReadBook: (book: Book) => void;
@@ -31,7 +34,7 @@
     onStateChange?: (state: LibraryViewState) => void;
   }
 
-  let { initialQuery, initialState = null, search, groupBy, refreshVersion, selectedBookIds, importing, onSelectionChange, onOpenBook, onReadBook, onImport, onNotify, onError, onStateChange }: Props = $props();
+  let { initialQuery, initialState = null, search, groupBy, refreshVersion, selectedBookIds, importing, devices = [], jobs = [], onSelectionChange, onOpenBook, onReadBook, onImport, onNotify, onError, onStateChange }: Props = $props();
   type FacetField = 'authors' | 'series' | 'genres' | 'tags' | 'languages' | 'formats';
   type ScalarFilter = 'deviceId' | 'onDevice' | 'readStatus' | 'favorite' | 'metadataStatus' | 'missingCover' | 'minSizeBytes' | 'maxSizeBytes';
   interface ActiveChip { field: FacetField | ScalarFilter; value: string | null; label: string }
@@ -333,6 +336,7 @@
     {/each}
     {#if total > 0}<div class="pagination"><span class="muted small" aria-live="polite">{new Intl.NumberFormat($locale).format((page?.offset ?? 0) + 1)}–{new Intl.NumberFormat($locale).format((page?.offset ?? 0) + items.length)} / {new Intl.NumberFormat($locale).format(total)}</span><div class="row"><button class="button secondary" disabled={loading || query.offset === 0} onclick={() => { query.offset = Math.max(0, query.offset - query.limit); }}><ChevronLeft size={16} aria-hidden="true" />{$t('common.back')}</button><button class="button secondary" disabled={loading || query.offset + items.length >= total} onclick={() => { query.offset += query.limit; }}>{$t('library.loadMore')}<ChevronRight size={16} aria-hidden="true" /></button></div></div>{/if}
   {/if}
+  <DeviceOnlyBooks {devices} {jobs} {refreshVersion} {search} {onNotify} {onError} />
 </section>
 
 <style>

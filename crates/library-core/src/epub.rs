@@ -4,7 +4,7 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File, OpenOptions},
-    io::{Cursor, Read, Seek, Write},
+    io::{BufReader, Cursor, Read, Seek, Write},
     path::Path,
 };
 
@@ -24,6 +24,95 @@ const MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_COMPRESSION_RATIO: u64 = 1_000;
 const MAX_XML_NODES: u32 = 500_000;
 const MAX_INSPECTION_SAMPLE_CHARACTERS: usize = 12_000;
+const MAX_INVENTORY_XML_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Catalogue metadata only: resource validation remains the responsibility of import.
+/// Reading three bounded entries avoids transferring chapters and images over slow USB.
+pub fn read_inventory_metadata(path: &Path) -> Result<BookMetadata> {
+    if !fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(invalid("EPUB source must be a regular file"));
+    }
+    let fallback = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("Untitled");
+    let mut archive = ZipArchive::new(BufReader::new(File::open(path)?))?;
+    if archive.len() > MAX_ENTRIES {
+        return Err(invalid("EPUB archive has too many entries"));
+    }
+    let mut names = HashSet::new();
+    for name in archive.file_names() {
+        validate_archive_name(name)?;
+        if !names.insert(name.trim_end_matches('/').to_lowercase()) {
+            return Err(invalid("ZIP contains duplicate or case-colliding paths"));
+        }
+    }
+    if archive.index_for_name("mimetype") != Some(0) {
+        return Err(invalid("EPUB mimetype must be first and uncompressed"));
+    }
+    {
+        let entry = archive.by_name("mimetype")?;
+        if entry.compression() != CompressionMethod::Stored || entry.header_start() != 0 {
+            return Err(invalid("EPUB mimetype must be first and uncompressed"));
+        }
+    }
+    if read_inventory_entry(&mut archive, "mimetype", EPUB_MIMETYPE.len() as u64)? != EPUB_MIMETYPE
+    {
+        return Err(invalid("Invalid EPUB mimetype"));
+    }
+    let container = read_inventory_entry(
+        &mut archive,
+        "META-INF/container.xml",
+        MAX_INVENTORY_XML_BYTES,
+    )?;
+    let container = std::str::from_utf8(&container)
+        .map_err(|_| AppError::Unsupported("EPUB XML must be UTF-8".into()))?;
+    let opf_path = package_path_from_container(container)?;
+    let opf = read_inventory_entry(&mut archive, &opf_path, MAX_INVENTORY_XML_BYTES)?;
+    let opf = std::str::from_utf8(&opf)
+        .map_err(|_| AppError::Unsupported("EPUB XML must be UTF-8".into()))?;
+    let document = parse_xml(opf)?;
+    let package = document.root_element();
+    validate_package(package)?;
+    let metadata = package
+        .children()
+        .find(|node| node.has_tag_name((OPF, "metadata")))
+        .ok_or_else(|| invalid("OPF metadata is missing"))?;
+    Ok(read_metadata(metadata, fallback))
+}
+
+fn read_inventory_entry<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    name: &str,
+    limit: u64,
+) -> Result<Vec<u8>> {
+    let mut entry = archive.by_name(name)?;
+    if entry.encrypted() {
+        return Err(AppError::Unsupported(
+            "Encrypted ZIP entries are unsupported".into(),
+        ));
+    }
+    if entry.is_dir() || !matches!(entry.unix_mode().unwrap_or(0) & 0o170000, 0 | 0o100000) {
+        return Err(invalid("ZIP metadata must be a regular file"));
+    }
+    let declared = entry.size();
+    if declared > limit {
+        return Err(invalid("EPUB inventory metadata exceeds the safety limit"));
+    }
+    if declared
+        > entry
+            .compressed_size()
+            .saturating_mul(MAX_COMPRESSION_RATIO)
+    {
+        return Err(invalid("ZIP compression ratio exceeds the safety limit"));
+    }
+    let mut bytes = Vec::new();
+    entry.by_ref().take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != declared {
+        return Err(invalid("ZIP entry has an inconsistent uncompressed size"));
+    }
+    Ok(bytes)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestItem {
@@ -697,7 +786,15 @@ fn check_encryption(entries: &BTreeMap<String, Vec<u8>>) -> Result<()> {
 }
 
 fn find_package(entries: &BTreeMap<String, Vec<u8>>) -> Result<String> {
-    let container = parse_xml(entry_text(entries, "META-INF/container.xml")?)?;
+    let path = package_path_from_container(entry_text(entries, "META-INF/container.xml")?)?;
+    if !entries.contains_key(&path) {
+        return Err(invalid("Package document is missing"));
+    }
+    Ok(path)
+}
+
+fn package_path_from_container(source: &str) -> Result<String> {
+    let container = parse_xml(source)?;
     let rootfiles: Vec<_> = container
         .descendants()
         .filter(|node| {
@@ -714,11 +811,7 @@ fn find_package(entries: &BTreeMap<String, Vec<u8>>) -> Result<String> {
     let full_path = rootfiles[0]
         .attribute("full-path")
         .ok_or_else(|| invalid("Missing package path"))?;
-    let path = resolve_href("", full_path)?;
-    if !entries.contains_key(&path) {
-        return Err(invalid("Package document is missing"));
-    }
-    Ok(path)
+    resolve_href("", full_path)
 }
 
 /// Resolve URI-escaped resource paths without crossing the archive root.
@@ -1433,6 +1526,99 @@ mod tests {
             ("OPS/chapter one.xhtml".into(), br#"<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Chapter</title></head><body><h1>One</h1><p>All text &amp; punctuation stays.</p></body></html>"#.to_vec()),
             ("OPS/cover.png".into(), vec![1, 2, 3]),
         ])
+    }
+
+    #[test]
+    fn inventory_reads_metadata_without_opening_chapters_or_images() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("inventory.epub");
+        let entries = fixture(
+            "3.0",
+            "<d:title>Catalogue</d:title><d:creator>Auteur</d:creator><d:language>fr</d:language>",
+        );
+        write_zip(File::create(&path).unwrap(), &entries, 6).unwrap();
+        let metadata = read_inventory_metadata(&path).unwrap();
+        assert_eq!(metadata, EpubDocument::open(&path).unwrap().metadata);
+        assert_eq!(metadata.title, "Catalogue");
+        assert_eq!(metadata.authors, ["Auteur"]);
+        assert_eq!(metadata.language, "fr");
+
+        // A damaged resource must not force a catalogue scan to transfer its bytes.
+        let mut archive = ZipArchive::new(File::open(&path).unwrap()).unwrap();
+        let offset = archive
+            .by_name("OPS/cover.png")
+            .unwrap()
+            .data_start()
+            .unwrap() as usize;
+        drop(archive);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[offset] ^= 0xff;
+        fs::write(&path, bytes).unwrap();
+        assert_eq!(read_inventory_metadata(&path).unwrap(), metadata);
+        assert!(inspect_for_import(&path).is_err());
+
+        let mut oversized = entries;
+        oversized.insert(
+            "OPS/chapter one.xhtml".into(),
+            vec![b'x'; MAX_ENTRY_BYTES as usize + 1],
+        );
+        write_zip(File::create(&path).unwrap(), &oversized, 9).unwrap();
+        assert_eq!(read_inventory_metadata(&path).unwrap(), metadata);
+        assert!(inspect_for_import(&path).is_err());
+    }
+
+    #[test]
+    fn inventory_rejects_malformed_or_unbounded_metadata() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("inventory.epub");
+        for package in [
+            "<broken",
+            "<package/>",
+            &format!("<package xmlns=\"{OPF}\"/>"),
+            &format!(
+                "<package xmlns=\"{OPF}\"><metadata id=\"dup\"/><manifest id=\"dup\"/></package>"
+            ),
+            &format!(
+                "<!DOCTYPE package [<!ENTITY unsafe 'x'>]><package xmlns=\"{OPF}\"><metadata/></package>"
+            ),
+        ] {
+            let mut entries = fixture("3.0", "<d:title>Book</d:title>");
+            entries.insert("OPS/book.opf".into(), package.as_bytes().to_vec());
+            write_zip(File::create(&path).unwrap(), &entries, 6).unwrap();
+            assert!(read_inventory_metadata(&path).is_err());
+        }
+        let mut entries = fixture("3.0", "<d:title>Book</d:title>");
+        entries.insert(
+            "OPS/book.opf".into(),
+            vec![b'x'; MAX_INVENTORY_XML_BYTES as usize + 1],
+        );
+        write_zip(File::create(&path).unwrap(), &entries, 9).unwrap();
+        assert!(read_inventory_metadata(&path).is_err());
+    }
+
+    #[test]
+    fn inventory_keeps_zip_path_and_metadata_integrity_guards() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("inventory.epub");
+        for unsafe_name in ["../escaped.xhtml", "OPS/COVER.PNG"] {
+            let mut entries = fixture("3.0", "<d:title>Book</d:title>");
+            entries.insert(unsafe_name.into(), vec![1, 2, 3]);
+            write_zip(File::create(&path).unwrap(), &entries, 6).unwrap();
+            assert!(read_inventory_metadata(&path).is_err());
+        }
+        let entries = fixture("3.0", "<d:title>Book</d:title>");
+        write_zip(File::create(&path).unwrap(), &entries, 6).unwrap();
+        let mut archive = ZipArchive::new(File::open(&path).unwrap()).unwrap();
+        let offset = archive
+            .by_name("OPS/book.opf")
+            .unwrap()
+            .data_start()
+            .unwrap() as usize;
+        drop(archive);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[offset] ^= 0xff;
+        fs::write(&path, bytes).unwrap();
+        assert!(read_inventory_metadata(&path).is_err());
     }
 
     #[test]

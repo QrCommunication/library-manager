@@ -76,6 +76,22 @@ impl LibraryService {
     }
 
     pub fn import(&self, source: &Path) -> Result<ImportOutcome> {
+        self.import_source(source, None)
+    }
+
+    /// A device import must copy exactly the bytes identified by its inventory.
+    pub fn import_expected(&self, source: &Path, expected_sha256: &str) -> Result<ImportOutcome> {
+        if expected_sha256.len() != 64
+            || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(invalid(
+                "Expected import hash must contain 64 hexadecimal characters",
+            ));
+        }
+        self.import_source(source, Some(expected_sha256))
+    }
+
+    fn import_source(&self, source: &Path, expected_sha256: Option<&str>) -> Result<ImportOutcome> {
         let _guard = self
             .gate
             .lock()
@@ -83,6 +99,11 @@ impl LibraryService {
         self.check_cancelled()?;
         let format = detect_format(source)?;
         let original = self.storage.import_original(source, format)?;
+        if expected_sha256.is_some_and(|expected| !original.sha256.eq_ignore_ascii_case(expected)) {
+            return Err(AppError::Conflict(
+                "Source file changed since device inventory".into(),
+            ));
+        }
         self.check_cancelled()?;
         if let Some(existing) = self.repository.find_original_hash(&original.sha256)? {
             return Ok(ImportOutcome {
@@ -1005,6 +1026,41 @@ mod tests {
         }
         zip.finish().unwrap();
         path
+    }
+
+    #[test]
+    fn expected_import_hash_rejects_changed_bytes_before_creating_library_records() {
+        let (directory, service) = fixture();
+        let source = write_epub(&directory, false);
+        for invalid_hash in ["", "abc", &"z".repeat(64)] {
+            assert!(matches!(
+                service.import_expected(&source, invalid_hash),
+                Err(AppError::InvalidInput(_))
+            ));
+        }
+        assert!(matches!(
+            service.import_expected(&source, &"0".repeat(64)),
+            Err(AppError::Conflict(_))
+        ));
+        assert_eq!(service.list(&BookQuery::default(), &[]).unwrap().total, 0);
+        assert!(service.operations().unwrap().is_empty());
+        let hash = Storage::hash_file(&source).unwrap();
+        assert!(
+            service
+                .repository
+                .find_original_hash(&hash)
+                .unwrap()
+                .is_none()
+        );
+        let imported = service.import_expected(&source, &hash).unwrap();
+        assert!(!imported.duplicate);
+        let duplicate = service
+            .import_expected(&source, &hash.to_uppercase())
+            .unwrap();
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.book.id, imported.book.id);
+        assert_eq!(service.list(&BookQuery::default(), &[]).unwrap().total, 1);
+        assert_eq!(service.operations().unwrap().len(), 1);
     }
 
     #[test]

@@ -166,6 +166,26 @@ export interface Device {
   lastSeenAt: string;
 }
 
+export interface DeviceInventoryBook {
+  deviceId: string;
+  relativePath: string;
+  bookId: string | null;
+  sha256: string | null;
+  title: string;
+  authors: string[];
+  format: BookFormat;
+  sizeBytes: number;
+  lastSeenAt: string;
+  warnings: string[];
+}
+
+export interface DeviceInventoryPage {
+  items: DeviceInventoryBook[];
+  total: number;
+  offset: number;
+  limit: number;
+}
+
 export interface Job {
   id: string;
   kind: JobKind;
@@ -365,6 +385,13 @@ export interface IpcContracts {
   optimization_profiles: CommandContract<undefined, OptimizationProfile[]>;
   devices_scan: CommandContract<undefined, Device[]>;
   device_index: CommandContract<{ id: string }, Job>;
+  device_inventory: CommandContract<{
+    id: string;
+    offset: number;
+    limit: number;
+    unknownOnly: boolean;
+  }, DeviceInventoryPage>;
+  device_import: CommandContract<{ id: string; relativePaths: string[] | null }, Job>;
   device_connect_wireless: CommandContract<{
     address: string;
     transport: WirelessTransport;

@@ -38,6 +38,18 @@
   let inventoryDeviceId = $state<string | null>(null);
   let inventorySearch = $state('');
   let inventoryMatch = $state<'all' | 'known' | 'unknown'>('all');
+  interface IndexProgress {
+    phase: 'discovering' | 'reading' | 'finalizing';
+    visitedEntries: number;
+    processedBooks: number;
+    totalBooks: number;
+    bytesRead: number;
+    totalBytes: number;
+    currentPath: string | null;
+  }
+  let inventoryLoading = $state(false);
+  let inventoryGeneration = 0;
+  const INVENTORY_PAGE_SIZE = 200;
   let jobsGeneration = 0;
   let pollTimer: ReturnType<typeof setTimeout> | undefined;
   const POLL_INTERVAL_MS = 2500;
@@ -108,6 +120,53 @@
       && typeof value.sizeBytes === 'number' && Number.isSafeInteger(value.sizeBytes) && value.sizeBytes >= 0
       && (value.bookId === null || typeof value.bookId === 'string');
   }
+  function parseIndexProgress(job: Job): IndexProgress | null {
+    if (job.kind !== 'deviceIndex' || !record(job.result) || !record(job.result.indexProgress)) return null;
+    const value = job.result.indexProgress;
+    if (typeof value.phase !== 'string' || !['discovering', 'reading', 'finalizing'].includes(value.phase)) return null;
+    const counters = ['visitedEntries', 'processedBooks', 'totalBooks', 'bytesRead', 'totalBytes'] as const;
+    if (!counters.every((key) => typeof value[key] === 'number' && Number.isSafeInteger(value[key]) && value[key] >= 0)) return null;
+    if (!(value.currentPath === null || typeof value.currentPath === 'string')) return null;
+    if ((value.processedBooks as number) > (value.totalBooks as number) || (value.bytesRead as number) > (value.totalBytes as number)) return null;
+    return {
+      phase: value.phase as IndexProgress['phase'], visitedEntries: value.visitedEntries as number,
+      processedBooks: value.processedBooks as number, totalBooks: value.totalBooks as number,
+      bytesRead: value.bytesRead as number, totalBytes: value.totalBytes as number,
+      currentPath: value.currentPath,
+    };
+  }
+  function readFraction(value: IndexProgress): number {
+    return value.totalBytes > 0 ? value.bytesRead / value.totalBytes : value.totalBooks === 0 ? 0 : value.processedBooks / value.totalBooks;
+  }
+  async function loadInventory(append = false): Promise<void> {
+    const id = inventoryDeviceId;
+    if (!id || inventoryLoading || inventoryDevice?.transport !== 'usb' || !inventoryDevice.connected) return;
+    const generation = ++inventoryGeneration;
+    inventoryLoading = true;
+    const previous = inventories[id];
+    const target = append ? (previous?.books.length ?? 0) + INVENTORY_PAGE_SIZE : Math.max(INVENTORY_PAGE_SIZE, previous?.books.length ?? 0);
+    let books = append ? [...(previous?.books ?? [])] : [];
+    let offset = books.length;
+    let total = previous?.total ?? 0;
+    try {
+      do {
+        const page = await request('device_inventory', { id, offset, limit: INVENTORY_PAGE_SIZE, unknownOnly: false });
+        if (disposed || inventoryDeviceId !== id || generation !== inventoryGeneration) return;
+        books = [...new Map([...books, ...page.items].map((book) => [book.relativePath, book])).values()];
+        offset += page.items.length;
+        total = page.total;
+        if (page.items.length === 0 || offset >= total) break;
+      } while (books.length < target);
+      inventories = { ...inventories, [id]: {
+        deviceId: id, books, total, truncated: books.length < total,
+        warnings: [], updatedAt: new Date().toISOString(),
+      } };
+    } catch (error) {
+      if (!disposed && inventoryDeviceId === id && generation === inventoryGeneration) report(error);
+    } finally {
+      if (generation === inventoryGeneration) inventoryLoading = false;
+    }
+  }
   function parseInventory(job: Job): Inventory | null {
     if (job.kind !== 'deviceIndex' || job.status !== 'completed' || !record(job.result)) return null;
     const result = job.result;
@@ -134,7 +193,7 @@
   function schedulePoll(jobs: Job[]): void {
     clearTimeout(pollTimer);
     pollTimer = undefined;
-    if (!disposed && jobs.some((job) => !terminal(job) && (job.kind === 'deviceIndex' || Object.values(receipts).some((receipt) => receipt.id === job.id)))) {
+    if (!disposed && ((inventoryDevice?.transport === 'usb' && inventoryDevice.connected) || jobs.some((job) => !terminal(job) && (job.kind === 'deviceIndex' || Object.values(receipts).some((receipt) => receipt.id === job.id))))) {
       pollTimer = setTimeout(() => { void refreshJobs(); }, POLL_INTERVAL_MS);
     }
   }
@@ -142,8 +201,13 @@
     const latest = { ...inventories };
     const updatedReceipts = Object.fromEntries(Object.entries(receipts).map(([id, previous]) => [id, jobs.find((job) => job.id === previous.id) ?? previous]));
     for (const job of [...jobs].sort((left, right) => left.updatedAt.localeCompare(right.updatedAt))) {
+      if (job.kind === 'deviceIndex' && record(job.result) && typeof job.result.deviceId === 'string') {
+        const id = job.result.deviceId;
+        const previousReceipt = updatedReceipts[id];
+        if (!previousReceipt || job.updatedAt >= previousReceipt.updatedAt) updatedReceipts[id] = job;
+      }
       const snapshot = parseInventory(job);
-      if (!snapshot) continue;
+      if (!snapshot || devices.some((device) => device.id === snapshot.deviceId && device.transport === 'usb')) continue;
       const previousInventory = latest[snapshot.deviceId];
       if (!previousInventory || snapshot.updatedAt >= previousInventory.updatedAt) latest[snapshot.deviceId] = snapshot;
       const previous = updatedReceipts[snapshot.deviceId];
@@ -157,7 +221,10 @@
     const generation = ++jobsGeneration;
     try {
       const jobs = await request('jobs_list', undefined);
-      if (!disposed && generation === jobsGeneration) applyJobs(jobs);
+      if (!disposed && generation === jobsGeneration) {
+        applyJobs(jobs);
+        void loadInventory();
+      }
     } catch (error) {
       if (!disposed && generation === jobsGeneration) {
         report(error);
@@ -179,6 +246,8 @@
     } else report(profileResult.reason);
   }
   function showInventory(device: Device): void {
+    inventoryGeneration += 1;
+    inventoryLoading = false;
     inventoryDeviceId = device.id;
     inventorySearch = '';
     inventoryMatch = 'all';
@@ -188,6 +257,9 @@
   function closeInventory(): void {
     inventoryDialog.close();
     inventoryDeviceId = null;
+    inventoryGeneration += 1;
+    inventoryLoading = false;
+    schedulePoll(Object.values(receipts));
   }
   $effect(() => {
     void refreshVersion;
@@ -197,6 +269,7 @@
     disposed = true;
     loadGeneration += 1;
     jobsGeneration += 1;
+    inventoryGeneration += 1;
     clearTimeout(pollTimer);
     inventoryDialog?.close();
     password = '';
@@ -319,6 +392,26 @@
   }
 </script>
 
+{#snippet jobProgress(job: Job)}
+  {@const progress = parseIndexProgress(job)}
+  {#if progress && !terminal(job)}
+    {#if progress.phase === 'discovering'}
+      <progress max="1" aria-label={$t('common.progress')}></progress>
+      <p class="field-hint">{$t('devices.inventoryDiscovering', { entries: number.format(progress.visitedEntries), books: number.format(progress.totalBooks) })}</p>
+    {:else}
+      {@const fraction = readFraction(progress)}
+      <progress value={fraction} max="1" aria-label={$t('common.progress')}></progress>
+      <p class="small">{$t('devices.inventoryProgress', { percent: percent.format(fraction) })}</p>
+      <p class="field-hint">{$t('devices.inventoryReading', { processed: number.format(progress.processedBooks), total: number.format(progress.totalBooks), read: formatSize(progress.bytesRead, $locale), size: formatSize(progress.totalBytes, $locale) })}</p>
+      {#if progress.phase === 'finalizing'}<p class="field-hint">{$t('devices.inventoryFinalizing')}</p>{/if}
+    {/if}
+    {#if progress.currentPath}<p class="small muted inventory-path">{progress.currentPath}</p>{/if}
+  {:else}
+    <progress value={job.progress} max="1" aria-label={$t('common.progress')}></progress>
+  {/if}
+{/snippet}
+
+
 <section class="page">
   <div class="page-header">
     <div><p class="eyebrow">Library Manager</p><h1 class="page-title">{$t('devices.title')}</h1><p class="page-subtitle">{$t('devices.standaloneHint')}</p></div>
@@ -344,7 +437,7 @@
           <p class="small muted">{$t('common.date')}: {formatDate(device.lastSeenAt, $locale)}</p>
           <div class="row wrap"><button class="button secondary" type="button" onclick={() => showInventory(device)}><BookOpen size={16} />{$t('devices.viewBooks')}</button><button class="button secondary" type="button" disabled={demo || !device.connected || scanning || pairing || busyDevice !== null} onclick={() => indexDevice(device)}><RefreshCw size={16} />{$t('devices.index')}</button><button class="button primary" type="button" disabled={demo || !device.connected || !device.writable || !selectedBookIds.length || scanning || pairing || busyDevice !== null} onclick={() => prepareTransfer(device)}><Send size={16} />{$t('actions.transfer')}</button></div>
           {#if device.transport !== 'usb'}<button class="button ghost" type="button" disabled={demo || scanning || pairing || busyDevice !== null} onclick={() => disconnect(device)}><Unplug size={16} />{$t('devices.disconnect')}</button>{/if}
-          {#if receipt}<div class="receipt stack" aria-live="polite"><p class="small"><strong>{$t(`jobs.${receipt.kind}`)}</strong> · {$t(`jobs.${receipt.status}`)}</p><progress value={receipt.progress} max="1" aria-label={$t('common.progress')}></progress>{#if receipt.message}<p class="field-hint">{receipt.message}</p>{/if}{#if receipt.error}<p class="field-hint">{$t(`errors.${receipt.error.code}`)}</p>{/if}</div>{/if}
+          {#if receipt}<div class="receipt stack" aria-live="polite"><p class="small"><strong>{$t(`jobs.${receipt.kind}`)}</strong> · {$t(`jobs.${receipt.status}`)}</p>{@render jobProgress(receipt)}{#if receipt.message}<p class="field-hint">{receipt.message}</p>{/if}{#if receipt.error}<p class="field-hint">{$t(`errors.${receipt.error.code}`)}</p>{/if}</div>{/if}
         </article>
       {/each}
     </div>
@@ -389,10 +482,11 @@
 <dialog class="modal inventory-modal" bind:this={inventoryDialog} aria-labelledby="inventory-title" oncancel={(event) => { event.preventDefault(); closeInventory(); }}>
   <div class="panel-header"><div><h2 id="inventory-title">{$t('devices.inventoryTitle')}</h2><p class="small muted">{inventoryDevice?.label ?? $t('devices.title')}</p></div><button class="icon-button" type="button" onclick={closeInventory} aria-label={$t('actions.close')}><X size={20} /></button></div>
   <div class="panel-body stack">
-    {#if inventoryReceipt && !terminal(inventoryReceipt)}<div class="receipt stack" aria-live="polite"><p>{$t(`jobs.${inventoryReceipt.kind}`)} · {$t(`jobs.${inventoryReceipt.status}`)}</p><progress value={inventoryReceipt.progress} max="1" aria-label={$t('common.progress')}></progress></div>{/if}
+    {#if inventoryReceipt && !terminal(inventoryReceipt)}<div class="receipt stack" aria-live="polite"><p>{$t(`jobs.${inventoryReceipt.kind}`)} · {$t(`jobs.${inventoryReceipt.status}`)}</p>{@render jobProgress(inventoryReceipt)}</div>{/if}
     {#if inventory}
       <p class="small muted">{$t('common.date')}: {formatDate(inventory.updatedAt, $locale)}</p>
-      {#if inventory.truncated}<p class="inventory-warning" role="status">{$t('devices.inventoryTruncated', { count: inventory.books.length, total: inventory.total ?? $t('common.unknown') })}</p>{/if}
+      <p class="small muted" role="status">{$t('devices.inventoryLoaded', { count: number.format(inventory.books.length), total: inventory.total === null ? $t('common.unknown') : number.format(inventory.total) })}</p>
+      {#if inventory.truncated && inventoryDevice?.transport === 'usb'}<button class="button secondary" type="button" disabled={inventoryLoading} onclick={() => { void loadInventory(true); }}>{$t('devices.inventoryLoadMore')}</button>{:else if inventory.truncated}<p class="inventory-warning" role="status">{$t('devices.inventoryTruncated', { count: inventory.books.length, total: inventory.total ?? $t('common.unknown') })}</p>{/if}
       {#each inventory.warnings.filter((warning) => warning !== 'deviceIndexResultTruncated') as warning}<p class="field-hint">{warningText(warning)}</p>{/each}
       <div class="inventory-filters"><div class="field grow"><label for="inventory-search">{$t('devices.inventorySearch')}</label><input id="inventory-search" class="input" type="search" bind:value={inventorySearch} /></div><div class="field"><label for="inventory-match">{$t('devices.inLibrary')}</label><select id="inventory-match" class="select" bind:value={inventoryMatch}><option value="all">{$t('common.all')}</option><option value="known">{$t('devices.inLibrary')}</option><option value="unknown">{$t('devices.unknownBook')}</option></select></div></div>
       <p class="small muted" aria-live="polite">{$t('devices.inventoryFiltered', { count: inventoryRows.length })}</p>

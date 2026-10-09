@@ -194,6 +194,8 @@ pub fn run() {
             commands::optimization_profiles,
             commands::devices_scan,
             commands::device_index,
+            commands::device_inventory,
+            commands::device_import,
             commands::device_connect_wireless,
             commands::device_disconnect,
             commands::device_transfer,

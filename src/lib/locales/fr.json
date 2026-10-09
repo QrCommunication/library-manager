@@ -214,7 +214,13 @@
     "inventoryTruncated": "Cet aperçu affiche {count} livres sur {total}. L’inventaire complet reste utilisé pour reconnaître les livres présents sur l’appareil.",
     "inventoryFiltered": "{count} livres affichés dans cet aperçu",
     "inventoryNoResults": "Aucun livre ne correspond aux filtres de cet aperçu.",
-    "calibreTransferHint": "Les envois utilisent des chemins uniques et sont vérifiés après réception. Une coupure réseau peut laisser un fichier partiel sur la liseuse ; Library Manager conserve une trace pour vérifier son nettoyage à la reconnexion."
+    "calibreTransferHint": "Les envois utilisent des chemins uniques et sont vérifiés après réception. Une coupure réseau peut laisser un fichier partiel sur la liseuse ; Library Manager conserve une trace pour vérifier son nettoyage à la reconnexion.",
+    "inventoryDiscovering": "Recherche des livres : {entries} éléments parcourus, {books} livres détectés",
+    "inventoryReading": "{processed} / {total} livres identifiés · {read} / {size} lus",
+    "inventoryFinalizing": "Finalisation de l’inventaire…",
+    "inventoryProgress": "{percent} de l’inventaire terminés",
+    "inventoryLoadMore": "Charger davantage",
+    "inventoryLoaded": "Livres affichés : {count} / {total}"
   },
   "optimization": {
     "lossless": "Compression sans perte",
@@ -392,5 +398,19 @@
     "progress": "Progression",
     "back": "Retour",
     "all": "Tous"
+  },
+  "deviceLibrary": {
+    "title": "Livres sur votre liseuse",
+    "onlyOnDevice": "Uniquement sur la liseuse",
+    "importOne": "Importer ce livre",
+    "importAll": "Importer tous les livres manquants",
+    "description": "Ces livres sont présents sur votre liseuse et absents de la bibliothèque locale. Ils apparaissent au fil de l’inventaire. La recherche porte sur les livres déjà chargés dans cette section ; « Charger davantage » permet de consulter les suivants.",
+    "empty": "Aucun livre à importer parmi les livres détectés pour le moment.",
+    "loadMore": "Charger davantage",
+    "loaded": "Livres chargés : {loaded} / {total} absents de la bibliothèque locale",
+    "importing": "Import dans la bibliothèque locale en cours…",
+    "importResult": "{imported} livres importés · {duplicates} déjà présents · {failed} échecs",
+    "disconnected": "Liseuse déconnectée. Rebranchez-la pour consulter ou importer ses livres.",
+    "identifying": "Inventaire en cours : les livres détectés apparaissent progressivement."
   }
 }

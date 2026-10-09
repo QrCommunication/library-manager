@@ -214,7 +214,13 @@
     "inventoryTruncated": "This preview shows {count} of {total} books. The full inventory is still used to recognize books present on the device.",
     "inventoryFiltered": "{count} books shown in this preview",
     "inventoryNoResults": "No books match the filters in this preview.",
-    "calibreTransferHint": "Transfers use unique paths and are verified after receipt. A network interruption may leave a partial file on the reader; Library Manager keeps a record to verify cleanup when it reconnects."
+    "calibreTransferHint": "Transfers use unique paths and are verified after receipt. A network interruption may leave a partial file on the reader; Library Manager keeps a record to verify cleanup when it reconnects.",
+    "inventoryDiscovering": "Finding books: {entries} items checked, {books} books detected",
+    "inventoryReading": "{processed} / {total} books identified · {read} / {size} read",
+    "inventoryFinalizing": "Finishing the inventory…",
+    "inventoryProgress": "{percent} of the inventory completed",
+    "inventoryLoadMore": "Load more",
+    "inventoryLoaded": "Books displayed: {count} / {total}"
   },
   "optimization": {
     "lossless": "Lossless compression",
@@ -392,5 +398,19 @@
     "progress": "Progress",
     "back": "Back",
     "all": "All"
+  },
+  "deviceLibrary": {
+    "title": "Books on your reader",
+    "onlyOnDevice": "Only on the reader",
+    "importOne": "Import this book",
+    "importAll": "Import all missing books",
+    "description": "These books are on your reader and missing from the local library. They appear as the inventory progresses. Search applies to books already loaded in this section; use “Load more” to browse the remaining books.",
+    "empty": "No books to import among those detected so far.",
+    "loadMore": "Load more",
+    "loaded": "Books loaded: {loaded} / {total} missing from the local library",
+    "importing": "Importing into the local library…",
+    "importResult": "{imported} books imported · {duplicates} already present · {failed} failures",
+    "disconnected": "Reader disconnected. Reconnect it to browse or import its books.",
+    "identifying": "Inventory in progress: detected books appear as they are found."
   }
 }

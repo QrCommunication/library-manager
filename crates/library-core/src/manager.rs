@@ -9,7 +9,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rustix::fs::{FlockOperation, Mode, OFlags};
@@ -34,6 +34,8 @@ const WORKER_TICK: Duration = Duration::from_millis(250);
 const DEVICE_SCAN_INTERVAL: Duration = Duration::from_secs(5);
 const DEVICE_SCAN_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BATCH: usize = 200;
+const MAX_DEVICE_IMPORT_BOOKS: usize = 20_000;
+const INDEX_PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 const MAX_INDEX_BOOKS: usize = 500;
 const MAX_INDEX_RESULT_BYTES: usize = 768 * 1024;
 
@@ -225,6 +227,42 @@ impl LibraryManager {
     pub fn device_index(&self, id: &str) -> Result<Job> {
         self.jobs
             .enqueue(JobKind::DeviceIndex, json!({"deviceId":id}))
+    }
+    pub fn device_inventory(
+        &self,
+        id: &str,
+        offset: u64,
+        limit: u64,
+        unknown_only: bool,
+    ) -> Result<crate::devices::DeviceInventoryPage> {
+        if limit == 0 || limit > MAX_BATCH as u64 {
+            return Err(invalid("Inventory page size must be between one and 200"));
+        }
+        self.devices.resolve_connected(id)?;
+        self.devices.inventory_page(id, offset, limit, unknown_only)
+    }
+    pub fn device_import(&self, id: &str, relative_paths: Option<Vec<String>>) -> Result<Job> {
+        self.devices.resolve_connected(id)?;
+        let inventory =
+            self.devices
+                .inventory_page(id, 0, MAX_DEVICE_IMPORT_BOOKS as u64, false)?;
+        if let Some(paths) = &relative_paths {
+            validate_device_import_paths(paths)?;
+            let known: HashSet<_> = inventory
+                .items
+                .iter()
+                .map(|book| book.relative_path.as_str())
+                .collect();
+            if paths.iter().any(|path| !known.contains(path.as_str())) {
+                return Err(invalid("Device imports require inventoried relative paths"));
+            }
+        }
+        // A null selection stays small and selects unknown books in the worker.
+        self.jobs.enqueue_with_result(
+            JobKind::Import,
+            json!({"deviceId":id,"relativePaths":relative_paths}),
+            json!({"deviceId":id}),
+        )
     }
     pub fn device_transfer(
         &self,
@@ -567,46 +605,111 @@ impl LibraryManager {
     }
     async fn import_job(&self, claim: &ClaimedJob) -> Result<Value> {
         let payload: ImportPayload = decode(&claim.payload)?;
-        validate_batch(&payload.paths)?;
+        let (device_id, paths, expected_hashes) = match payload {
+            ImportPayload::Local { paths } => {
+                validate_batch(&paths)?;
+                (None, paths, BTreeMap::new())
+            }
+            ImportPayload::Device {
+                device_id,
+                relative_paths,
+            } => {
+                self.devices.resolve_connected(&device_id)?;
+                let inventory = self.devices.inventory_page(
+                    &device_id,
+                    0,
+                    MAX_DEVICE_IMPORT_BOOKS as u64,
+                    relative_paths.is_none(),
+                )?;
+                let paths = match relative_paths {
+                    Some(paths) => {
+                        validate_device_import_paths(&paths)?;
+                        paths
+                    }
+                    None => inventory
+                        .items
+                        .iter()
+                        .map(|book| book.relative_path.clone())
+                        .collect(),
+                };
+                let expected_hashes = inventory
+                    .items
+                    .into_iter()
+                    .map(|book| (book.relative_path, book.sha256))
+                    .collect();
+                (Some(device_id), paths, expected_hashes)
+            }
+        };
         let settings = self.settings.get()?;
         let mut imported = 0;
         let mut duplicates = 0;
         let mut warnings = Vec::new();
+        let mut warning_count = 0_usize;
         let mut ids = Vec::new();
         let mut errors = BTreeMap::<String, u64>::new();
-        for (index, path) in payload.paths.iter().enumerate() {
+        for (index, path) in paths.iter().enumerate() {
             check_cancelled(claim)?;
             let library = self
                 .library
                 .clone()
                 .with_cancellation(claim.cancellation.clone());
-            let path = PathBuf::from(path);
-            match blocking(move || library.import(&path)).await {
+            let path = path.clone();
+            let devices = self.devices.clone();
+            let source_device = device_id.clone();
+            let expected_hash = expected_hashes.get(&path).cloned().flatten();
+            let is_device_import = source_device.is_some();
+            match blocking(move || {
+                let path = match source_device {
+                    Some(id) => devices.resolve_import_path(&id, &path)?,
+                    None => PathBuf::from(path),
+                };
+                if is_device_import {
+                    let hash = expected_hash.ok_or_else(|| {
+                        AppError::Unsupported(
+                            "This inventoried file has no verified content hash".into(),
+                        )
+                    })?;
+                    library.import_expected(&path, &hash)
+                } else {
+                    library.import(&path)
+                }
+            })
+            .await
+            {
                 Ok(outcome) => {
                     if outcome.duplicate {
                         duplicates += 1;
                     } else {
                         imported += 1;
                     }
-                    warnings.extend(outcome.warnings);
+                    warning_count += outcome.warnings.len();
+                    warnings.extend(
+                        outcome
+                            .warnings
+                            .into_iter()
+                            .take(MAX_INDEX_BOOKS.saturating_sub(warnings.len())),
+                    );
+                    if let Some(id) = &device_id {
+                        self.devices.reconcile_import(id, &outcome.book.id)?;
+                    }
+                    self.library_changed(vec![outcome.book.id.clone()], "import");
                     if settings.auto_enrich
                         && (!outcome.duplicate || self.needs_recovered_enrichment(&outcome.book)?)
                     {
                         self.enqueue_enrichment(&outcome.book, "import")?;
                     }
-                    ids.push(outcome.book.id);
+                    if ids.len() < MAX_INDEX_BOOKS {
+                        ids.push(outcome.book.id);
+                    }
                 }
                 Err(AppError::Cancelled) => return Err(AppError::Cancelled),
                 Err(error) => {
                     *errors.entry(error.code().into()).or_default() += 1;
                 }
             }
-            self.jobs.update_progress(
-                claim,
-                (index + 1) as f64 / payload.paths.len() as f64,
-                "",
-            )?;
-            self.jobs.update_result(claim, json!({"imported":imported,"duplicates":duplicates,"warnings":warnings,"bookIds":ids,"errorsByCode":errors}))?;
+            self.jobs
+                .update_progress(claim, (index + 1) as f64 / paths.len() as f64, "")?;
+            self.jobs.update_result(claim, json!({"deviceId":device_id,"imported":imported,"duplicates":duplicates,"warnings":warnings,"warningCount":warning_count,"warningsTruncated":warning_count > warnings.len(),"bookIds":ids,"bookIdsTruncated":imported + duplicates > ids.len(),"total":paths.len(),"processed":index + 1,"errorsByCode":errors}))?;
         }
         check_cancelled(claim)?;
         self.library_changed(ids.clone(), "import");
@@ -614,7 +717,7 @@ impl LibraryManager {
             return Err(invalid("No source could be imported"));
         }
         Ok(
-            json!({"imported":imported,"duplicates":duplicates,"warnings":warnings,"bookIds":ids,"errorsByCode":errors}),
+            json!({"deviceId":device_id,"imported":imported,"duplicates":duplicates,"warnings":warnings,"warningCount":warning_count,"warningsTruncated":warning_count > warnings.len(),"bookIds":ids,"bookIdsTruncated":imported + duplicates > ids.len(),"total":paths.len(),"processed":paths.len(),"errorsByCode":errors}),
         )
     }
     fn needs_recovered_enrichment(&self, book: &Book) -> Result<bool> {
@@ -685,7 +788,51 @@ impl LibraryManager {
         } else {
             let devices = self.devices.clone();
             let id = payload.device_id.clone();
-            blocking(move || devices.index(&id)).await?
+            let manager = self.clone();
+            let claim = claim.clone();
+            blocking(move || {
+                let mut last_report = Instant::now();
+                let mut last_library_report = Instant::now();
+                let mut last_phase = String::new();
+                let mut last_processed = 0_u64;
+                let mut previous_progress = claim.job.progress;
+                devices.index_with_progress(&id, claim.cancellation.clone(), |progress| {
+                    check_cancelled(&claim)?;
+                    let phase_changed = progress.phase != last_phase;
+                    let processed_changed = progress.processed_books != last_processed;
+                    if phase_changed
+                        || processed_changed
+                        || last_report.elapsed() >= INDEX_PROGRESS_INTERVAL
+                    {
+                        let measured = if progress.phase == "discovering" {
+                            0.0
+                        } else if progress.total_bytes > 0 {
+                            0.99 * progress.bytes_read as f64 / progress.total_bytes as f64
+                        } else if progress.total_books > 0 {
+                            0.99 * progress.processed_books as f64 / progress.total_books as f64
+                        } else {
+                            0.0
+                        };
+                        previous_progress = previous_progress.max(measured.min(0.99));
+                        manager.jobs.update_result(
+                            &claim,
+                            json!({"deviceId":id,"indexProgress":progress}),
+                        )?;
+                        manager
+                            .jobs
+                            .update_progress(&claim, previous_progress, "")?;
+                        last_report = Instant::now();
+                        last_phase = progress.phase.clone();
+                        last_processed = progress.processed_books;
+                    }
+                    if phase_changed || last_library_report.elapsed() >= INDEX_PROGRESS_INTERVAL {
+                        manager.library_changed(Vec::new(), "deviceIndexProgress");
+                        last_library_report = Instant::now();
+                    }
+                    Ok(())
+                })
+            })
+            .await?
         };
         check_cancelled(claim)?;
         let warnings = if payload.device_id.starts_with("calibre-") {
@@ -815,6 +962,24 @@ fn validate_batch(values: &[String]) -> Result<()> {
     }
     Ok(())
 }
+fn validate_device_import_paths(values: &[String]) -> Result<()> {
+    if values.is_empty()
+        || values.len() > MAX_DEVICE_IMPORT_BOOKS
+        || values.iter().any(|value| {
+            value.is_empty()
+                || value.len() > 4096
+                || value.contains('\0')
+                || !Path::new(value)
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+        })
+    {
+        return Err(invalid(
+            "Device import needs one to 20000 safe relative paths",
+        ));
+    }
+    Ok(())
+}
 fn decode<T: serde::de::DeserializeOwned>(value: &Value) -> Result<T> {
     serde_json::from_value(value.clone()).map_err(|_| invalid("Invalid background-job payload"))
 }
@@ -842,9 +1007,17 @@ async fn blocking<T: Send + 'static>(
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ImportPayload {
-    paths: Vec<String>,
+#[serde(untagged)]
+enum ImportPayload {
+    Local {
+        paths: Vec<String>,
+    },
+    Device {
+        #[serde(rename = "deviceId")]
+        device_id: String,
+        #[serde(rename = "relativePaths")]
+        relative_paths: Option<Vec<String>>,
+    },
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1287,6 +1460,193 @@ mod tests {
             manager.library_list(&BookQuery::default()).unwrap().total,
             1
         );
+    }
+
+    fn device_fixture(count: usize) -> (TempDir, LibraryManager, Events, PathBuf, PathBuf, String) {
+        let directory = tempfile::tempdir().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let profile = directory.path().join("profile");
+        let mut manager = create(&profile, events.clone()).unwrap();
+        let mut settings = manager.settings.get().unwrap();
+        settings.auto_enrich = false;
+        manager.settings_save(&settings).unwrap();
+        let media = directory.path().join("media");
+        let card = media.join("Xteink");
+        let gvfs = directory.path().join("gvfs");
+        let mountinfo = directory.path().join("mountinfo");
+        std::fs::create_dir_all(&card).unwrap();
+        std::fs::create_dir_all(&gvfs).unwrap();
+        for index in 0..count {
+            std::fs::write(
+                card.join(format!("book-{index}.pdf")),
+                format!("%PDF synthetic fixture {index}"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            &mountinfo,
+            format!(
+                "42 1 8:1 / {} rw,nosuid - vfat UUID=TEST-CARD rw\n",
+                card.display()
+            ),
+        )
+        .unwrap();
+        manager.devices =
+            DeviceService::scan_at(Database::new(&profile).unwrap(), &mountinfo, &media, &gvfs);
+        let devices = manager.devices.scan().unwrap();
+        let id = devices
+            .iter()
+            .find(|device| device.connected)
+            .unwrap()
+            .id
+            .clone();
+        *manager.cached_devices.lock().unwrap() = devices;
+        (directory, manager, events, card, mountinfo, id)
+    }
+
+    #[tokio::test]
+    async fn device_import_preserves_source_reconciles_presence_and_deduplicates() {
+        let (_directory, manager, _events, card, _mountinfo, id) = device_fixture(1);
+        manager.devices.index(&id).unwrap();
+        let original = std::fs::read(card.join("book-0.pdf")).unwrap();
+        let job = manager
+            .device_import(&id, Some(vec!["book-0.pdf".into()]))
+            .unwrap();
+        assert_eq!(job.result.unwrap()["deviceId"], id);
+        assert!(manager.run_once().await.unwrap());
+        let result = manager.jobs.get(&job.id).unwrap();
+        assert_eq!(result.status, JobStatus::Completed);
+        assert_eq!(result.result.unwrap()["imported"], 1);
+        assert_eq!(std::fs::read(card.join("book-0.pdf")).unwrap(), original);
+        let local = manager.library_list(&BookQuery::default()).unwrap();
+        assert_eq!(local.total, 1);
+        assert_eq!(local.items[0].on_device_ids, vec![id.clone()]);
+        assert_eq!(
+            manager.device_inventory(&id, 0, 200, true).unwrap().total,
+            0
+        );
+        let repeated = manager
+            .device_import(&id, Some(vec!["book-0.pdf".into()]))
+            .unwrap();
+        assert!(manager.run_once().await.unwrap());
+        assert_eq!(
+            manager.jobs.get(&repeated.id).unwrap().result.unwrap()["duplicates"],
+            1
+        );
+        assert_eq!(
+            manager.library_list(&BookQuery::default()).unwrap().total,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn device_import_all_uses_full_backend_inventory_and_continues_after_file_changes() {
+        let (_directory, manager, _events, card, _mountinfo, id) = device_fixture(202);
+        manager.devices.index(&id).unwrap();
+        let job = manager.device_import(&id, None).unwrap();
+        std::fs::write(card.join("book-0.pdf"), b"changed after inventory").unwrap();
+        assert!(manager.run_once().await.unwrap());
+        let finished = manager.jobs.get(&job.id).unwrap();
+        assert_eq!(finished.status, JobStatus::Completed);
+        let result = finished.result.unwrap();
+        assert_eq!(result["deviceId"], id);
+        assert_eq!(result["total"], 202);
+        assert_eq!(result["processed"], 202);
+        assert_eq!(result["imported"], 201);
+        assert_eq!(result["errorsByCode"]["conflict"], 1);
+        assert_eq!(
+            manager.library_list(&BookQuery::default()).unwrap().total,
+            201
+        );
+        assert_eq!(
+            manager.device_inventory(&id, 0, 200, true).unwrap().total,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn device_import_revalidates_connection_in_worker_and_rejects_noninventoried_paths() {
+        let (_directory, manager, _events, _card, mountinfo, id) = device_fixture(1);
+        manager.devices.index(&id).unwrap();
+        assert!(
+            manager
+                .device_import(&id, Some(vec!["../outside.pdf".into()]))
+                .is_err()
+        );
+        assert!(
+            manager
+                .device_import(&id, Some(vec!["absent.pdf".into()]))
+                .is_err()
+        );
+        let job = manager.device_import(&id, None).unwrap();
+        std::fs::write(mountinfo, "").unwrap();
+        assert!(manager.run_once().await.unwrap());
+        assert_eq!(manager.jobs.get(&job.id).unwrap().status, JobStatus::Failed);
+        assert_eq!(
+            manager.library_list(&BookQuery::default()).unwrap().total,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn device_index_jobs_report_measured_monotone_progress_and_honor_cancellation() {
+        let (_directory, mut manager, events, _card, _mountinfo, id) = device_fixture(2);
+        let job = manager.device_index(&id).unwrap();
+        assert!(manager.run_once().await.unwrap());
+        assert_eq!(
+            manager.jobs.get(&job.id).unwrap().status,
+            JobStatus::Completed
+        );
+        let updates: Vec<_> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, value)| name == "job:updated" && value["job"]["id"] == job.id)
+            .map(|(_, value)| value["job"].clone())
+            .collect();
+        assert!(
+            updates
+                .iter()
+                .any(|job| job["result"]["indexProgress"]["phase"] == "discovering")
+        );
+        assert!(
+            updates
+                .iter()
+                .any(|job| job["result"]["indexProgress"]["phase"] == "reading")
+        );
+        let fractions: Vec<_> = updates
+            .iter()
+            .map(|job| job["progress"].as_f64().unwrap())
+            .collect();
+        assert!(fractions.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(
+            fractions
+                .iter()
+                .any(|fraction| *fraction > 0.0 && *fraction < 0.99)
+        );
+        assert_eq!(fractions.last(), Some(&1.0));
+        let original_jobs = manager.jobs.clone();
+        manager.jobs = manager
+            .jobs
+            .clone()
+            .with_event_callback(Arc::new(move |job| {
+                if job.kind == JobKind::DeviceIndex
+                    && job
+                        .result
+                        .as_ref()
+                        .and_then(|result| result["indexProgress"]["processedBooks"].as_u64())
+                        .is_some_and(|count| count > 0)
+                {
+                    original_jobs.cancel(&job.id).unwrap();
+                }
+            }));
+        let cancelled = manager.device_index(&id).unwrap();
+        assert!(manager.run_once().await.unwrap());
+        assert_eq!(
+            manager.jobs.get(&cancelled.id).unwrap().status,
+            JobStatus::Cancelled
+        );
+        assert_eq!(manager.devices.inventory(&id).unwrap().len(), 2);
     }
 
     fn indexed(index: usize, large: bool) -> IndexedDeviceBook {

@@ -309,6 +309,32 @@ pub async fn device_index(state: State<'_, AppState>, id: String) -> IpcResult<J
     blocking(state.inner(), move |manager| manager.device_index(&id)).await
 }
 
+#[tauri::command(rename_all = "camelCase")]
+pub async fn device_inventory(
+    state: State<'_, AppState>,
+    id: String,
+    offset: u64,
+    limit: u64,
+    unknown_only: bool,
+) -> IpcResult<library_core::devices::DeviceInventoryPage> {
+    blocking(state.inner(), move |manager| {
+        manager.device_inventory(&id, offset, limit, unknown_only)
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn device_import(
+    state: State<'_, AppState>,
+    id: String,
+    relative_paths: Option<Vec<String>>,
+) -> IpcResult<Job> {
+    blocking(state.inner(), move |manager| {
+        manager.device_import(&id, relative_paths)
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn device_connect_wireless(
     state: State<'_, AppState>,

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { version } from '../../package.json';
 import { defaultQuery } from './contracts';
 import type { BookQuery } from './contracts';
 
@@ -16,6 +17,37 @@ async function list(patch: Partial<BookQuery> = {}) {
 }
 
 describe('explicit preview library', () => {
+  it('reports the packaged version and separates device-only books from the local catalogue', async () => {
+    expect((await preview.requestPreview('app_bootstrap', undefined)).version).toBe(version);
+    const params = { id: 'preview-xteink', offset: 0, limit: 200, unknownOnly: false };
+    const inventory = await preview.requestPreview('device_inventory', params);
+    const unknown = await preview.requestPreview('device_inventory', { ...params, unknownOnly: true });
+    expect(inventory.total).toBe(13);
+    expect(inventory.items.filter((book) => book.bookId !== null)).toHaveLength(12);
+    expect(unknown.total).toBe(1);
+    expect(unknown.items[0]).toMatchObject({ deviceId: params.id, bookId: null, format: 'epub', title: 'Le carnet de la liseuse' });
+    expect((await list()).items.some((book) => book.title === unknown.items[0]?.title)).toBe(false);
+    const devices = await preview.requestPreview('devices_scan', undefined);
+    expect(devices.find((device) => device.id === params.id)?.bookCount).toBe(inventory.total);
+    expect(devices.find((device) => device.id === params.id)?.matchedBookCount).toBe(12);
+  });
+
+  it('paginates device inventory including offset zero and validates bounds and live devices', async () => {
+    const params = { id: 'preview-xteink', offset: 0, limit: 1, unknownOnly: false };
+    const first = await preview.requestPreview('device_inventory', params);
+    const second = await preview.requestPreview('device_inventory', { ...params, offset: 1 });
+    expect(first).toMatchObject({ total: 13, offset: 0, limit: 1 });
+    expect(first.items).toHaveLength(1);
+    expect(second.items).toHaveLength(1);
+    expect(second.items[0]?.relativePath).not.toBe(first.items[0]?.relativePath);
+    expect((await preview.requestPreview('device_inventory', { ...params, unknownOnly: true, offset: 1 })).items).toEqual([]);
+    for (const patch of [{ offset: -1 }, { offset: 0.5 }, { limit: 0 }, { limit: 201 }]) {
+      await expect(preview.requestPreview('device_inventory', { ...params, ...patch })).rejects.toMatchObject({ code: 'invalidInput' });
+    }
+    await expect(preview.requestPreview('device_inventory', { ...params, id: 'unknown' })).rejects.toMatchObject({ code: 'notFound' });
+    await expect(preview.requestPreview('device_inventory', { ...params, id: 'preview-wireless' })).rejects.toMatchObject({ code: 'deviceDisconnected' });
+  });
+
   it('requires an explicit browser demo and never activates inside the desktop application', async () => {
     expect(preview.isPreview()).toBe(true);
     vi.stubGlobal('window', { location: { search: '' } });
@@ -107,7 +139,7 @@ describe('explicit preview library', () => {
 
   it('never fabricates successful real operations and reports truthful conversion and provider capabilities', async () => {
     const id = 'preview-book-01';
-    for (const command of ['import_books', 'book_update', 'book_enrich', 'book_optimize', 'book_convert', 'device_index', 'device_transfer', 'provider_models', 'provider_set_secret', 'chat_send', 'job_cancel', 'operation_undo'] as const) {
+    for (const command of ['import_books', 'book_update', 'book_enrich', 'book_optimize', 'book_convert', 'device_index', 'device_import', 'device_transfer', 'provider_models', 'provider_set_secret', 'chat_send', 'job_cancel', 'operation_undo'] as const) {
       // No handler for these operations reads arguments: every action must reject before doing work.
       await expect(preview.requestPreview(command, {} as never)).rejects.toMatchObject({ code: 'operationConflict', detail: command });
     }

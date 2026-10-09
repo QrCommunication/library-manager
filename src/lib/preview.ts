@@ -1,6 +1,7 @@
 import type { UnlistenFn } from '@tauri-apps/api/event';
+import { version } from '../../package.json';
 import type {
-  AppError, Book, BookFormat, BookPage, BookQuery, Device, Facet, IpcCommand,
+  AppError, Book, BookFormat, BookPage, BookQuery, Device, DeviceInventoryBook, Facet, IpcCommand,
   IpcContracts, IpcEvents, IpcParams, IpcResult, LibraryFacets, OptimizationProfile,
   Provider, ReaderManifest, ReaderSection, Settings,
 } from './contracts';
@@ -133,7 +134,7 @@ const devices: Device[] = [
     id: 'preview-xteink', label: 'Demo · Xteink X4 Pro', transport: 'usb', connected: true,
     writable: false, profile: 'xteink', mountPath: null, address: null,
     totalBytes: 64 * 1024 ** 3, freeBytes: 54 * 1024 ** 3,
-    bookCount: books.filter((book) => book.onDeviceIds.includes('preview-xteink')).length,
+    bookCount: books.filter((book) => book.onDeviceIds.includes('preview-xteink')).length + 1,
     matchedBookCount: books.filter((book) => book.onDeviceIds.includes('preview-xteink')).length,
     lastSeenAt: DEMO_DATE,
   },
@@ -319,7 +320,7 @@ type PreviewHandlers = {
 };
 
 const handlers: PreviewHandlers = {
-  app_bootstrap: () => ({ version: '0.1.0', systemLanguage: typeof navigator === 'undefined' ? 'en' : navigator.language, settings, devices, pendingJobs: [] }),
+  app_bootstrap: () => ({ version, systemLanguage: typeof navigator === 'undefined' ? 'en' : navigator.language, settings, devices, pendingJobs: [] }),
   library_list: ({ query }) => listBooks(query),
   library_facets: () => facets(),
   book_get: ({ id }) => bookById(id),
@@ -336,6 +337,27 @@ const handlers: PreviewHandlers = {
   optimization_profiles: () => profiles,
   devices_scan: () => devices,
   device_index: () => unavailable('device_index'),
+  device_inventory: ({ id, offset, limit, unknownOnly }) => {
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+      throw publicError('invalidInput', 'The demonstration inventory page is invalid.');
+    }
+    const device = devices.find((candidate) => candidate.id === id);
+    if (!device) throw publicError('notFound', 'Unknown demonstration device.');
+    if (!device.connected) throw publicError('deviceDisconnected', 'The demonstration device is disconnected.');
+    const inventory: DeviceInventoryBook[] = books.filter((book) => book.onDeviceIds.includes(id)).map((book) => ({
+      deviceId: id, relativePath: `${book.id}.${book.format}`, bookId: book.id,
+      sha256: null, title: book.title, authors: book.authors, format: book.format,
+      sizeBytes: book.sizeBytes, lastSeenAt: DEMO_DATE, warnings: [],
+    }));
+    inventory.push({
+      deviceId: id, relativePath: 'Livres/Le carnet de la liseuse.epub', bookId: null,
+      sha256: null, title: 'Le carnet de la liseuse', authors: ['Maëlle Veyron'],
+      format: 'epub', sizeBytes: 245_760, lastSeenAt: DEMO_DATE, warnings: [],
+    });
+    const filtered = unknownOnly ? inventory.filter((book) => book.bookId === null) : inventory;
+    return { items: filtered.slice(offset, offset + limit), total: filtered.length, offset, limit };
+  },
+  device_import: () => unavailable('device_import'),
   device_connect_wireless: () => unavailable('device_connect_wireless'),
   device_disconnect: () => unavailable('device_disconnect'),
   device_transfer: () => unavailable('device_transfer'),

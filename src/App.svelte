@@ -313,7 +313,7 @@
         <ReaderView book={readingBook} onClose={() => { readingBook = null; }} onNotify={notify} onError={reportError} />
       {:else if activeView === 'library'}
         <LibraryView
-          {initialQuery} {search} {groupBy} {refreshVersion} {selectedBookIds} {importing}
+          {initialQuery} {search} {groupBy} {refreshVersion} {selectedBookIds} {importing} {devices} {jobs}
           initialState={libraryState} onStateChange={(state: LibraryViewState) => { libraryState = state; }}
           onSelectionChange={(ids: string[]) => { selectedBookIds = ids; }}
           onOpenBook={(book: Book) => { detailBook = book; }}

@@ -5,6 +5,7 @@ use std::fs;
 use std::io::{Read, Take};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use chrono::Utc;
@@ -15,10 +16,13 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::database::Database;
+#[cfg(test)]
 use crate::epub::EpubDocument;
 use crate::error::{AppError, Result};
 use crate::models::{BookFormat, Device};
-use crate::storage::{MAX_FILE_BYTES, Storage};
+use crate::storage::MAX_FILE_BYTES;
+#[cfg(test)]
+use crate::storage::Storage;
 
 const MAX_MOUNTINFO_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_MOUNTS: usize = 4_096;
@@ -43,6 +47,36 @@ pub struct IndexedDeviceBook {
     pub size_bytes: u64,
     pub last_seen_at: String,
     pub warnings: Vec<String>,
+}
+
+/// Counters are measured from enumeration and actual file reads, never elapsed time.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceIndexProgress {
+    pub phase: String,
+    pub visited_entries: u64,
+    pub processed_books: u64,
+    pub total_books: u64,
+    pub bytes_read: u64,
+    pub total_bytes: u64,
+    pub current_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceInventoryPage {
+    pub items: Vec<IndexedDeviceBook>,
+    pub total: u64,
+    pub offset: u64,
+    pub limit: u64,
+}
+
+#[derive(Debug)]
+struct InventorySnapshot {
+    capability: MountCapability,
+    books: Vec<IndexedDeviceBook>,
+    versions: BTreeMap<String, fs::Metadata>,
+    indexing: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,6 +129,7 @@ pub struct DeviceService {
     database: Database,
     source: Arc<MountSource>,
     active: Arc<Mutex<BTreeMap<String, MountCapability>>>,
+    inventories: Arc<Mutex<BTreeMap<String, InventorySnapshot>>>,
 }
 
 impl DeviceService {
@@ -113,6 +148,7 @@ impl DeviceService {
                 gvfs_roots: vec![runtime.join("gvfs")],
             }),
             active: Arc::new(Mutex::new(BTreeMap::new())),
+            inventories: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -190,6 +226,11 @@ impl DeviceService {
         drop(rows);
         drop(statement);
         transaction.commit()?;
+        self.lock_inventories()?.retain(|id, snapshot| {
+            current
+                .get(id)
+                .is_none_or(|mounted| snapshot.capability.same_connection(mounted))
+        });
         *active = current;
         Ok(devices)
     }
@@ -211,14 +252,82 @@ impl DeviceService {
         Ok(capability.path)
     }
 
-    /// Reads the device, then replaces its local inventory in one transaction.
-    /// Hash equality is the only automatic match to a library file.
+    /// Compatibility wrapper for callers that do not need live progress.
     pub fn index(&self, id: &str) -> Result<Vec<IndexedDeviceBook>> {
+        self.index_with_progress(id, Arc::new(AtomicBool::new(false)), |_| Ok(()))
+    }
+
+    /// Enumerates first, fixing the read denominator before hashing any book.
+    /// Completed records become visible without exposing a partially written DB.
+    pub fn index_with_progress<F>(
+        &self,
+        id: &str,
+        cancelled: Arc<AtomicBool>,
+        mut callback: F,
+    ) -> Result<Vec<IndexedDeviceBook>>
+    where
+        F: FnMut(DeviceIndexProgress) -> Result<()>,
+    {
         let capability = self.connected_capability(id)?;
+        {
+            let mut inventories = self.lock_inventories()?;
+            if inventories
+                .get(id)
+                .is_some_and(|snapshot| snapshot.indexing)
+            {
+                return Err(AppError::Conflict(
+                    "Device inventory is already running".into(),
+                ));
+            }
+            inventories.insert(
+                id.into(),
+                InventorySnapshot {
+                    capability: capability.clone(),
+                    books: Vec::new(),
+                    versions: BTreeMap::new(),
+                    indexing: true,
+                },
+            );
+        }
+        let outcome = self.perform_index(&capability, &cancelled, &mut callback);
+        let mut inventories = self.lock_inventories()?;
+        if inventories
+            .get(id)
+            .is_some_and(|snapshot| snapshot.capability.same_connection(&capability))
+        {
+            if outcome.is_err() {
+                inventories.remove(id);
+            } else if let Some(snapshot) = inventories.get_mut(id) {
+                snapshot.indexing = false;
+            }
+        }
+        outcome
+    }
+
+    fn perform_index<F>(
+        &self,
+        capability: &MountCapability,
+        cancelled: &AtomicBool,
+        callback: &mut F,
+    ) -> Result<Vec<IndexedDeviceBook>>
+    where
+        F: FnMut(DeviceIndexProgress) -> Result<()>,
+    {
+        let id = capability.id.as_str();
         let timestamp = Utc::now().to_rfc3339();
-        let mut indexed = Vec::new();
-        let mut visited = 0_usize;
-        let mut total_bytes = 0_u64;
+        let mut progress = DeviceIndexProgress {
+            phase: "discovering".into(),
+            visited_entries: 0,
+            processed_books: 0,
+            total_books: 0,
+            bytes_read: 0,
+            total_bytes: 0,
+            current_path: None,
+        };
+        check_cancelled(cancelled)?;
+        callback(progress.clone())?;
+        let mut discovered = Vec::new();
+        let mut discovered_bytes = 0_u64;
         let walker = WalkDir::new(&capability.path)
             .follow_links(false)
             .same_file_system(true)
@@ -226,13 +335,14 @@ impl DeviceService {
             .into_iter()
             .filter_entry(|entry| !ignored_directory(entry.path(), &capability.path));
         for entry in walker {
+            check_cancelled(cancelled)?;
             let entry = entry.map_err(|error| {
                 AppError::Io(error.into_io_error().unwrap_or_else(|| {
                     std::io::Error::other("Cannot enumerate the mounted device")
                 }))
             })?;
-            visited += 1;
-            if visited > MAX_INDEX_ENTRIES {
+            progress.visited_entries += 1;
+            if progress.visited_entries > MAX_INDEX_ENTRIES as u64 {
                 return Err(AppError::Unsupported(
                     "Device inventory entry limit exceeded".into(),
                 ));
@@ -242,13 +352,22 @@ impl DeviceService {
                     "Device folder depth limit exceeded".into(),
                 ));
             }
+            progress.current_path = Some(
+                entry
+                    .path()
+                    .strip_prefix(&capability.path)
+                    .unwrap_or(entry.path())
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            callback(progress.clone())?;
             if !entry.file_type().is_file() {
                 continue;
             }
             let Some(format) = format_for_path(entry.path()) else {
                 continue;
             };
-            if indexed.len() == MAX_INDEX_BOOKS {
+            if discovered.len() == MAX_INDEX_BOOKS {
                 return Err(AppError::Unsupported(
                     "Device inventory book limit exceeded".into(),
                 ));
@@ -256,75 +375,150 @@ impl DeviceService {
             require_root(&capability.path, &capability.identity)?;
             validate_contained_file(entry.path(), &capability.path)?;
             let metadata = fs::symlink_metadata(entry.path())?;
-            let size_bytes = metadata.len();
-            total_bytes = total_bytes.checked_add(size_bytes).ok_or_else(|| {
-                AppError::Unsupported("Device inventory byte limit exceeded".into())
-            })?;
-            if total_bytes > MAX_INDEX_BYTES {
-                return Err(AppError::Unsupported(
-                    "Device inventory byte limit exceeded".into(),
+            discovered_bytes = discovered_bytes
+                .checked_add(metadata.len())
+                .filter(|bytes| *bytes <= MAX_INDEX_BYTES)
+                .ok_or_else(|| {
+                    AppError::Unsupported("Device inventory byte limit exceeded".into())
+                })?;
+            if metadata.len() <= MAX_FILE_BYTES {
+                progress.total_bytes += metadata.len();
+            }
+            discovered.push((entry.path().to_owned(), format, metadata));
+            progress.total_books = discovered.len() as u64;
+        }
+        progress.phase = "reading".into();
+        progress.current_path = None;
+        callback(progress.clone())?;
+        let connection = self.database.connect()?;
+        let mut indexed = Vec::with_capacity(discovered.len());
+        for (path, format, metadata) in discovered {
+            check_cancelled(cancelled)?;
+            require_root(&capability.path, &capability.identity)?;
+            validate_contained_file(&path, &capability.path)?;
+            if !same_file_version(&metadata, &fs::symlink_metadata(&path)?) {
+                return Err(AppError::Conflict(
+                    "A device file changed during indexing".into(),
                 ));
             }
-            let relative_path = relative_utf8_path(entry.path(), &capability.path)?;
+            let relative_path = relative_utf8_path(&path, &capability.path)?;
+            progress.current_path = Some(relative_path.clone());
+            let size_bytes = metadata.len();
             let mut warnings = Vec::new();
             let sha256 = if size_bytes <= MAX_FILE_BYTES {
-                match Storage::hash_file(entry.path()) {
-                    Ok(hash) => Some(hash),
-                    Err(_) => {
-                        warnings.push("hashUnavailable".into());
-                        None
+                let mut file = fs::File::open(&path)?;
+                let mut hash = Sha256::new();
+                let mut buffer = vec![0_u8; 256 * 1024];
+                let mut file_bytes = 0_u64;
+                loop {
+                    check_cancelled(cancelled)?;
+                    let read = file.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
                     }
+                    file_bytes += read as u64;
+                    if file_bytes > size_bytes {
+                        return Err(AppError::Conflict(
+                            "A device file changed during indexing".into(),
+                        ));
+                    }
+                    hash.update(&buffer[..read]);
+                    progress.bytes_read += read as u64;
+                    callback(progress.clone())?;
                 }
+                if file_bytes != size_bytes {
+                    return Err(AppError::Conflict(
+                        "A device file changed during indexing".into(),
+                    ));
+                }
+                Some(
+                    hash.finalize()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>(),
+                )
             } else {
                 warnings.push("fileTooLarge".into());
                 None
             };
-            let mut title = entry
-                .path()
+            let mut title = path
                 .file_stem()
                 .map(|stem| stem.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let mut authors = Vec::new();
             if format == BookFormat::Epub && size_bytes <= MAX_FILE_BYTES {
-                match EpubDocument::open(entry.path()) {
-                    Ok(document) => {
-                        title = document.metadata.title;
-                        authors = document.metadata.authors;
+                check_cancelled(cancelled)?;
+                match crate::epub::read_inventory_metadata(&path) {
+                    Ok(metadata) => {
+                        title = metadata.title;
+                        authors = metadata.authors;
                     }
                     Err(_) => warnings.push("metadataUnavailable".into()),
                 }
             }
-            title = bounded_text(&title);
-            authors.truncate(MAX_AUTHORS);
-            authors = authors
-                .into_iter()
-                .map(|author| bounded_text(&author))
-                .collect();
-            // A file changed between hashing and metadata parsing cannot match an old hash.
-            let after = fs::symlink_metadata(entry.path())?;
-            if !same_file_version(&metadata, &after) {
+            if !same_file_version(&metadata, &fs::symlink_metadata(&path)?) {
                 return Err(AppError::Conflict(
                     "A device file changed during indexing".into(),
                 ));
             }
-            indexed.push(IndexedDeviceBook {
+            authors.truncate(MAX_AUTHORS);
+            let book_id = sha256
+                .as_ref()
+                .map(|hash| {
+                    connection
+                        .query_row(
+                            "SELECT book_id FROM book_files WHERE sha256 = ?1",
+                            [hash],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                })
+                .transpose()?
+                .flatten();
+            let book = IndexedDeviceBook {
                 device_id: id.into(),
-                relative_path,
-                book_id: None,
+                relative_path: relative_path.clone(),
+                book_id,
                 sha256,
-                title,
-                authors,
+                title: bounded_text(&title),
+                authors: authors
+                    .into_iter()
+                    .map(|author| bounded_text(&author))
+                    .collect(),
                 format,
                 size_bytes,
                 last_seen_at: timestamp.clone(),
                 warnings,
-            });
+            };
+            {
+                let mut inventories = self.lock_inventories()?;
+                let snapshot = inventories
+                    .get_mut(id)
+                    .ok_or_else(|| AppError::Conflict("Device inventory was invalidated".into()))?;
+                if !snapshot.capability.same_connection(capability) {
+                    return Err(AppError::Conflict(
+                        "Device inventory connection changed".into(),
+                    ));
+                }
+                snapshot.versions.insert(relative_path, metadata);
+                snapshot.books.push(book.clone());
+            }
+            indexed.push(book);
+            progress.processed_books += 1;
+            callback(progress.clone())?;
         }
-        self.revalidate_connection(&capability)?;
+        check_cancelled(cancelled)?;
+        self.revalidate_connection(capability)?;
+        progress.phase = "finalizing".into();
+        progress.current_path = None;
+        callback(progress.clone())?;
+        check_cancelled(cancelled)?;
+        drop(connection);
         let mut connection = self.database.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute("DELETE FROM device_books WHERE device_id = ?1", [id])?;
         for book in &mut indexed {
+            check_cancelled(cancelled)?;
             if let Some(hash) = &book.sha256 {
                 book.book_id = transaction
                     .query_row(
@@ -346,17 +540,115 @@ impl DeviceService {
                     book.title,
                     serde_json::to_string(&book.authors)?,
                     book.format.as_str(),
-                    i64::try_from(book.size_bytes).map_err(|_| {
-                        AppError::InvalidInput("Device file size is outside SQLite range".into())
-                    })?,
+                    i64::try_from(book.size_bytes).map_err(|_| AppError::InvalidInput(
+                        "Device file size is outside SQLite range".into()
+                    ))?,
                     timestamp
                 ],
             )?;
         }
-        // Do not call scan while holding the transaction: that would need another writer.
-        self.revalidate_connection(&capability)?;
+        self.revalidate_connection(capability)?;
+        check_cancelled(cancelled)?;
         transaction.commit()?;
         Ok(indexed)
+    }
+
+    /// Updates presence using backend-owned local hashes after a successful import.
+    pub fn reconcile_import(&self, device_id: &str, book_id: &str) -> Result<()> {
+        let connection = self.database.connect()?;
+        connection.execute(
+            "UPDATE device_books SET book_id = ?2 WHERE device_id = ?1
+                AND sha256 IN (SELECT sha256 FROM book_files WHERE book_id = ?2)",
+            params![device_id, book_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn inventory_page(
+        &self,
+        id: &str,
+        offset: u64,
+        limit: u64,
+        unknown_only: bool,
+    ) -> Result<DeviceInventoryPage> {
+        let mut books = self.inventory(id)?;
+        if unknown_only {
+            books.retain(|book| book.book_id.is_none());
+        }
+        let total = books.len() as u64;
+        let offset_index = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(books.len());
+        let count = usize::try_from(limit.min(MAX_INDEX_BOOKS as u64)).unwrap_or(MAX_INDEX_BOOKS);
+        let items = books.into_iter().skip(offset_index).take(count).collect();
+        Ok(DeviceInventoryPage {
+            items,
+            total,
+            offset,
+            limit: limit.min(MAX_INDEX_BOOKS as u64),
+        })
+    }
+
+    /// Resolves only an inventoried, unchanged file on the same live connection.
+    pub fn resolve_import_path(&self, id: &str, relative_path: &str) -> Result<PathBuf> {
+        let relative = Path::new(relative_path);
+        if relative_path.is_empty()
+            || !relative
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return Err(AppError::InvalidInput("Unsafe device import path".into()));
+        }
+        let capability = self.connected_capability(id)?;
+        let path = capability.path.join(relative);
+        validate_contained_file(&path, &capability.path)?;
+        let current = fs::symlink_metadata(&path)?;
+        let remembered = {
+            let inventories = self.lock_inventories()?;
+            inventories
+                .get(id)
+                .map(|snapshot| {
+                    if !snapshot.capability.same_connection(&capability) {
+                        return Err(AppError::Conflict(
+                            "Device connection changed since inventory".into(),
+                        ));
+                    }
+                    let version = snapshot.versions.get(relative_path).ok_or_else(|| {
+                        AppError::NotFound("File is absent from the device inventory".into())
+                    })?;
+                    Ok(same_file_version(version, &current))
+                })
+                .transpose()?
+        };
+        if remembered == Some(false) {
+            return Err(AppError::Conflict(
+                "Device file changed since inventory".into(),
+            ));
+        }
+        // A restarted process has persisted hashes but no in-memory inode version.
+        if remembered.is_none() {
+            let connection = self.database.connect()?;
+            let record: Option<(Option<String>, i64)> = connection.query_row(
+                "SELECT sha256, size_bytes FROM device_books WHERE device_id = ?1 AND relative_path = ?2",
+                params![id, relative_path], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional()?;
+            let (hash, size) = record.ok_or_else(|| {
+                AppError::NotFound("File is absent from the device inventory".into())
+            })?;
+            let expected = hash.ok_or_else(|| {
+                AppError::Unsupported("This file cannot be verified for import".into())
+            })?;
+            if current.len() != positive_integer(size)?
+                || crate::storage::Storage::hash_file(&path)? != expected
+                || !same_file_version(&current, &fs::symlink_metadata(&path)?)
+            {
+                return Err(AppError::Conflict(
+                    "Device file changed since inventory".into(),
+                ));
+            }
+        }
+        self.revalidate_connection(&capability)?;
+        Ok(path)
     }
 
     /// Cached inventory remains available for an offline device; it is not presence.
@@ -370,10 +662,42 @@ impl DeviceService {
         if !exists {
             return Err(AppError::NotFound("Unknown device".into()));
         }
+        let staged = {
+            let inventories = self.lock_inventories()?;
+            inventories
+                .get(id)
+                .filter(|snapshot| snapshot.indexing)
+                .map(|snapshot| snapshot.books.clone())
+        };
+        if let Some(mut books) = staged {
+            for book in &mut books {
+                book.book_id = book
+                    .sha256
+                    .as_ref()
+                    .map(|hash| {
+                        connection
+                            .query_row(
+                                "SELECT book_id FROM book_files WHERE sha256 = ?1",
+                                [hash],
+                                |row| row.get(0),
+                            )
+                            .optional()
+                    })
+                    .transpose()?
+                    .flatten();
+            }
+            books.sort_by(|a, b| {
+                a.relative_path
+                    .to_lowercase()
+                    .cmp(&b.relative_path.to_lowercase())
+            });
+            return Ok(books);
+        }
         let mut statement = connection.prepare(
-            "SELECT relative_path, book_id, sha256, title, authors_json, format, size_bytes,
-                last_seen_at FROM device_books WHERE device_id = ?1
-             ORDER BY relative_path COLLATE NOCASE",
+            "SELECT d.relative_path, (SELECT book_id FROM book_files WHERE sha256 = d.sha256 LIMIT 1),
+                d.sha256, d.title, d.authors_json, d.format, d.size_bytes,
+                d.last_seen_at FROM device_books d WHERE d.device_id = ?1
+             ORDER BY d.relative_path COLLATE NOCASE",
         )?;
         let mut rows = statement.query([id])?;
         let mut result = Vec::new();
@@ -394,6 +718,12 @@ impl DeviceService {
             });
         }
         Ok(result)
+    }
+
+    fn lock_inventories(&self) -> Result<MutexGuard<'_, BTreeMap<String, InventorySnapshot>>> {
+        self.inventories
+            .lock()
+            .map_err(|_| AppError::Conflict("Device inventory state is unavailable".into()))
     }
 
     fn lock_active(&self) -> Result<MutexGuard<'_, BTreeMap<String, MountCapability>>> {
@@ -523,7 +853,7 @@ impl DeviceService {
     }
 
     #[cfg(test)]
-    fn scan_at(database: Database, mountinfo: &Path, media: &Path, gvfs: &Path) -> Self {
+    pub(crate) fn scan_at(database: Database, mountinfo: &Path, media: &Path, gvfs: &Path) -> Self {
         Self {
             database,
             source: Arc::new(MountSource {
@@ -532,6 +862,7 @@ impl DeviceService {
                 gvfs_roots: vec![gvfs.into()],
             }),
             active: Arc::new(Mutex::new(BTreeMap::new())),
+            inventories: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 }
@@ -806,6 +1137,14 @@ fn hex_digest(bytes: &[u8]) -> String {
         .collect()
 }
 
+fn check_cancelled(cancelled: &AtomicBool) -> Result<()> {
+    if cancelled.load(Ordering::Relaxed) {
+        Err(AppError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
 fn same_file_version(before: &fs::Metadata, after: &fs::Metadata) -> bool {
     after.is_file()
         && before.dev() == after.dev()
@@ -969,6 +1308,38 @@ mod tests {
             Some("book-device")
         );
         assert_eq!(fixture.service.scan().unwrap()[0].matched_book_count, 1);
+        fixture
+            .database
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE device_books SET book_id = NULL WHERE device_id = ?1",
+                [&id],
+            )
+            .unwrap();
+        assert_eq!(
+            fixture
+                .service
+                .inventory_page(&id, 0, 20_000, true)
+                .unwrap()
+                .total,
+            0
+        );
+        assert_eq!(
+            fixture.service.inventory(&id).unwrap()[0]
+                .book_id
+                .as_deref(),
+            Some("book-device")
+        );
+        fixture
+            .service
+            .reconcile_import(&id, "book-device")
+            .unwrap();
+        fixture
+            .service
+            .reconcile_import(&id, "book-device")
+            .unwrap();
+        assert_eq!(fixture.service.scan().unwrap()[0].matched_book_count, 1);
         assert_eq!(
             repository
                 .get("book-device", std::slice::from_ref(&id))
@@ -1107,6 +1478,149 @@ mod tests {
             fixture.service.inventory(&id).unwrap()[0].relative_path,
             "Known.txt"
         );
+    }
+
+    #[test]
+    fn progress_counts_actual_chunks_and_publishes_staging_before_commit() {
+        let fixture = Fixture::new();
+        let bytes = vec![b'x'; 3 * 256 * 1024 + 7];
+        fs::write(fixture.card.join("Large.txt"), &bytes).unwrap();
+        let id = fixture.id();
+        let mut samples = Vec::new();
+        fixture
+            .service
+            .index_with_progress(&id, Arc::new(AtomicBool::new(false)), |progress| {
+                if progress.processed_books == 1 && progress.phase == "reading" {
+                    let page = fixture.service.inventory_page(&id, 0, 100, true)?;
+                    assert_eq!(page.total, 1);
+                    assert!(page.items[0].sha256.is_some());
+                    let connection = fixture.database.connect()?;
+                    let count: i64 =
+                        connection
+                            .query_row("SELECT count(*) FROM device_books", [], |row| row.get(0))?;
+                    assert_eq!(count, 0, "staging is visible before atomic publication");
+                    assert_eq!(
+                        fixture.service.resolve_import_path(&id, "Large.txt")?,
+                        fixture.card.join("Large.txt")
+                    );
+                }
+                samples.push(progress);
+                Ok(())
+            })
+            .unwrap();
+        let reading: Vec<_> = samples
+            .iter()
+            .filter(|sample| sample.phase == "reading")
+            .collect();
+        assert!(
+            reading
+                .iter()
+                .all(|sample| sample.total_bytes == bytes.len() as u64)
+        );
+        let increments: Vec<_> = reading
+            .windows(2)
+            .filter(|pair| pair[1].bytes_read > pair[0].bytes_read)
+            .map(|pair| pair[1].bytes_read - pair[0].bytes_read)
+            .collect();
+        assert_eq!(increments, [256 * 1024, 256 * 1024, 256 * 1024, 7]);
+        assert_eq!(samples.last().unwrap().bytes_read, bytes.len() as u64);
+        assert_eq!(samples.last().unwrap().phase, "finalizing");
+    }
+
+    #[test]
+    fn cancellation_discards_staging_and_preserves_previous_complete_inventory() {
+        let fixture = Fixture::new();
+        fs::write(fixture.card.join("Known.txt"), b"known").unwrap();
+        let id = fixture.id();
+        fixture.service.index(&id).unwrap();
+        fs::write(fixture.card.join("Large.txt"), vec![b'x'; 1024 * 1024]).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = cancelled.clone();
+        let result = fixture
+            .service
+            .index_with_progress(&id, cancelled, |progress| {
+                if progress.phase == "reading" && progress.bytes_read > 256 * 1024 {
+                    signal.store(true, Ordering::Relaxed);
+                }
+                Ok(())
+            });
+        assert!(matches!(result, Err(AppError::Cancelled)));
+        assert!(
+            !fixture
+                .service
+                .lock_inventories()
+                .unwrap()
+                .contains_key(&id)
+        );
+        let inventory = fixture.service.inventory(&id).unwrap();
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0].relative_path, "Known.txt");
+    }
+
+    #[test]
+    fn import_resolution_refuses_unknown_traversal_symlinks_and_changed_versions() {
+        let fixture = Fixture::new();
+        let source = fixture.card.join("Known.txt");
+        fs::write(&source, b"known").unwrap();
+        let id = fixture.id();
+        fixture.service.index(&id).unwrap();
+        assert_eq!(
+            fixture
+                .service
+                .resolve_import_path(&id, "Known.txt")
+                .unwrap(),
+            source
+        );
+        for unsafe_path in [
+            "",
+            "../Known.txt",
+            "/Known.txt",
+            "nested/../Known.txt",
+            "Absent.txt",
+        ] {
+            assert!(
+                fixture
+                    .service
+                    .resolve_import_path(&id, unsafe_path)
+                    .is_err()
+            );
+        }
+        fs::write(&source, b"changed version").unwrap();
+        assert!(matches!(
+            fixture.service.resolve_import_path(&id, "Known.txt"),
+            Err(AppError::Conflict(_))
+        ));
+        fs::remove_file(&source).unwrap();
+        let outside = fixture.media.join("Outside.txt");
+        fs::write(&outside, b"known").unwrap();
+        symlink(&outside, &source).unwrap();
+        assert!(
+            fixture
+                .service
+                .resolve_import_path(&id, "Known.txt")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn failed_progress_callback_preserves_committed_inventory() {
+        let fixture = Fixture::new();
+        fs::write(fixture.card.join("Known.txt"), b"known").unwrap();
+        let id = fixture.id();
+        fixture.service.index(&id).unwrap();
+        fs::write(fixture.card.join("New.txt"), b"new book").unwrap();
+        let result = fixture.service.index_with_progress(
+            &id,
+            Arc::new(AtomicBool::new(false)),
+            |progress| {
+                if progress.phase == "finalizing" {
+                    return Err(AppError::Conflict("callback failed".into()));
+                }
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(fixture.service.inventory(&id).unwrap().len(), 1);
     }
 
     #[test]
