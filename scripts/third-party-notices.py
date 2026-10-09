@@ -13,11 +13,14 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from urllib.parse import urlsplit, urlunsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_LICENSE_BYTES = 1024 * 1024
+MAX_DEPENDENCY_METADATA_BYTES = 16 * 1024 * 1024
+MAX_DEPENDENCY_GRAPH_NODES = 10000
 REQUIRED_JS = {"svelte", "@lucide/svelte"}
 REQUIRED_CARGO_NOTICES = {"dlopen2", "alloc-stdlib"}
 LICENSE_NAME = re.compile(r"^(?:licen[cs]e|copying|notice|copyright)(?:[._-].*)?$", re.I)
@@ -176,29 +179,67 @@ def cargo_dependencies(root: Path) -> list[Dependency]:
     return dependencies
 
 
-def module_roots(directory: Path) -> list[Path]:
-    if not directory.is_dir():
-        return []
-    packages = []
-    for child in sorted(directory.iterdir()):
-        if child.name.startswith("."):
-            continue
-        if child.name.startswith("@") and child.is_dir():
-            packages.extend(nested for nested in sorted(child.iterdir()) if (nested / "package.json").is_file())
-        elif (child / "package.json").is_file():
-            packages.append(child)
-    return packages
+def installed_js_roots(root: Path) -> list[Path]:
+    """Read pnpm's active dependency graph; virtual-store leftovers are not dependencies."""
+    modules = (root / "node_modules").resolve()
+    if not modules.is_dir():
+        raise RuntimeError("Install the locked JS dependencies with pnpm before generating notices")
+    try:
+        process = subprocess.run(["pnpm", "list", "--depth", "Infinity", "--json"], cwd=root, capture_output=True, text=True, check=False, timeout=180)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError("pnpm dependency inventory is unavailable; install the pinned pnpm build tool") from error
+    if process.returncode or len(process.stdout) > MAX_DEPENDENCY_METADATA_BYTES:
+        raise RuntimeError("pnpm could not provide the installed dependency graph")
+    try:
+        projects = json.loads(process.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("pnpm returned malformed dependency inventory") from error
+    if not isinstance(projects, list) or len(projects) != 1 or not isinstance(projects[0], dict) or projects[0].get("path") != str(root.resolve()):
+        raise RuntimeError("pnpm dependency inventory does not describe this project")
+    pending: list[tuple[dict, bool]] = []
+
+    def enqueue_children(package: dict) -> None:
+        try:
+            manifest = json.loads((Path(package["path"]) / "package.json").read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise RuntimeError("An installed JS package has unreadable metadata") from error
+        if not isinstance(manifest, dict) or not isinstance(manifest.get("optionalDependencies", {}), dict):
+            raise RuntimeError("An installed JS package has invalid optional dependency metadata")
+        optional_names = set(manifest.get("optionalDependencies", {}))
+        for field_name in ("dependencies", "devDependencies", "optionalDependencies"):
+            children = package.get(field_name, {})
+            if not isinstance(children, dict) or any(not isinstance(child, dict) for child in children.values()):
+                raise RuntimeError("pnpm dependency inventory has invalid child metadata")
+            # pnpm reports transitive optional dependencies in its dependencies map.
+            pending.extend((child, field_name == "optionalDependencies" or name in optional_names) for name, child in children.items())
+
+    enqueue_children(projects[0])
+    paths: set[Path] = set()
+    visited = 0
+    while pending:
+        package, optional = pending.pop()
+        visited += 1
+        if visited > MAX_DEPENDENCY_GRAPH_NODES:
+            raise RuntimeError("pnpm dependency graph exceeds the inventory limit")
+        path_value = package.get("path")
+        if not isinstance(path_value, str) or not Path(path_value).is_absolute():
+            raise RuntimeError("pnpm dependency inventory has an invalid package path")
+        package_root = Path(path_value).resolve()
+        try:
+            package_root.relative_to(modules)
+        except ValueError as error:
+            raise RuntimeError("pnpm dependency package is outside node_modules") from error
+        if not (package_root / "package.json").is_file():
+            if optional:
+                continue
+            raise RuntimeError("A required pnpm dependency is missing; install the locked dependencies")
+        paths.add(package_root)
+        enqueue_children(package)
+    return sorted(paths)
 
 
 def js_dependencies(root: Path) -> list[Dependency]:
-    modules = root / "node_modules"
-    if not modules.is_dir():
-        raise RuntimeError("Install the locked JS dependencies with pnpm before generating notices")
-    pending = module_roots(modules)
-    store = modules / ".pnpm"
-    if store.is_dir():
-        for entry in sorted(store.iterdir()):
-            pending.extend(module_roots(entry / "node_modules"))
+    pending = installed_js_roots(root)
     seen: set[Path] = set()
     packages: dict[tuple[str, str], Dependency] = {}
     while pending:
@@ -229,7 +270,6 @@ def js_dependencies(root: Path) -> list[Dependency]:
                 packages[key].warnings = [warning for warning in packages[key].warnings if "readable license file" not in warning]
         else:
             packages[key] = dependency
-        pending.extend(module_roots(package_root / "node_modules"))
     for name in sorted(REQUIRED_JS):
         required = [package for package in packages.values() if package.name == name]
         if not required or any(not package.texts or package.license == "Not declared" for package in required):
@@ -273,7 +313,7 @@ def render(dependencies: list[Dependency]) -> str:
     texts = {hashlib.sha256(text.encode()).hexdigest(): text for dependency in dependencies for text in dependency.texts.values()}
     output = [
         "# Third-party notices", "",
-        "Generated by `python3 scripts/third-party-notices.py` from `cargo metadata --locked --offline`, installed npm/pnpm package sources, and the bundled libmobi source. Run after installing the locked dependencies; `--check` verifies that this document is current without downloading notices.", "",
+        "Generated by `python3 scripts/third-party-notices.py` from `cargo metadata --locked --offline`, the active installed pnpm dependency graph, and the bundled libmobi source. Unreachable virtual-store remnants are excluded. Run after installing the locked dependencies; `--check` verifies that this document is current without downloading notices.", "",
         "The inventory includes build tools and dependencies resolved for other platforms. Their presence in this list does not mean that every package is included in each Linux binary. License declarations come from package metadata; original supplied notices and copyright statements are preserved below. Identical texts are shared by hash without replacing package-specific attribution. No build directory, user profile path, secret, or generation timestamp is added.", "",
         "Library Manager itself is licensed under GPL-3.0-only; its complete application license is in `LICENSE`. Bundled libmobi is LGPL-3.0-or-later and its corresponding source remains in `vendor/`.", "",
         "## Dependency inventory", "",
@@ -393,10 +433,47 @@ class GeneratorTests(unittest.TestCase):
                 package.mkdir(parents=True)
                 (package / "package.json").write_text(json.dumps({"name": name, "version": "1.0", "license": "MIT"}), encoding="utf-8")
                 (package / "LICENSE").write_text("Copyright Holder\nMIT\n", encoding="utf-8")
-            self.assertEqual(len(js_dependencies(root)), 2)
-            (root / "node_modules" / "svelte" / "LICENSE").unlink()
-            with self.assertRaises(RuntimeError):
-                js_dependencies(root)
+            paths = [root / "node_modules" / name for name in REQUIRED_JS]
+            with patch.dict(js_dependencies.__globals__, {"installed_js_roots": lambda _: paths}):
+                self.assertEqual(len(js_dependencies(root)), 2)
+                (root / "node_modules" / "svelte" / "LICENSE").unlink()
+                with self.assertRaises(RuntimeError):
+                    js_dependencies(root)
+
+    def test_pnpm_graph_keeps_transitives_and_aliases_but_excludes_store_remnants(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "package.json").write_text("{}", encoding="utf-8")
+            paths = {}
+            for name, version in [("svelte", "5.0"), ("@lucide/svelte", "1.0"), ("typescript", "7.0"), ("transitive", "2.0"), ("orphan", "0.1")]:
+                package = root / "node_modules" / ".pnpm" / name.replace("/", "+") / "node_modules" / name
+                package.mkdir(parents=True)
+                metadata = {"name": name, "version": version, "license": "MIT"}
+                if name == "typescript":
+                    metadata["optionalDependencies"] = {"other-platform": "1.0"}
+                (package / "package.json").write_text(json.dumps(metadata), encoding="utf-8")
+                (package / "LICENSE").write_text(f"Copyright {name} original holder\nMIT\n", encoding="utf-8")
+                paths[name] = {"path": str(package), "version": version}
+            alias = {**paths["typescript"], "from": "typescript", "dependencies": {"transitive": paths["transitive"], "other-platform": {"path": str(root / "node_modules" / "not-installed")}}}
+            graph = [{"path": str(root), "dependencies": {"svelte": paths["svelte"], "@lucide/svelte": paths["@lucide/svelte"]}, "devDependencies": {"@typescript/native": alias, "shared-peer": paths["typescript"]}, "optionalDependencies": {"other-platform": {"path": str(root / "node_modules" / "not-installed")}}}]
+            result = subprocess.CompletedProcess([], 0, json.dumps(graph), "")
+            with patch("subprocess.run", return_value=result) as command:
+                packages = js_dependencies(root)
+            command.assert_called_once_with(["pnpm", "list", "--depth", "Infinity", "--json"], cwd=root, capture_output=True, text=True, check=False, timeout=180)
+            self.assertEqual({(package.name, package.version) for package in packages}, {("svelte", "5.0"), ("@lucide/svelte", "1.0"), ("typescript", "7.0"), ("transitive", "2.0")})
+            self.assertIn("Copyright transitive original holder", render(packages))
+            self.assertNotIn("Copyright orphan original holder", render(packages))
+
+    def test_pnpm_graph_refuses_missing_required_packages_and_paths_outside_modules(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "package.json").write_text("{}", encoding="utf-8")
+            (root / "node_modules").mkdir()
+            for path in (root / "node_modules" / "missing", root / "private"):
+                graph = [{"path": str(root), "dependencies": {"required": {"path": str(path)}}}]
+                result = subprocess.CompletedProcess([], 0, json.dumps(graph), "")
+                with patch("subprocess.run", return_value=result), self.assertRaises(RuntimeError):
+                    installed_js_roots(root)
 
 
 def main() -> int:

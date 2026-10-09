@@ -55,10 +55,12 @@
     "linux": {
       "deb": {
         "section": "education",
-        "priority": "optional"
+        "priority": "optional",
+        "depends": ["ca-certificates"]
       },
       "rpm": {
-        "release": "1"
+        "release": "1",
+        "depends": ["ca-certificates"]
       }
     }
   }
