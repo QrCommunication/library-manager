@@ -601,12 +601,15 @@ mod tests {
 
     #[test]
     fn profile_root_rejects_relative_parent_and_control_paths() {
-        assert_eq!(
-            application_root(Path::new("/tmp/library-manager-profile")).unwrap(),
-            PathBuf::from("/tmp/library-manager-profile")
-        );
-        for path in ["relative/profile", "/tmp/../other", "/tmp/profile\nprivate"] {
-            assert!(application_root(Path::new(path)).is_err());
+        let directory = TestDirectory::new();
+        let profile = directory.0.join("profile");
+        assert_eq!(application_root(&profile).unwrap(), profile);
+        for path in [
+            PathBuf::from("relative/profile"),
+            directory.0.join("..").join("other"),
+            directory.0.join("profile\nprivate"),
+        ] {
+            assert!(application_root(&path).is_err());
         }
     }
 

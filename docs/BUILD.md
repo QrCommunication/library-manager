@@ -53,6 +53,8 @@ Le verrou du profil est acquis et son identité recontrôlée avant d’applique
 
 La CI Windows exécute séparément quatre sondes natives avant la suite complète : inventaire réel, jointures avec snapshots synthétiques, sortie JSON constante et conversion JSON PowerShell. Chacune garde le délai de production de dix secondes. Une expiration relève séparément la terminaison du processus et la fin de stdout ; les étapes du script sont limitées à une liste fixe sans données privées. Tous les contrôles du workspace, de Clippy et des notices s'exécutent même après un échec de sonde, puis le statut cumulé bloque le packaging si nécessaire.
 
+Les règles [.gitattributes](../.gitattributes) imposent LF aux sources textuelles et documents des runners natifs. Les sources libmobi et les licences amont épinglées gardent leurs octets d'origine avec `-text` ; leur empreinte ne doit jamais être recalculée pour accepter une conversion automatique Windows. Les fixtures qui vérifient un CRLF précis écrivent des octets, et les tests de profil utilisent des chemins absolus propres au système.
+
 ### macOS
 
 Installer les outils de ligne de commande Xcode et construire séparément sur Intel et Apple Silicon. Le moteur MOBI utilise le compilateur C natif, `configure` et `make`, comme sous Linux. Définir `MACOSX_DEPLOYMENT_TARGET=13.0` avant compilation.

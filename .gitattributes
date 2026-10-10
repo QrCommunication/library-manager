@@ -1,2 +1,6 @@
-# Preserve the corresponding upstream source archive, including its formatting.
-vendor/libmobi-0.12/** -whitespace
+# Keep source and packaged documentation identical on every native runner.
+* text=auto eol=lf
+
+# Preserve exact upstream bytes, including licenses pinned by their SHA-256.
+vendor/libmobi-0.12/** -text -whitespace
+vendor/licenses/** -text

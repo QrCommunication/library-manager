@@ -453,7 +453,9 @@ class GeneratorTests(unittest.TestCase):
             package = directory / "package"
             package.mkdir()
             (directory / "private").write_text("Private user data", encoding="utf-8")
-            (package / "LICENSE").write_text("Copyright Holder\r\nPermission is granted.\r\n", encoding="utf-8")
+            license_bytes = b"Copyright Holder\r\nPermission is granted.\r\n"
+            (package / "LICENSE").write_bytes(license_bytes)
+            self.assertEqual((package / "LICENSE").read_bytes(), license_bytes)
             (package / "NOTICE").symlink_to(directory / "private")
             self.assertEqual(license_texts(package), {"LICENSE": "Copyright Holder\nPermission is granted.\n"})
             self.assertIsNone(read_license(directory / "private", package))

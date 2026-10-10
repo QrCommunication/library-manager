@@ -1752,7 +1752,9 @@ fn check_cancelled(cancelled: &AtomicBool) -> Result<()> {
 mod tests {
     use super::*;
     use crate::book_repository::{BookRepository, StoredFile};
-    use crate::models::{BookFile, BookMetadata, DeviceTransport, FileVariant};
+    #[cfg(unix)]
+    use crate::models::DeviceTransport;
+    use crate::models::{BookFile, BookMetadata, FileVariant};
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;

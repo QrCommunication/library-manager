@@ -2181,17 +2181,17 @@ mod tests {
         #[cfg(unix)]
         std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
         #[cfg(windows)]
+        let original_permissions = std::fs::metadata(&lock).unwrap().permissions();
+        #[cfg(windows)]
         {
-            let mut permissions = std::fs::metadata(&lock).unwrap().permissions();
+            let mut permissions = original_permissions.clone();
             permissions.set_readonly(true);
             std::fs::set_permissions(&lock, permissions).unwrap();
         }
         assert!(create(&root, events.clone()).is_err());
         #[cfg(windows)]
         {
-            let mut permissions = std::fs::metadata(&lock).unwrap().permissions();
-            permissions.set_readonly(false);
-            std::fs::set_permissions(&lock, permissions).unwrap();
+            std::fs::set_permissions(&lock, original_permissions).unwrap();
         }
         std::fs::remove_file(&lock).unwrap();
         let unrelated = directory.path().join("unrelated");
