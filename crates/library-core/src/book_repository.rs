@@ -6,6 +6,8 @@ use chrono::{SecondsFormat, Utc};
 use rusqlite::types::{Type, Value};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params, params_from_iter};
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 use uuid::Uuid;
 
@@ -13,12 +15,16 @@ use crate::database::Database;
 use crate::error::{AppError, Result};
 use crate::models::{
     Book, BookFile, BookMetadata, BookPage, BookQuery, BookSort, Facet, FileVariant, LibraryFacets,
-    MetadataStatus, Operation, OperationStatus, ReadStatus,
+    MetadataProposal, MetadataStatus, Operation, OperationStatus, ReadStatus,
 };
 
 const MAX_PAGE_SIZE: u64 = 200;
 const MAX_FILTER_VALUES: usize = 200;
 const MAX_CONNECTED_DEVICES: usize = 256;
+const MAX_REVIEW_RESULT_BYTES: usize = 1024 * 1024;
+const MAX_REMOVAL_BOOKS: usize = 200;
+const MAX_OPERATION_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_REMOVAL_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
 const BOOK_FROM: &str = "books b LEFT JOIN book_files selected_file ON selected_file.id = (
     SELECT preferred.id FROM book_files preferred WHERE preferred.book_id = b.id
     ORDER BY CASE WHEN preferred.variant = 'original' THEN 0 ELSE 1 END,
@@ -192,10 +198,44 @@ impl BookRepository {
         file: Option<StoredFile>,
         kind: &str,
     ) -> Result<Book> {
+        self.update_audited_with_review(book, expected_revision, file, kind, None)
+    }
+
+    /// Human review resolution, metadata, variants and history share the same CAS transaction.
+    pub fn update_audited_with_review(
+        &self,
+        book: &Book,
+        expected_revision: u64,
+        file: Option<StoredFile>,
+        kind: &str,
+        review_job_id: Option<&str>,
+    ) -> Result<Book> {
         validate_id(kind)?;
+        if let Some(id) = review_job_id {
+            validate_id(id)?;
+        }
         let mut connection = self.database.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let before = audit_snapshot(&transaction, &book.id)?;
+        let mut before = audit_snapshot(&transaction, &book.id)?;
+        if before.book.revision != expected_revision || book.revision != expected_revision {
+            return Err(AppError::RevisionConflict);
+        }
+        let reviews = proposal_records(&transaction, &book.id)?;
+        if let Some(id) = review_job_id {
+            let target = reviews
+                .iter()
+                .find(|record| record.id == id)
+                .ok_or_else(|| AppError::NotFound("Metadata proposal".into()))?;
+            if review_state(&target.result) == Some("applied")
+                && target.result["review"]["resolvedRevision"].as_u64()
+                    == Some(before.book.revision)
+                && book == &before.book
+                && file.is_none()
+            {
+                return Ok(before.book);
+            }
+            require_pending_review(&target.result, expected_revision)?;
+        }
         let updated = persist_book(&transaction, book, expected_revision)?;
         if let Some(file) = file {
             validate_file(&file)?;
@@ -206,7 +246,51 @@ impl BookRepository {
             }
             insert_file(&transaction, &file)?;
         }
-        let after = audit_snapshot(&transaction, &book.id)?;
+        let mut after = audit_snapshot(&transaction, &book.id)?;
+        let changed = !same_bibliographic_metadata(&before.book, &updated);
+        for record in reviews {
+            let explicit = review_job_id == Some(record.id.as_str());
+            let pending = review_state(&record.result).is_none()
+                || review_state(&record.result) == Some("pending");
+            if !pending {
+                continue;
+            }
+            let mut result = review_envelope(&record.result);
+            let mut review = result
+                .get("review")
+                .and_then(JsonValue::as_object)
+                .cloned()
+                .unwrap_or_default();
+            if explicit || changed {
+                let stale = review
+                    .get("reviewRevision")
+                    .and_then(JsonValue::as_u64)
+                    .is_some_and(|revision| revision != expected_revision);
+                review.insert(
+                    "state".into(),
+                    JsonValue::from(if explicit {
+                        "applied"
+                    } else if stale {
+                        "obsolete"
+                    } else {
+                        "dismissed"
+                    }),
+                );
+                review.insert("resolvedRevision".into(), JsonValue::from(updated.revision));
+            } else if review.get("reviewRevision").and_then(JsonValue::as_u64)
+                == Some(expected_revision)
+            {
+                review.insert("reviewRevision".into(), JsonValue::from(updated.revision));
+            } else {
+                continue;
+            }
+            result["review"] = JsonValue::Object(review);
+            before
+                .reviews
+                .push(review_snapshot(&record.id, &record.result)?);
+            after.reviews.push(review_snapshot(&record.id, &result)?);
+            write_review_result(&transaction, &record.id, &result)?;
+        }
         insert_operation(&transaction, kind, Some(&before), &after)?;
         transaction.commit()?;
         Ok(updated)
@@ -347,6 +431,107 @@ impl BookRepository {
         records.into_iter().map(public_operation).collect()
     }
 
+    /// Remove catalogue rows as one reversible, revision-bound request; never remove bytes.
+    pub fn remove_audited(
+        &self,
+        request_id: &str,
+        books: &[(String, u64)],
+    ) -> Result<Vec<Operation>> {
+        let request_books = validate_removal_request(request_id, books)?;
+        let mut connection = self.database.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous = removal_receipts(&transaction, request_id)?;
+        if !previous.is_empty() {
+            let mut operations = Vec::with_capacity(previous.len());
+            if previous.len() != request_books.len() {
+                return Err(AppError::Conflict(
+                    "Removal request receipt is incomplete".into(),
+                ));
+            }
+            for record in previous {
+                let receipt: RemovalReceipt = serde_json::from_str(
+                    record
+                        .after
+                        .as_deref()
+                        .ok_or_else(|| AppError::Conflict("Removal receipt is missing".into()))?,
+                )?;
+                if receipt.request_id != request_id
+                    || receipt.books != request_books
+                    || record.status != "applied"
+                {
+                    return Err(AppError::Conflict(
+                        "Removal request was changed or already undone".into(),
+                    ));
+                }
+                operations.push(public_operation(record)?);
+            }
+            transaction.commit()?;
+            return Ok(operations);
+        }
+        let mut snapshots = Vec::with_capacity(request_books.len());
+        let mut total_bytes = 0usize;
+        // Check the whole batch before deleting even the first book.
+        for (id, revision) in &request_books {
+            let snapshot = removal_snapshot(&transaction, id)?;
+            if snapshot.audit.book.revision != *revision {
+                return Err(AppError::RevisionConflict);
+            }
+            require_no_active_book_jobs(&transaction, id)?;
+            let receipt = RemovalReceipt {
+                book: snapshot.audit.book.clone(),
+                request_id: request_id.into(),
+                books: request_books.clone(),
+            };
+            let before = bounded_snapshot(&snapshot)?;
+            let after = bounded_snapshot(&receipt)?;
+            total_bytes = total_bytes
+                .saturating_add(before.len())
+                .saturating_add(after.len());
+            if total_bytes > MAX_REMOVAL_SNAPSHOT_BYTES {
+                return Err(AppError::InvalidInput(
+                    "Removal snapshots exceed the batch history limit".into(),
+                ));
+            }
+            snapshots.push((id.clone(), *revision, before, after));
+        }
+        let mut operations = Vec::with_capacity(snapshots.len());
+        for (book_id, revision, before, after) in snapshots {
+            let operation_id = removal_operation_id(request_id, &book_id)?;
+            let timestamp = now();
+            transaction.execute("INSERT INTO operations(id,kind,status,before_json,after_json,created_at) VALUES(?1,'catalogueRemove','applied',?2,?3,?4)", params![operation_id,before,after,timestamp])?;
+            transaction.execute("DELETE FROM books_search WHERE book_id=?", [&book_id])?;
+            let changed = transaction.execute(
+                "DELETE FROM books WHERE id=?1 AND revision=?2",
+                params![book_id, revision as i64],
+            )?;
+            require_changed(&transaction, &book_id, changed)?;
+            let receipt: RemovalReceipt = serde_json::from_str(&after)?;
+            operations.push(public_operation(OperationRecord {
+                id: operation_id,
+                kind: "catalogueRemove".into(),
+                status: "applied".into(),
+                before: Some(before),
+                after: Some(after),
+                title: receipt.book.title,
+                created_at: timestamp,
+            })?);
+        }
+        transaction.commit()?;
+        Ok(operations)
+    }
+
+    /// Paths stay private; LibraryService verifies each retained file before undoing a removal.
+    pub fn removal_files_for_undo(&self, operation_id: &str) -> Result<Option<Vec<StoredFile>>> {
+        validate_id(operation_id)?;
+        let connection = self.database.connect()?;
+        let record = load_operation(&connection, operation_id)?;
+        if record.kind != "catalogueRemove" || record.status == "reverted" {
+            return Ok(None);
+        }
+        let (snapshot, _) = decode_removal(&record)?;
+        Ok(Some(snapshot.audit.files))
+    }
+
     pub fn undo_audited(&self, operation_id: &str) -> Result<Operation> {
         validate_id(operation_id)?;
         let mut connection = self.database.connect()?;
@@ -358,6 +543,17 @@ impl BookRepository {
         }
         if record.status != "applied" {
             return Err(AppError::Conflict("Operation cannot be undone".into()));
+        }
+        if record.kind == "catalogueRemove" {
+            restore_catalogue_removal(&transaction, &record)?;
+            transaction.execute(
+                "UPDATE operations SET status='reverted' WHERE id=? AND status='applied'",
+                [operation_id],
+            )?;
+            let mut reverted = record;
+            reverted.status = "reverted".into();
+            transaction.commit()?;
+            return public_operation(reverted);
         }
         let before: AuditSnapshot =
             serde_json::from_str(record.before.as_deref().ok_or_else(|| {
@@ -394,7 +590,8 @@ impl BookRepository {
                 ));
             }
         }
-        persist_book(&transaction, &before.book, current.book.revision)?;
+        validate_review_undo(&transaction, &before, &after)?;
+        let restored = persist_book(&transaction, &before.book, current.book.revision)?;
         let before_ids: std::collections::HashSet<_> = before
             .files
             .iter()
@@ -434,6 +631,7 @@ impl BookRepository {
                 return Err(AppError::Conflict("The managed file changed during undo".into()));
             }
         }
+        restore_review_undo(&transaction, &before, restored.revision)?;
         let mut reverted = record;
         transaction.execute(
             "UPDATE operations SET status='reverted' WHERE id=? AND status='applied'",
@@ -591,12 +789,16 @@ impl BookRepository {
         };
         let mut connection = self.database.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous_revision = get_book(&transaction, id)?.revision;
         let changed = transaction.execute(
             "UPDATE books SET reader_location=?1, reading_progress=?2, read_status=?3, revision=revision+1, updated_at=?4
             WHERE id=?5 AND (reader_location IS NOT ?1 OR reading_progress<>?2 OR read_status<>?3)",
             params![location, progress, status.as_str(), now(), id],
         )?;
         require_existing(&transaction, id, changed)?;
+        if changed > 0 {
+            rebase_pending_reviews(&transaction, id, previous_revision, previous_revision + 1)?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -630,6 +832,22 @@ fn get_book(connection: &Connection, id: &str) -> Result<Book> {
 struct AuditSnapshot {
     book: Book,
     files: Vec<StoredFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    reviews: Vec<ReviewSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewSnapshot {
+    job_id: String,
+    review: Option<JsonValue>,
+    legacy: bool,
+    fingerprint: String,
+}
+
+struct ProposalRecord {
+    id: String,
+    result: JsonValue,
 }
 
 fn audit_snapshot(connection: &Connection, id: &str) -> Result<AuditSnapshot> {
@@ -639,7 +857,469 @@ fn audit_snapshot(connection: &Connection, id: &str) -> Result<AuditSnapshot> {
             .prepare("SELECT * FROM book_files WHERE book_id=? ORDER BY id")?
             .query_map([id], map_file)?
             .collect::<rusqlite::Result<Vec<_>>>()?,
+        reviews: Vec::new(),
     })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemovalSnapshot {
+    #[serde(flatten)]
+    audit: AuditSnapshot,
+    reader_location: Option<String>,
+    device_links: Vec<DeviceLinkSnapshot>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RemovalReceipt {
+    book: Book,
+    request_id: String,
+    books: Vec<(String, u64)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DeviceLinkSnapshot {
+    device_id: String,
+    relative_path: String,
+    book_id: Option<String>,
+    sha256: Option<String>,
+    title: String,
+    authors_json: String,
+    format: String,
+    size_bytes: u64,
+    last_seen_at: String,
+}
+
+fn validate_removal_request(
+    request_id: &str,
+    books: &[(String, u64)],
+) -> Result<Vec<(String, u64)>> {
+    let valid_request = Uuid::parse_str(request_id)
+        .ok()
+        .is_some_and(|id| id.to_string() == request_id);
+    if !valid_request || books.is_empty() || books.len() > MAX_REMOVAL_BOOKS {
+        return Err(AppError::InvalidInput(
+            "Removal needs a canonical request UUID and one to 200 books".into(),
+        ));
+    }
+    let mut unique = HashSet::new();
+    for (id, revision) in books {
+        validate_id(id)?;
+        if *revision == 0 || *revision >= i64::MAX as u64 || !unique.insert(id) {
+            return Err(AppError::InvalidInput(
+                "Removal needs distinct books and valid revisions".into(),
+            ));
+        }
+    }
+    let mut ordered = books.to_vec();
+    ordered.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(ordered)
+}
+
+fn bounded_snapshot(value: &impl Serialize) -> Result<String> {
+    let encoded = serde_json::to_string(value)?;
+    if encoded.len() > MAX_OPERATION_SNAPSHOT_BYTES {
+        return Err(AppError::InvalidInput(
+            "Operation snapshot exceeds the history limit".into(),
+        ));
+    }
+    Ok(encoded)
+}
+
+fn removal_operation_id(request_id: &str, book_id: &str) -> Result<String> {
+    let bytes = serde_json::to_vec(&(request_id, book_id))?;
+    let hash = Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!("catalogue-remove-{hash}"))
+}
+
+fn load_operation(connection: &Connection, id: &str) -> Result<OperationRecord> {
+    connection.query_row("SELECT id,kind,status,before_json,after_json,COALESCE(json_extract(after_json,'$.book.title'),'') AS book_title,created_at FROM operations WHERE id=?", [id], operation_record)
+        .optional()?.ok_or_else(|| AppError::NotFound("Operation".into()))
+}
+
+fn removal_receipts(connection: &Connection, request_id: &str) -> Result<Vec<OperationRecord>> {
+    Ok(connection.prepare("SELECT id,kind,status,before_json,after_json,COALESCE(json_extract(after_json,'$.book.title'),'') AS book_title,created_at FROM operations WHERE kind='catalogueRemove' AND json_extract(after_json,'$.requestId')=? ORDER BY json_extract(after_json,'$.book.id')")?
+        .query_map([request_id], operation_record)?.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn require_no_active_book_jobs(connection: &Connection, book_id: &str) -> Result<()> {
+    let active: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE status IN ('queued','running','waitingForConfiguration','waitingForNetwork') AND (json_extract(payload_json,'$.payload.id')=?1 OR json_extract(payload_json,'$.payload.bookId')=?1 OR EXISTS(SELECT 1 FROM json_each(payload_json,'$.bookIds') WHERE type='text' AND value=?1) OR EXISTS(SELECT 1 FROM json_each(payload_json,'$.payload.bookIds') WHERE type='text' AND value=?1) OR EXISTS(SELECT 1 FROM json_each(payload_json,'$.payload.selectedBookIds') WHERE type='text' AND value=?1)))", [book_id], |row| row.get(0))?;
+    if active {
+        return Err(AppError::Conflict(
+            "A selected book has active background work".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn map_device_link(row: &Row<'_>) -> rusqlite::Result<DeviceLinkSnapshot> {
+    Ok(DeviceLinkSnapshot {
+        device_id: row.get("device_id")?,
+        relative_path: row.get("relative_path")?,
+        book_id: row.get("book_id")?,
+        sha256: row.get("sha256")?,
+        title: row.get("title")?,
+        authors_json: row.get("authors_json")?,
+        format: row.get("format")?,
+        size_bytes: checked_unsigned(row.get("size_bytes")?, 0)?,
+        last_seen_at: row.get("last_seen_at")?,
+    })
+}
+
+fn removal_snapshot(connection: &Connection, id: &str) -> Result<RemovalSnapshot> {
+    Ok(RemovalSnapshot {
+        audit: audit_snapshot(connection, id)?,
+        reader_location: connection.query_row(
+            "SELECT reader_location FROM books WHERE id=?",
+            [id],
+            |row| row.get(0),
+        )?,
+        device_links: connection
+            .prepare("SELECT * FROM device_books WHERE book_id=? ORDER BY device_id,relative_path")?
+            .query_map([id], map_device_link)?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+    })
+}
+
+fn decode_removal(record: &OperationRecord) -> Result<(RemovalSnapshot, RemovalReceipt)> {
+    if record.status != "applied" {
+        return Err(AppError::Conflict("Removal cannot be undone".into()));
+    }
+    let snapshot: RemovalSnapshot = serde_json::from_str(
+        record
+            .before
+            .as_deref()
+            .ok_or_else(|| AppError::Conflict("Removal snapshot is missing".into()))?,
+    )?;
+    let receipt: RemovalReceipt = serde_json::from_str(
+        record
+            .after
+            .as_deref()
+            .ok_or_else(|| AppError::Conflict("Removal receipt is missing".into()))?,
+    )?;
+    let request = validate_removal_request(&receipt.request_id, &receipt.books)?;
+    if request != receipt.books
+        || snapshot.audit.book != receipt.book
+        || record.id != removal_operation_id(&receipt.request_id, &receipt.book.id)?
+        || !request.contains(&(receipt.book.id.clone(), receipt.book.revision))
+    {
+        return Err(AppError::Conflict(
+            "Removal snapshots are inconsistent".into(),
+        ));
+    }
+    validate_book(&snapshot.audit.book)?;
+    if snapshot
+        .reader_location
+        .as_ref()
+        .is_some_and(|value| value.len() > 8192 || value.contains('\0'))
+    {
+        return Err(AppError::Conflict("Reader snapshot is invalid".into()));
+    }
+    for file in &snapshot.audit.files {
+        validate_file(file)?;
+        if file.file.book_id != snapshot.audit.book.id {
+            return Err(AppError::Conflict(
+                "Removal file belongs to another book".into(),
+            ));
+        }
+    }
+    for link in &snapshot.device_links {
+        validate_id(&link.device_id)?;
+        validate_relative_path(&link.relative_path)?;
+        if link.book_id.as_deref() != Some(snapshot.audit.book.id.as_str()) {
+            return Err(AppError::Conflict(
+                "Removal device link belongs to another book".into(),
+            ));
+        }
+    }
+    Ok((snapshot, receipt))
+}
+
+fn restore_catalogue_removal(connection: &Connection, record: &OperationRecord) -> Result<()> {
+    let (snapshot, _) = decode_removal(record)?;
+    let book = &snapshot.audit.book;
+    if book_exists(connection, &book.id)? {
+        return Err(AppError::Conflict(
+            "The removed book identity has been reused".into(),
+        ));
+    }
+    require_no_active_book_jobs(connection, &book.id)?;
+    for file in &snapshot.audit.files {
+        let occupied: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM book_files WHERE id=?1 OR relative_path=?2 OR sha256=?3)",
+            params![
+                file.file.id,
+                file.relative_path,
+                file.file.sha256.to_ascii_lowercase()
+            ],
+            |row| row.get(0),
+        )?;
+        if occupied {
+            return Err(AppError::Conflict(
+                "A removed file identity belongs to another book".into(),
+            ));
+        }
+    }
+    for link in &snapshot.device_links {
+        let current = connection
+            .query_row(
+                "SELECT * FROM device_books WHERE device_id=?1 AND relative_path=?2",
+                params![link.device_id, link.relative_path],
+                map_device_link,
+            )
+            .optional()?;
+        let mut detached = link.clone();
+        detached.book_id = None;
+        if current.as_ref() != Some(&detached) {
+            return Err(AppError::Conflict(
+                "The device inventory changed since catalogue removal".into(),
+            ));
+        }
+    }
+    let metadata = BookMetadata {
+        title: book.title.clone(),
+        authors: book.authors.clone(),
+        author_sort: book.author_sort.clone(),
+        series: book.series.clone(),
+        series_index: book.series_index,
+        genres: book.genres.clone(),
+        tags: book.tags.clone(),
+        language: book.language.clone(),
+        description: book.description.clone(),
+        isbn: book.isbn.clone(),
+        publisher: book.publisher.clone(),
+        published: book.published.clone(),
+    };
+    insert_metadata(connection, &book.id, &metadata, book.cover_path.as_deref())?;
+    for file in &snapshot.audit.files {
+        insert_file(connection, file)?;
+    }
+    persist_book(connection, book, 1)?;
+    let revision = book.revision + 1;
+    connection.execute(
+        "UPDATE books SET revision=?1,added_at=?2,reader_location=?3 WHERE id=?4",
+        params![
+            revision as i64,
+            book.added_at,
+            snapshot.reader_location,
+            book.id
+        ],
+    )?;
+    for link in &snapshot.device_links {
+        let changed = connection.execute("UPDATE device_books SET book_id=?1 WHERE device_id=?2 AND relative_path=?3 AND book_id IS NULL",params![book.id,link.device_id,link.relative_path])?;
+        if changed != 1 {
+            return Err(AppError::Conflict(
+                "The device link changed during undo".into(),
+            ));
+        }
+    }
+    rebase_pending_reviews(connection, &book.id, book.revision, revision)?;
+    Ok(())
+}
+
+fn same_bibliographic_metadata(left: &Book, right: &Book) -> bool {
+    left.title == right.title
+        && left.authors == right.authors
+        && left.author_sort == right.author_sort
+        && left.series == right.series
+        && left.series_index == right.series_index
+        && left.genres == right.genres
+        && left.tags == right.tags
+        && left.language == right.language
+        && left.description == right.description
+        && left.isbn == right.isbn
+        && left.publisher == right.publisher
+        && left.published == right.published
+}
+
+fn proposal_records(connection: &Connection, book_id: &str) -> Result<Vec<ProposalRecord>> {
+    let mut statement = connection.prepare("SELECT id,result_json FROM jobs WHERE kind='enrich' AND status='completed' AND length(result_json)<=?2 AND CASE WHEN json_valid(result_json) THEN COALESCE(json_extract(result_json,'$.proposal.bookId'),json_extract(result_json,'$.bookId')) END=?1 ORDER BY created_at,id")?;
+    let rows = statement.query_map(params![book_id, MAX_REVIEW_RESULT_BYTES as i64], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut records = Vec::new();
+    for row in rows {
+        let (id, raw) = row?;
+        let Ok(result) = serde_json::from_str::<JsonValue>(&raw) else {
+            continue;
+        };
+        let proposal = result.get("proposal").unwrap_or(&result);
+        if serde_json::from_value::<MetadataProposal>(proposal.clone())
+            .is_ok_and(|proposal| proposal.book_id == book_id)
+        {
+            records.push(ProposalRecord { id, result });
+        }
+    }
+    Ok(records)
+}
+
+fn review_state(result: &JsonValue) -> Option<&str> {
+    result.get("review")?;
+    Some(result["review"]["state"].as_str().unwrap_or("invalid"))
+}
+
+fn require_pending_review(result: &JsonValue, revision: u64) -> Result<()> {
+    if !matches!(review_state(result), None | Some("pending")) {
+        return Err(AppError::Conflict(
+            "Metadata proposal is already resolved or invalid".into(),
+        ));
+    }
+    if let Some(review) = result.get("review") {
+        let pending_revision = review
+            .get("reviewRevision")
+            .and_then(JsonValue::as_u64)
+            .filter(|value| *value > 0)
+            .ok_or_else(|| AppError::Conflict("Metadata proposal revision is invalid".into()))?;
+        if pending_revision != revision {
+            return Err(AppError::RevisionConflict);
+        }
+        if review.get("sourceRevision").is_some_and(|value| {
+            value
+                .as_u64()
+                .is_none_or(|source| source == 0 || source > pending_revision)
+        }) {
+            return Err(AppError::Conflict(
+                "Metadata proposal source revision is invalid".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn review_envelope(result: &JsonValue) -> JsonValue {
+    if result.get("proposal").is_some() {
+        result.clone()
+    } else {
+        serde_json::json!({"proposal":result})
+    }
+}
+
+fn review_snapshot(id: &str, result: &JsonValue) -> Result<ReviewSnapshot> {
+    let mut body = review_envelope(result);
+    body.as_object_mut()
+        .ok_or_else(|| AppError::Conflict("Metadata proposal is invalid".into()))?
+        .remove("review");
+    let fingerprint = Sha256::digest(serde_json::to_vec(&body)?)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok(ReviewSnapshot {
+        job_id: id.into(),
+        review: result.get("review").cloned(),
+        legacy: result.get("proposal").is_none(),
+        fingerprint,
+    })
+}
+
+fn write_review_result(connection: &Connection, id: &str, result: &JsonValue) -> Result<()> {
+    let raw = serde_json::to_string(result)?;
+    if raw.len() > MAX_REVIEW_RESULT_BYTES {
+        return Err(AppError::InvalidInput(
+            "Metadata review result exceeds its storage limit".into(),
+        ));
+    }
+    if connection.execute(
+        "UPDATE jobs SET result_json=?2 WHERE id=?1 AND kind='enrich' AND status='completed'",
+        params![id, raw],
+    )? != 1
+    {
+        return Err(AppError::Conflict("Metadata proposal changed".into()));
+    }
+    Ok(())
+}
+
+fn rebase_pending_reviews(
+    connection: &Connection,
+    id: &str,
+    previous: u64,
+    updated: u64,
+) -> Result<()> {
+    for record in proposal_records(connection, id)? {
+        if review_state(&record.result) != Some("pending")
+            || record.result["review"]["reviewRevision"].as_u64() != Some(previous)
+        {
+            continue;
+        }
+        let mut result = record.result;
+        result["review"]["reviewRevision"] = JsonValue::from(updated);
+        write_review_result(connection, &record.id, &result)?;
+    }
+    Ok(())
+}
+
+fn validate_review_undo(
+    connection: &Connection,
+    before: &AuditSnapshot,
+    after: &AuditSnapshot,
+) -> Result<()> {
+    if before.reviews.len() != after.reviews.len() {
+        return Err(AppError::Conflict(
+            "Metadata review history is inconsistent".into(),
+        ));
+    }
+    if before.reviews.is_empty() {
+        return Ok(());
+    }
+    let records = proposal_records(connection, &after.book.id)?;
+    for (previous, expected) in before.reviews.iter().zip(&after.reviews) {
+        if previous.job_id != expected.job_id || previous.fingerprint != expected.fingerprint {
+            return Err(AppError::Conflict(
+                "Metadata review history is inconsistent".into(),
+            ));
+        }
+        let record = records
+            .iter()
+            .find(|record| record.id == expected.job_id)
+            .ok_or_else(|| AppError::Conflict("Metadata proposal history is missing".into()))?;
+        let current = review_snapshot(&record.id, &record.result)?;
+        if current.fingerprint != expected.fingerprint
+            || current.review != expected.review
+            || current.legacy != expected.legacy
+        {
+            return Err(AppError::Conflict(
+                "Metadata proposal changed after this operation".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn restore_review_undo(
+    connection: &Connection,
+    before: &AuditSnapshot,
+    revision: u64,
+) -> Result<()> {
+    if before.reviews.is_empty() {
+        return Ok(());
+    }
+    let records = proposal_records(connection, &before.book.id)?;
+    for snapshot in &before.reviews {
+        let record = records
+            .iter()
+            .find(|record| record.id == snapshot.job_id)
+            .ok_or_else(|| AppError::Conflict("Metadata proposal history is missing".into()))?;
+        let mut result = review_envelope(&record.result);
+        if let Some(mut review) = snapshot.review.clone() {
+            if review["state"] == "pending"
+                && review["reviewRevision"].as_u64() == Some(before.book.revision)
+            {
+                review["reviewRevision"] = JsonValue::from(revision);
+            }
+            result["review"] = review;
+        } else {
+            result.as_object_mut().unwrap().remove("review");
+        }
+        if snapshot.legacy {
+            result = result["proposal"].clone();
+        }
+        write_review_result(connection, &snapshot.job_id, &result)?;
+    }
+    Ok(())
 }
 
 fn persist_book(connection: &Connection, book: &Book, expected_revision: u64) -> Result<Book> {
@@ -1448,6 +2128,658 @@ mod tests {
             },
             relative_path: format!("books/{id}.{}", format.as_str()),
         }
+    }
+
+    const REMOVAL_REQUEST: &str = "2e03a3c2-6a88-4dfe-9b0d-a4bab3a4e105";
+
+    fn seed_device_link(database: &Database, book_id: &str) -> Result<()> {
+        database.connect()?.execute(
+            "INSERT INTO devices(id,label,transport) VALUES('reader','Reader','usb')",
+            [],
+        )?;
+        database.connect()?.execute("INSERT INTO device_books(device_id,relative_path,book_id,sha256,title,format,size_bytes) VALUES('reader','Books/story.epub',?1,?2,'Device edition','epub',120)", params![book_id, "a".repeat(64)])?;
+        Ok(())
+    }
+
+    #[test]
+    fn catalogue_removal_and_undo_preserve_files_reading_preferences_links_and_proofs() -> Result<()>
+    {
+        let (temporary, database, repository) = fixture()?;
+        let book = repository.insert(
+            "book",
+            metadata("Read story", &["Writer"], None, &[], "fr"),
+            &[file(
+                "original",
+                "book",
+                'a',
+                BookFormat::Epub,
+                FileVariant::Original,
+                120,
+            )],
+            None,
+        )?;
+        repository.save_progress(&book.id, "chapter:7:position:19", 0.4)?;
+        let mut personal = repository.get("book", &[])?;
+        personal.favorite = true;
+        personal.rating = Some(4.5);
+        personal.notes = "Private notes".into();
+        personal.metadata_status = MetadataStatus::NeedsReview;
+        let before =
+            repository.update_audited(&personal, personal.revision, None, "personalUpdate")?;
+        seed_device_link(&database, &book.id)?;
+        let proof = seed_review_job(&database, "review", &before, false)?;
+        let stored = repository.files(&book.id)?;
+        let physical = temporary.path().join(&stored[0].relative_path);
+        std::fs::create_dir_all(physical.parent().unwrap())?;
+        std::fs::write(&physical, b"Unchanged bytes outside SQL")?;
+        let operations =
+            repository.remove_audited(REMOVAL_REQUEST, &[(book.id.clone(), before.revision)])?;
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].kind, "catalogueRemove");
+        assert!(operations[0].reversible);
+        assert_eq!(
+            repository
+                .list(&BookQuery::default(), &["reader".into()])?
+                .total,
+            0
+        );
+        assert!(matches!(
+            repository.get(&book.id, &[]),
+            Err(AppError::NotFound(_))
+        ));
+        assert_eq!(
+            repository.removal_files_for_undo(&operations[0].id)?,
+            Some(stored.clone())
+        );
+        assert_eq!(std::fs::read(&physical)?, b"Unchanged bytes outside SQL");
+        assert_eq!(review_job_result(&database, "review")?, proof);
+        let detached: Option<String> = database.connect()?.query_row(
+            "SELECT book_id FROM device_books WHERE device_id='reader'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(detached.is_none());
+        drop(repository);
+        let reopened = BookRepository::new(Database::new(temporary.path())?);
+        reopened.undo_audited(&operations[0].id)?;
+        let restored = reopened.get(&book.id, &["reader".into()])?;
+        assert!(restored.revision > before.revision);
+        assert_eq!(restored.added_at, before.added_at);
+        assert_eq!(restored.title, before.title);
+        assert_eq!(restored.favorite, before.favorite);
+        assert_eq!(restored.rating, before.rating);
+        assert_eq!(restored.notes, before.notes);
+        assert_eq!(restored.reading_progress, before.reading_progress);
+        assert_eq!(restored.read_status, before.read_status);
+        assert_eq!(restored.on_device_ids, ["reader"]);
+        assert_eq!(
+            reopened.reader_location(&book.id)?,
+            Some("chapter:7:position:19".into())
+        );
+        assert_eq!(reopened.files(&book.id)?, stored);
+        let rebased = review_job_result(&database, "review")?;
+        assert_eq!(rebased["proposal"], proof["proposal"]);
+        assert_eq!(rebased["review"]["state"], "pending");
+        assert_eq!(rebased["review"]["sourceRevision"], before.revision);
+        assert_eq!(rebased["review"]["reviewRevision"], restored.revision);
+        assert_eq!(
+            reopened
+                .list(
+                    &BookQuery {
+                        search: "Read story".into(),
+                        ..Default::default()
+                    },
+                    &[]
+                )?
+                .total,
+            1
+        );
+        let twice = reopened.undo_audited(&operations[0].id)?;
+        assert_eq!(twice.status, OperationStatus::Reverted);
+        assert_eq!(reopened.get(&book.id, &[])?.revision, restored.revision);
+        assert!(matches!(
+            reopened.remove_audited(REMOVAL_REQUEST, &[(book.id, before.revision)]),
+            Err(AppError::Conflict(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn catalogue_removal_batch_is_atomic_and_request_receipt_is_idempotent() -> Result<()> {
+        let (_temporary, database, repository) = fixture()?;
+        let first =
+            repository.insert("first", metadata("First", &[], None, &[], "en"), &[], None)?;
+        let second = repository.insert(
+            "second",
+            metadata("Second", &[], None, &[], "en"),
+            &[],
+            None,
+        )?;
+        assert!(matches!(
+            repository.remove_audited(
+                REMOVAL_REQUEST,
+                &[
+                    (first.id.clone(), first.revision),
+                    (second.id.clone(), second.revision + 1)
+                ]
+            ),
+            Err(AppError::RevisionConflict)
+        ));
+        assert_eq!(repository.list(&BookQuery::default(), &[])?.total, 2);
+        assert!(repository.operations()?.is_empty());
+        let batch = vec![
+            (first.id.clone(), first.revision),
+            (second.id.clone(), second.revision),
+        ];
+        let operations = repository.remove_audited(REMOVAL_REQUEST, &batch)?;
+        let replay = BookRepository::new(database).remove_audited(
+            REMOVAL_REQUEST,
+            &batch.into_iter().rev().collect::<Vec<_>>(),
+        )?;
+        assert_eq!(replay, operations);
+        assert_eq!(repository.operations()?.len(), 2);
+        assert!(matches!(
+            repository.remove_audited(REMOVAL_REQUEST, &[(first.id.clone(), first.revision)]),
+            Err(AppError::Conflict(_))
+        ));
+        assert!(matches!(
+            repository.remove_audited(
+                REMOVAL_REQUEST,
+                &[
+                    (first.id.clone(), first.revision + 1),
+                    (second.id, second.revision)
+                ]
+            ),
+            Err(AppError::Conflict(_))
+        ));
+        assert_eq!(repository.list(&BookQuery::default(), &[])?.total, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn catalogue_removal_refuses_active_jobs_and_invalid_batches() -> Result<()> {
+        let (_temporary, database, repository) = fixture()?;
+        let book = repository.insert(
+            "book",
+            metadata("Busy book", &[], None, &[], "en"),
+            &[],
+            None,
+        )?;
+        for status in [
+            "queued",
+            "running",
+            "waitingForNetwork",
+            "waitingForConfiguration",
+        ] {
+            database.connect()?.execute(
+                "INSERT INTO jobs(id,kind,status,payload_json) VALUES(?1,'chat',?2,?3)",
+                params![
+                    status,
+                    status,
+                    serde_json::json!({"version":1,"payload":{"id":"book"},"bookIds":["book"]})
+                        .to_string()
+                ],
+            )?;
+            assert!(matches!(
+                repository.remove_audited(REMOVAL_REQUEST, &[(book.id.clone(), book.revision)]),
+                Err(AppError::Conflict(_))
+            ));
+            database
+                .connect()?
+                .execute("DELETE FROM jobs WHERE id=?", [status])?;
+        }
+        for invalid in [
+            vec![],
+            vec![("book".into(), 0)],
+            vec![("book".into(), 1), ("book".into(), 1)],
+            (0..201).map(|index| (format!("book-{index}"), 1)).collect(),
+        ] {
+            assert!(matches!(
+                repository.remove_audited(REMOVAL_REQUEST, &invalid),
+                Err(AppError::InvalidInput(_))
+            ));
+        }
+        assert!(matches!(
+            repository.remove_audited("not-a-uuid", &[(book.id.clone(), book.revision)]),
+            Err(AppError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            repository.remove_audited(REMOVAL_REQUEST, &[("missing".into(), 1)]),
+            Err(AppError::NotFound(_))
+        ));
+        assert_eq!(repository.get(&book.id, &[])?, book);
+        assert!(repository.operations()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn catalogue_removal_undo_refuses_reused_identity_files_and_changed_device_inventory()
+    -> Result<()> {
+        for collision in ["book", "hash", "path", "fileId", "device"] {
+            let (_temporary, database, repository) = fixture()?;
+            let stored = file(
+                "original",
+                "book",
+                'a',
+                BookFormat::Epub,
+                FileVariant::Original,
+                120,
+            );
+            let book = repository.insert(
+                "book",
+                metadata("Removed book", &[], None, &[], "en"),
+                std::slice::from_ref(&stored),
+                None,
+            )?;
+            seed_device_link(&database, &book.id)?;
+            let operation = repository
+                .remove_audited(REMOVAL_REQUEST, &[(book.id.clone(), book.revision)])?
+                .remove(0);
+            if collision == "device" {
+                database.connect()?.execute(
+                    "UPDATE device_books SET sha256=? WHERE device_id='reader'",
+                    ["b".repeat(64)],
+                )?;
+            } else {
+                let mut other = file(
+                    "other-file",
+                    "other",
+                    'b',
+                    BookFormat::Epub,
+                    FileVariant::Original,
+                    100,
+                );
+                match collision {
+                    "hash" => other.file.sha256 = stored.file.sha256.clone(),
+                    "path" => other.relative_path = stored.relative_path.clone(),
+                    "fileId" => other.file.id = stored.file.id.clone(),
+                    _ => {}
+                }
+                repository.insert(
+                    if collision == "book" { "book" } else { "other" },
+                    metadata("New owner", &[], None, &[], "en"),
+                    if collision == "book" {
+                        &[]
+                    } else {
+                        std::slice::from_ref(&other)
+                    },
+                    None,
+                )?;
+            }
+            assert!(
+                matches!(
+                    repository.undo_audited(&operation.id),
+                    Err(AppError::Conflict(_))
+                ),
+                "{collision}"
+            );
+            assert_eq!(
+                repository
+                    .operations()?
+                    .iter()
+                    .find(|candidate| candidate.id == operation.id)
+                    .unwrap()
+                    .status,
+                OperationStatus::Applied
+            );
+        }
+        Ok(())
+    }
+
+    fn seed_review_job(
+        database: &Database,
+        id: &str,
+        book: &Book,
+        legacy: bool,
+    ) -> Result<serde_json::Value> {
+        let proposal = serde_json::json!({"bookId":book.id,"patch":{"title":"Proposed title"},"confidence":0.8,"evidence":[{"field":"title","value":"Proposed title","confidence":0.8,"sourceUrls":[]}],"warnings":["Preserved warning"],"providerId":"minimax","modelId":"fixture"});
+        let result = if legacy {
+            proposal
+        } else {
+            serde_json::json!({"proposal":proposal,"review":{"state":"pending","sourceRevision":book.revision,"reviewRevision":book.revision}})
+        };
+        database.connect()?.execute("INSERT INTO jobs(id,kind,status,progress,payload_json,result_json,created_at,updated_at) VALUES(?1,'enrich','completed',1,?2,?3,?4,?4)",params![id,serde_json::json!({"version":1,"payload":{"id":book.id,"bookIds":[book.id]}}).to_string(),result.to_string(),now()])?;
+        Ok(result)
+    }
+
+    fn review_job_result(database: &Database, id: &str) -> Result<serde_json::Value> {
+        let raw: String = database.connect()?.query_row(
+            "SELECT result_json FROM jobs WHERE id=?",
+            [id],
+            |row| row.get(0),
+        )?;
+        Ok(serde_json::from_str(&raw)?)
+    }
+
+    #[test]
+    fn bibliographic_save_resolves_historical_reviews_and_survives_reopen() -> Result<()> {
+        let (temporary, database, repository) = fixture()?;
+        let book = repository.insert(
+            "book",
+            metadata("Original", &["Author"], None, &[], "fr"),
+            &[],
+            None,
+        )?;
+        let legacy = seed_review_job(&database, "legacy-job", &book, true)?;
+        seed_review_job(&database, "pending-job", &book, false)?;
+        let other =
+            repository.insert("other", metadata("Other", &[], None, &[], "fr"), &[], None)?;
+        let other_result = seed_review_job(&database, "other-job", &other, false)?;
+        let mut edited = book.clone();
+        edited.title = "Human title".into();
+        edited.metadata_status = MetadataStatus::Verified;
+        let updated = repository.update_audited(&edited, book.revision, None, "metadataUpdate")?;
+        assert_eq!(
+            review_job_result(&database, "legacy-job")?["proposal"],
+            legacy
+        );
+        for id in ["legacy-job", "pending-job"] {
+            let result = review_job_result(&database, id)?;
+            assert_eq!(result["review"]["state"], "dismissed");
+            assert_eq!(result["review"]["resolvedRevision"], updated.revision);
+        }
+        assert!(
+            review_job_result(&database, "legacy-job")?["review"]
+                .get("sourceRevision")
+                .is_none()
+        );
+        assert_eq!(review_job_result(&database, "other-job")?, other_result);
+        drop(repository);
+        drop(database);
+        let reopened = Database::new(temporary.path())?;
+        assert_eq!(
+            review_job_result(&reopened, "legacy-job")?["review"]["state"],
+            "dismissed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_review_validation_can_resolve_without_metadata_changes_and_is_idempotent()
+    -> Result<()> {
+        let (_temporary, database, repository) = fixture()?;
+        let book = repository.insert(
+            "book",
+            metadata("Original", &[], None, &[], "fr"),
+            &[],
+            None,
+        )?;
+        seed_review_job(&database, "review-job", &book, true)?;
+        let mut validated = book.clone();
+        validated.metadata_status = MetadataStatus::Verified;
+        let updated = repository.update_audited_with_review(
+            &validated,
+            book.revision,
+            None,
+            "metadataUpdate",
+            Some("review-job"),
+        )?;
+        assert_eq!(updated.title, book.title);
+        assert_eq!(
+            review_job_result(&database, "review-job")?["review"]["state"],
+            "applied"
+        );
+        let duplicate = repository.update_audited_with_review(
+            &updated,
+            updated.revision,
+            None,
+            "metadataUpdate",
+            Some("review-job"),
+        )?;
+        assert_eq!(duplicate.revision, updated.revision);
+        assert_eq!(repository.operations()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn personal_preferences_do_not_consume_bibliographic_reviews() -> Result<()> {
+        let (_temporary, database, repository) = fixture()?;
+        let book = repository.insert(
+            "book",
+            metadata("Original", &[], None, &[], "fr"),
+            &[],
+            None,
+        )?;
+        seed_review_job(&database, "review-job", &book, false)?;
+        let mut edited = book.clone();
+        edited.notes = "Personal notes".into();
+        edited.favorite = true;
+        let updated = repository.update_audited(&edited, book.revision, None, "personalUpdate")?;
+        assert_eq!(
+            review_job_result(&database, "review-job")?["review"]["state"],
+            "pending"
+        );
+        let result = review_job_result(&database, "review-job")?;
+        assert_eq!(result["review"]["sourceRevision"], book.revision);
+        assert_eq!(result["review"]["reviewRevision"], updated.revision);
+        Ok(())
+    }
+
+    #[test]
+    fn reading_progress_rebases_pending_review_without_consuming_or_fabricating_provenance()
+    -> Result<()> {
+        let (_temporary, database, repository) = fixture()?;
+        let book = repository.insert(
+            "book",
+            metadata("Original", &[], None, &[], "fr"),
+            &[],
+            None,
+        )?;
+        seed_review_job(&database, "pending-job", &book, false)?;
+        let legacy = seed_review_job(&database, "legacy-job", &book, true)?;
+        repository.save_progress("book", "chapter:2", 0.5)?;
+        let current = repository.get("book", &[])?;
+        let result = review_job_result(&database, "pending-job")?;
+        assert_eq!(result["review"]["state"], "pending");
+        assert_eq!(result["review"]["sourceRevision"], book.revision);
+        assert_eq!(result["review"]["reviewRevision"], current.revision);
+        assert_eq!(review_job_result(&database, "legacy-job")?, legacy);
+        repository.save_progress("book", "chapter:2", 0.5)?;
+        assert_eq!(repository.get("book", &[])?.revision, current.revision);
+        let mut validated = current.clone();
+        validated.metadata_status = MetadataStatus::Verified;
+        repository.update_audited_with_review(
+            &validated,
+            current.revision,
+            None,
+            "metadataUpdate",
+            Some("pending-job"),
+        )?;
+        assert_eq!(
+            review_job_result(&database, "pending-job")?["review"]["state"],
+            "applied"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_review_undo_restores_pending_with_fresh_cas_and_preserves_sources() -> Result<()> {
+        let (_temporary, database, repository) = fixture()?;
+        let mut book = repository.insert(
+            "book",
+            metadata("Original", &[], None, &[], "fr"),
+            &[],
+            None,
+        )?;
+        book.metadata_status = MetadataStatus::NeedsReview;
+        book = repository.update_book(&book, book.revision)?;
+        let original = seed_review_job(&database, "review-job", &book, false)?;
+        let mut edited = book.clone();
+        edited.title = "Proposed title".into();
+        edited.metadata_status = MetadataStatus::Verified;
+        repository.update_audited_with_review(
+            &edited,
+            book.revision,
+            None,
+            "metadataUpdate",
+            Some("review-job"),
+        )?;
+        let operation = repository.operations()?.remove(0);
+        repository.undo_audited(&operation.id)?;
+        let restored = repository.get("book", &[])?;
+        assert_eq!(restored.title, book.title);
+        assert_eq!(restored.metadata_status, MetadataStatus::NeedsReview);
+        let result = review_job_result(&database, "review-job")?;
+        assert_eq!(result["proposal"], original["proposal"]);
+        assert_eq!(result["review"]["state"], "pending");
+        assert_eq!(result["review"]["sourceRevision"], book.revision);
+        assert_eq!(result["review"]["reviewRevision"], restored.revision);
+        assert!(result["review"].get("resolvedRevision").is_none());
+        repository.undo_audited(&operation.id)?;
+        assert_eq!(repository.get("book", &[])?.revision, restored.revision);
+        edited = restored.clone();
+        edited.title = "Proposed title".into();
+        edited.metadata_status = MetadataStatus::Verified;
+        repository.update_audited_with_review(
+            &edited,
+            restored.revision,
+            None,
+            "metadataUpdate",
+            Some("review-job"),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn review_undo_rejects_changed_evidence_before_restoring_book() -> Result<()> {
+        let (_temporary, database, repository) = fixture()?;
+        let book = repository.insert(
+            "book",
+            metadata("Original", &[], None, &[], "fr"),
+            &[],
+            None,
+        )?;
+        seed_review_job(&database, "review-job", &book, true)?;
+        let mut edited = book.clone();
+        edited.title = "Proposed title".into();
+        edited.metadata_status = MetadataStatus::Verified;
+        let updated = repository.update_audited_with_review(
+            &edited,
+            book.revision,
+            None,
+            "metadataUpdate",
+            Some("review-job"),
+        )?;
+        let operation = repository.operations()?.remove(0);
+        let mut result = review_job_result(&database, "review-job")?;
+        result["proposal"]["evidence"][0]["value"] = JsonValue::from("Changed evidence");
+        database.connect()?.execute(
+            "UPDATE jobs SET result_json=? WHERE id='review-job'",
+            [result.to_string()],
+        )?;
+        assert!(matches!(
+            repository.undo_audited(&operation.id),
+            Err(AppError::Conflict(_))
+        ));
+        assert_eq!(repository.get("book", &[])?, updated);
+        assert_eq!(repository.operations()?[0].status, OperationStatus::Applied);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_review_rejects_another_book_or_stale_source_and_keeps_old_choices_closed()
+    -> Result<()> {
+        let (_temporary, database, repository) = fixture()?;
+        let book = repository.insert(
+            "book",
+            metadata("Original", &[], None, &[], "fr"),
+            &[],
+            None,
+        )?;
+        let other =
+            repository.insert("other", metadata("Other", &[], None, &[], "fr"), &[], None)?;
+        seed_review_job(&database, "other-job", &other, false)?;
+        seed_review_job(&database, "review-job", &book, false)?;
+        assert!(matches!(
+            repository.update_audited_with_review(
+                &book,
+                book.revision,
+                None,
+                "metadataUpdate",
+                Some("other-job")
+            ),
+            Err(AppError::NotFound(_))
+        ));
+        let mut changed = book.clone();
+        changed.title = "Human title".into();
+        let current = repository.update_book(&changed, book.revision)?;
+        assert!(matches!(
+            repository.update_audited_with_review(
+                &current,
+                current.revision,
+                None,
+                "metadataUpdate",
+                Some("review-job")
+            ),
+            Err(AppError::RevisionConflict)
+        ));
+        changed = current.clone();
+        changed.title = "Another human title".into();
+        let current =
+            repository.update_audited(&changed, current.revision, None, "metadataUpdate")?;
+        assert_eq!(
+            review_job_result(&database, "review-job")?["review"]["state"],
+            "obsolete"
+        );
+        assert!(matches!(
+            repository.update_audited_with_review(
+                &current,
+                current.revision,
+                None,
+                "metadataUpdate",
+                Some("review-job")
+            ),
+            Err(AppError::Conflict(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn review_resolution_rolls_back_with_stale_revision_or_invalid_variant() -> Result<()> {
+        let (_temporary, database, repository) = fixture()?;
+        let book = repository.insert(
+            "book",
+            metadata("Original", &[], None, &[], "fr"),
+            &[],
+            None,
+        )?;
+        let original = seed_review_job(&database, "review-job", &book, false)?;
+        let mut edited = book.clone();
+        edited.title = "Changed".into();
+        edited.metadata_status = MetadataStatus::Verified;
+        assert!(matches!(
+            repository.update_audited_with_review(
+                &edited,
+                book.revision + 1,
+                None,
+                "metadataUpdate",
+                Some("review-job")
+            ),
+            Err(AppError::RevisionConflict)
+        ));
+        let invalid = file(
+            "wrong-variant",
+            "other",
+            'a',
+            BookFormat::Epub,
+            FileVariant::Normalized,
+            100,
+        );
+        assert!(
+            repository
+                .update_audited_with_review(
+                    &edited,
+                    book.revision,
+                    Some(invalid),
+                    "metadataUpdate",
+                    Some("review-job")
+                )
+                .is_err()
+        );
+        assert_eq!(repository.get("book", &[])?, book);
+        assert_eq!(review_job_result(&database, "review-job")?, original);
+        assert!(repository.operations()?.is_empty());
+        Ok(())
     }
 
     #[test]

@@ -330,6 +330,8 @@ const handlers: PreviewHandlers = {
   },
   import_books: () => unavailable('import_books'),
   book_update: () => unavailable('book_update'),
+  book_review: () => unavailable('book_review'),
+  books_remove: () => unavailable('books_remove'),
   book_enrich: () => unavailable('book_enrich'),
   book_optimize: () => unavailable('book_optimize'),
   book_convert: () => unavailable('book_convert'),

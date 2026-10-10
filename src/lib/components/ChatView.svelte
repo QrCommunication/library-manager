@@ -5,6 +5,8 @@
   import type { AppError, Book, ChatDeltaEvent, ChatMessage, Conversation, Job, Provider, Settings, WebSource } from '../contracts';
   import { formatDate, formatProviderDiagnostic, locale, t } from '../i18n';
   import { createRequestScheduler } from '../request-scheduler';
+  import SelectionActions from './SelectionActions.svelte';
+  import { isMetadataReady, MAX_SELECTED_BOOKS, type MetadataDisabledReason } from '../selection-capabilities';
 
   interface Props {
     selectedBookIds: string[];
@@ -15,11 +17,19 @@
     onVerifyStarted?(): void;
     onNotify(message: string): void;
     onError(error: unknown): void;
+    metadataReady?: boolean;
+    metadataDisabledReason?: MetadataDisabledReason | null;
+    transferReady?: boolean;
+    onTransferSelected?(initialDeviceId?: string): void;
+    onRemoveSelected?(): void;
+    onClearSelection?(): void;
+    onOpenSettings?(): void;
   }
-  let { selectedBookIds, refreshVersion, onOpenBook, onChooseBooks, verifyRequested = false, onVerifyStarted, onNotify, onError }: Props = $props();
+  let { selectedBookIds, refreshVersion, onOpenBook, onChooseBooks, verifyRequested = false, onVerifyStarted,
+    onNotify, onError, metadataReady = false, metadataDisabledReason = null, transferReady = false,
+    onTransferSelected, onRemoveSelected, onClearSelection, onOpenSettings }: Props = $props();
   const MAX_TEXT_LENGTH = 8000;
   const MAX_CONTEXT_BOOKS = 32;
-  const MAX_SELECTED_BOOKS = 200;
   const BOOK_LOAD_CONCURRENCY = 4;
   const demo = isPreview();
   let disposed = false;
@@ -54,14 +64,13 @@
   let failure = $state<AppError | null>(null);
   let chatScroll = $state<HTMLDivElement>();
   const currentProvider = $derived(providers.find((provider) => provider.id === settings?.providerId));
-  const configured = $derived(Boolean(settings?.modelId && currentProvider?.configured && currentProvider.status === 'ready'));
+  const configured = $derived(metadataReady && isMetadataReady(settings, providers));
   const jobPending = $derived(activeJob !== null && !['completed', 'failed', 'cancelled'].includes(activeJob.status));
   const contextBookIds = $derived([...new Set(selectedBookIds)]);
   const contextKey = $derived(contextBookIds.join('\u0000'));
   const contextTooLarge = $derived(contextBookIds.length > MAX_SELECTED_BOOKS);
   const reviewBooks = $derived(selectedBooks.filter((book) => contextBookIds.includes(book.id)
-    && book.metadataStatus === 'needsReview'
-    && enrichmentJobs.some((job) => completedProposalForBook(job, book.id))));
+    && enrichmentJobs.some((job) => completedProposalForBook(job, book))));
   const canSend = $derived(!demo && configured && !sending && !jobPending && !contextTooLarge && draft.trim().length > 0 && draft.length <= MAX_TEXT_LENGTH);
   const number = $derived(new Intl.NumberFormat($locale));
   const failureDetail = $derived(failure?.code === 'providerError'
@@ -111,7 +120,7 @@
   });
 
   async function verifySelected(): Promise<void> {
-    if (disposed || demo || enriching || !contextBookIds.length || contextTooLarge) return;
+    if (disposed || demo || !metadataReady || enriching || !contextBookIds.length || contextTooLarge) return;
     const ids = [...contextBookIds];
     enriching = true;
     enrichmentSummary = { queued: 0, skipped: 0, failed: 0 };
@@ -120,7 +129,7 @@
       // Refresh eligibility before enqueueing; live job events keep it current during the batch.
       mergeEnrichmentJobs(await request('jobs_list', undefined));
       for (const id of ids) {
-        if (disposed) break;
+        if (disposed || !metadataReady) break;
         if (enrichmentPending(id)) {
           enrichmentSummary.skipped += 1;
           continue;
@@ -145,12 +154,18 @@
     } finally { if (!disposed) enriching = false; }
   }
 
-  async function openSelected(id: string): Promise<void> {
+  async function openSelected(id: string, reviewOnly = false): Promise<void> {
     if (!onOpenBook || openingBookId !== null) return;
     openingBookId = id;
     try {
       const current = await request('book_get', { id });
-      if (!disposed) onOpenBook(current);
+      if (!disposed) {
+        if (reviewOnly && !enrichmentJobs.some((job) => completedProposalForBook(job, current))) {
+          onNotify($t('library.noReviewProposals'));
+          return;
+        }
+        onOpenBook(current);
+      }
     } catch (error) { if (!disposed) report(error); }
     finally { if (!disposed) openingBookId = null; }
   }
@@ -162,11 +177,19 @@
   function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
   }
-  function completedProposalForBook(job: Job, bookId: string): boolean {
+  function completedProposalForBook(job: Job, book: Book): boolean {
+    const bookId = book.id;
     if (job.kind !== 'enrich' || job.status !== 'completed' || !job.bookIds.includes(bookId) || !isRecord(job.result)) return false;
     const proposal = 'proposal' in job.result ? job.result.proposal : job.result;
-    return isRecord(proposal) && proposal.bookId === bookId
-      && isRecord(proposal.patch) && Object.keys(proposal.patch).length > 0;
+    if (!isRecord(proposal) || proposal.bookId !== bookId
+      || !isRecord(proposal.patch) || !Object.keys(proposal.patch).length) return false;
+    if ('review' in job.result) {
+      const review = job.result.review;
+      return isRecord(review) && review.state === 'pending' && typeof review.reviewRevision === 'number'
+        && Number.isSafeInteger(review.reviewRevision) && review.reviewRevision >= 0
+        && review.reviewRevision === book.revision;
+    }
+    return book.metadataStatus === 'needsReview';
   }
   function isWebSource(value: unknown): value is WebSource {
     return isRecord(value) && typeof value.url === 'string' && typeof value.title === 'string'
@@ -430,11 +453,15 @@
       {#if !configured}<p class="configuration-hint">{$t('chat.noModel')}</p>{/if}
       {#if demo}<p class="configuration-hint">{$t('app.previewDescription')}</p>{/if}
         <section class="selected-books stack" aria-label={$t('chat.selectedBooks', { count: contextBookIds.length })}>
-          <div class="spread"><p class="small">{$t('chat.selectedBooks', { count: contextBookIds.length })}</p><div class="row wrap"><button class="button ghost" type="button" disabled={!onChooseBooks} onclick={() => onChooseBooks?.()}>{$t('chat.chooseBooks')}</button><button class="button secondary" type="button" disabled={demo || enriching || !contextBookIds.length || contextTooLarge} onclick={() => void verifySelected()}><Sparkles size={16} />{$t(enriching ? 'chat.verifyingSelected' : 'chat.verifySelected')}</button></div></div>
+          <div class="spread"><p class="small">{$t('chat.selectedBooks', { count: contextBookIds.length })}</p><button class="button ghost" type="button" disabled={!onChooseBooks} onclick={() => onChooseBooks?.()}>{$t('chat.chooseBooks')}</button></div>
+          <SelectionActions selectedCount={contextBookIds.length} {metadataReady} {metadataDisabledReason} {transferReady}
+            {demo} busy={enriching || sending || jobPending} onVerifySelected={() => { void verifySelected(); }}
+            {onTransferSelected} {onRemoveSelected} {onClearSelection} {onOpenSettings} />
+          {#if enriching}<p class="field-hint" role="status">{$t('chat.verifyingSelected')}</p>{/if}
           {#if !contextBookIds.length}<p class="field-hint">{$t('chat.noSelectedBooks')}</p>{/if}
           {#if contextTooLarge}<p class="field-hint context-overflow" role="status">{$t('chat.selectionTooLarge', { count: MAX_SELECTED_BOOKS })}</p>{/if}
           <div class="selected-book-list row wrap">{#each contextBookIds as id (id)}{@const selected = selectedBooks.find((item) => item.id === id)}<button class="source-chip" type="button" disabled={!onOpenBook || openingBookId !== null} onclick={() => void openSelected(id)} title={$t('chat.openSelected')}>{selected?.title ?? $t(loadingSelectedBooks ? 'common.loading' : 'common.unknown')}{#if selected?.metadataStatus === 'needsReview'}<span class="badge warning">{$t('book.needsReview')}</span>{/if}</button>{/each}</div>
-          {#if reviewBooks.length}<div class="stack" aria-label={$t('editor.reviewTitle')}>{#each reviewBooks as book (book.id)}<div class="spread"><span class="small">{book.title}</span><button class="button secondary" type="button" disabled={!onOpenBook || openingBookId !== null} onclick={() => void openSelected(book.id)}>{$t('chat.reviewProposal')}</button></div>{/each}</div>{/if}
+          {#if reviewBooks.length}<div class="stack" aria-label={$t('editor.reviewTitle')}>{#each reviewBooks as book (book.id)}<div class="spread"><span class="small">{book.title}</span><button class="button secondary" type="button" disabled={!onOpenBook || openingBookId !== null} onclick={() => void openSelected(book.id, true)}>{$t('chat.reviewProposal')}</button></div>{/each}</div>{/if}
           {#if enrichmentSummary}<div class="row wrap small" role="status"><span>{$t('chat.enrichmentQueued', { count: enrichmentSummary.queued })}</span><span>{$t('chat.enrichmentSkipped', { count: enrichmentSummary.skipped })}</span><span>{$t('chat.enrichmentFailed', { count: enrichmentSummary.failed })}</span></div>{/if}
         </section>
       <div class="chat-scroll" bind:this={chatScroll} aria-label={$t('chat.title')} aria-busy={loadingMessages}>

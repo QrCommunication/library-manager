@@ -83,6 +83,7 @@ jobs:
         with:
           workspaces: '. -> target'
           key: ${{ matrix.target }}
+          cache-on-failure: true
 
       - name: Install the isolated Windows sidecar toolchain
         if: runner.os == 'Windows'
@@ -145,6 +146,23 @@ jobs:
               stream.write(f'PACKAGE_VERSION={version}\nSOURCE_DATE_EPOCH={epoch}\n')
               if os.environ['PACKAGE_PLATFORM'] == 'macos':
                   stream.write('MACOSX_DEPLOYMENT_TARGET=13.0\n')
+          PY
+
+      - name: Select a private canonical macOS temporary directory
+        if: runner.os == 'macOS'
+        run: |
+          python - <<'PY'
+          import os, tempfile
+          from pathlib import Path
+          # Resolve the OS-provided symlink once; filesystem adapters still
+          # refuse links in all subsequent caller-supplied paths.
+          root = Path(tempfile.gettempdir()).resolve(strict=True)
+          if not root.is_dir():
+              raise SystemExit('The system temporary root is not a directory')
+          directory = Path(tempfile.mkdtemp(prefix='library-manager-native-', dir=root))
+          os.chmod(directory, 0o700)
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as stream:
+              stream.write(f'TMPDIR={directory}\n')
           PY
 
       - name: Install locked dependencies

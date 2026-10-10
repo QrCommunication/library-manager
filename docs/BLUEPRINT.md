@@ -1,27 +1,28 @@
 # Architecture réalisée de Library Manager
 
-État du 9 octobre 2026. [IPC.md](IPC.md) décrit les 33 commandes et les cinq événements. [MASTER_PLAN.md](MASTER_PLAN.md) conserve les preuves de validation et l’état des paquets ; ce document décrit les composants présents.
+État du 10 octobre 2026 : **0.2.1 en préparation**, non encore attestée comme livraison native sur toutes les plateformes. [IPC.md](IPC.md) décrit les **37 commandes effectivement enregistrées** dans `src-tauri/src/lib.rs` et les cinq événements. [RELEASE_0.2.1_PLAN.md](RELEASE_0.2.1_PLAN.md) suit cette livraison ; [QUALITY.md](QUALITY.md) et [MASTER_PLAN.md](MASTER_PLAN.md) conservent les preuves et leur historique. Ce document décrit l’architecture source, sans transformer un build ou une fixture en preuve de fonctionnement sur une liseuse.
 
 ## Application et frontières
 
-Library Manager est une application Linux autonome sous GPL-3.0-only : Tauri 2, Svelte 5, TypeScript stricte et SQLite embarqué. Le moteur Rust `library-core` ne dépend pas de Tauri ou d’une WebView. Calibre n’est ni installé ni exécuté ; le moteur MOBI est distribué avec l’application.
+Library Manager est une application desktop autonome sous GPL-3.0-only : Tauri 2, Svelte 5, TypeScript stricte et SQLite embarqué. Les cibles de 0.2.1 sont Linux, Windows x64 et macOS Intel/ARM. Le moteur Rust `library-core` ne dépend pas de Tauri ou d’une WebView. Calibre n’est ni installé ni exécuté ; le moteur MOBI est distribué avec l’application. La disponibilité et la validation de chaque paquet restent des résultats à établir séparément.
 
 `src-tauri/src/main.rs` appelle `library_manager_lib::run()`. La bibliothèque desktop est produite uniquement en `rlib`, puis liée au binaire `library-manager`. La distribution Linux n’expose aucune bibliothèque native mobile et ne produit plus les sorties ABI staticlib/cdylib. Les configurations DEB/RPM/AppImage conservent ce binaire et le sidecar. Voir la [structure Tauri](https://v2.tauri.app/start/project-structure/) et les [types de liaison Rust](https://doc.rust-lang.org/reference/linkage.html).
 
 Les commandes IPC font l’entrée/sortie et délèguent aux services. `LibraryManager` compose les services et exécute les jobs ; `BookRepository` possède les transactions métier. Les contrôleurs n’exécutent pas de SQL. Fichiers/ZIP/images utilisent `spawn_blocking`, le réseau reste async ; concurrence réglable de 1 à 4.
 
-Le Manager détient un verrou privé `runtime.lock` sans suivi de symlink, conservé par tous ses clones. La reprise des jobs intervient après acquisition. Une deuxième ouverture produit `profileInUse`. Le plugin d’instance unique ramène la fenêtre quand le bus de session est disponible ; les erreurs d’initialisation restent affichables. La cartographie autorisée se trouve dans `~/.Codex/projects/library-manager/memory/`.
+Le Manager détient un verrou privé `runtime.lock`, ouvert par la façade de fichiers sûre et conservé par tous ses clones. L’identité, les droits privés et le verrou natif sont contrôlés avant reprise des jobs ; une deuxième ouverture produit `profileInUse`. Le plugin d’instance unique ramène la fenêtre quand le mécanisme de session est disponible ; les erreurs d’initialisation restent affichables. La cartographie autorisée se trouve dans `~/.Codex/projects/library-manager/memory/`.
 
 ## Carte des fichiers présents
 
 | Fichier | Responsabilité |
 | --- | --- |
 | `Cargo.toml`, `rust-toolchain.toml` | Workspace core/desktop, versions partagées, Rust 1.99 et profil de livraison. |
-| `crates/library-core/src/lib.rs` | Façade publique du moteur et interdiction unsafe. |
+| `crates/library-core/src/lib.rs` | Façade publique du moteur et `deny(unsafe_code)` global. |
 | `crates/library-core/src/models.rs`, `error.rs` | Contrats Serde, filtres, patches nullable et erreurs publiques sans secrets. |
 | `crates/library-core/migrations/001_initial.sql`, `database.rs` | Schéma versionné, connexions privées et migrations SQLite. |
 | `crates/library-core/src/book_repository.rs` | Livres, variantes, recherche, facettes, présence, révisions, progression et journal transactionnel. |
 | `crates/library-core/src/storage.rs` | Originaux immuables, SHA-256, capacités de chemin et publication atomique sans écrasement. |
+| `crates/library-core/src/secure_fs.rs`, `secure_fs/unix.rs`, `secure_fs/windows.rs` | Capacités de répertoire, ouvertures relatives sans liens, identités/snapshots, publication exclusive, permissions et barrières de durabilité natives. |
 | `crates/library-core/src/library.rs` | Import, normalisation, couverture, corrections, conversion, optimisation et undo. |
 | `crates/library-core/src/settings.rs` | Préférences validées ; racine de bibliothèque fixée à la construction. |
 | `crates/library-core/src/manager.rs` | Cycle de vie, dispatch, annulation, attente configuration, scans et événements. |
@@ -32,14 +33,14 @@ Le Manager détient un verrou privé `runtime.lock` sans suivi de symlink, conse
 | `crates/library-core/src/devices.rs` | Montages USB/SD/MTP accessibles, identité, inventaire et rapprochement par contenu. |
 | `crates/library-core/src/transfer.rs` | Copies USB et client HTTP CrossPoint, staging, vérification et annulation. |
 | `crates/library-core/src/calibre_wireless.rs` | Serveur TCP smart-device autonome compatible Calibre/KOReader. |
-| `crates/library-core/src/providers.rs` | Six API, catalogues dynamiques et secrets session/coffre Linux. |
+| `crates/library-core/src/providers.rs` | Six API, catalogues dynamiques, secrets privés et diagnostics fournisseur filtrés. |
 | `crates/library-core/src/web.rs` | Recherche et pages publiques, protection SSRF et budgets. |
 | `crates/library-core/src/enrichment.rs` | Propositions bibliographiques avec preuves ; aucune mutation directe. |
-| `crates/library-core/src/chat.rs` | Conversations, plans de recherche validés, contexte et citations obtenues. |
+| `crates/library-core/src/chat.rs`, `chat_tools.rs` | Conversations, plans de recherche, boucle de sept outils typés, périmètre autorisé et reçus de reprise. |
 | `crates/library-core/src/jobs.rs` | File durable, tentatives, reprise, attente, résultats et tokens d’annulation. |
 | `src-tauri/src/lib.rs`, `main.rs`, `commands.rs` | Shell, état d’initialisation, plugins et pont IPC/événements. |
 | `src-tauri/build.rs`, `vendor/libmobi-0.12/` | Construction native du sidecar depuis les sources versionnées. |
-| `src-tauri/tauri.conf.json`, `capabilities/default.json` | Fenêtre, CSP, dialogue natif et bundles Linux ; aucune permission shell arbitraire. |
+| `src-tauri/tauri.conf.json`, `capabilities/default.json` | Fenêtre, CSP, dialogue natif, bundles et ressources ; aucune permission shell arbitraire. |
 | `src/lib/contracts.ts`, `api.ts`, `preview.ts` | IPC typée et aperçu navigateur explicitement identifié avec fixtures synthétiques. |
 | `src/lib/i18n.ts`, `locales/fr.json`, `locales/en.json` | Langue système, sélection, fallback et découverte des dictionnaires. |
 | `src/lib/components/LibraryView.svelte` | Grille/table, recherche, tris, facettes, pagination, sélection et présence. |
@@ -48,11 +49,15 @@ Le Manager détient un verrou privé `runtime.lock` sans suivi de symlink, conse
 | `src/lib/components/DevicesView.svelte` | Appareils, connexion manuelle, inventaire et transferts. |
 | `src/lib/components/ChatView.svelte`, `SettingsView.svelte` | Chat, fournisseurs/modèles, sources, langue, thème et préférences. |
 | `src/lib/components/ActivityView.svelte` | Jobs, résultats, attentes/erreurs, annulation et opérations réversibles. |
+| `src/lib/request-scheduler.ts` | Requêtes sérialisées, recherche différée et rafraîchissements regroupés sans invalider une réponse courante valide. |
+| `src/lib/selection-capabilities.ts`, `components/SelectionActions.svelte` | Limite commune de 200 livres, disponibilité réelle des métadonnées et barre d’actions partagée. |
+| `src/lib/components/DeviceTransferDialog.svelte`, `RemoveBooksDialog.svelte` | Sélection de destination et confirmation explicite ; retrait du catalogue avec révisions et reçu idempotent. |
 | `src/App.svelte`, `src/app.css` | Navigation, session de recherche conservée au retour du lecteur, identité et thèmes. |
 | `src/lib/api.test.ts`, `i18n.test.ts`, `preview.test.ts` | Tests frontend des contrats, traductions et aperçu. |
-| `scripts/native-smoke.py` | Parcours du vrai binaire avec tauri-driver, profil isolé et rapport/capture optionnels. |
+| `scripts/native-smoke.py`, `native-assistant-smoke.py` | Parcours du vrai binaire avec tauri-driver, profils isolés, droits/outils et actions du catalogue. |
 | `scripts/third-party-notices.py`, `vendor/licenses/` | Inventaire verrouillé et notices originales vérifiables. |
 | `.github/workflows/ci.yml` | Contrôles, paquets, contenu distribué, source correspondante, SHA-256 et artefacts CI. |
+| `.github/workflows/desktop.yml` | Tests et builds natifs Windows/macOS, sidecar, provenance, statut de signature et vérifications Apple conditionnelles. |
 
 ## Persistance et intégrité
 
@@ -64,6 +69,10 @@ La recherche combine FTS5 sur titre/auteurs/série/genres/description et recherc
 
 Les originaux sont conservés dans `books/originals/<sha256>.<format>`. Les variantes ont des chemins auteur → série avec indices zéro/fractionnaires et identifiant évitant les collisions. Undo restaure les variantes actives du snapshot précédent, garde les artefacts historiques et refuse une révision récente. Les preuves/propositions IA restent dans les résultats de jobs ; le journal conserve les snapshots, pas un registre supplémentaire de preuve par champ.
 
+`secure_fs` représente l’autorité par un handle de répertoire, plutôt que par un chemin déjà vérifié puis rouvert librement. Les enfants sont ouverts relativement à ce handle ; les symlinks et les reparse points/junctions Windows sont refusés. Les snapshots enregistrent identité, taille, modification et changement réel. La publication ne remplace jamais une cible existante ; le nettoyage vérifie l’identité avant de retirer un fichier. L’adaptateur Unix utilise les primitives du système via `rustix`. Windows ajoute des handles natifs, ACL owner-only et appels FFI documentés : l’exemption `allow(unsafe_code)` est limitée à cet adaptateur, avec justifications de sûreté, et ne s’étend pas aux services. Une garantie de durabilité ou d’identité indisponible produit une erreur explicite. Les tests compilés ou exécutés sous Linux ne prouvent pas ces garanties sur un système de fichiers Windows.
+
+`books_remove` retire jusqu’à 200 livres dans une transaction contrôlée par leurs révisions. L’opération `catalogueRemove` conserve un reçu lié au `requestId` : répéter les mêmes arguments retourne le résultat enregistré ; changer les arguments sous cet identifiant est refusé. Originaux, variantes et copies sur les appareils sont conservés. Undo restaure le catalogue après contrôle des fichiers et collisions ; ce parcours ne supprime pas physiquement les fichiers d’une liseuse.
+
 ## Import et enrichissement
 
 Le dialogue natif sélectionne les fichiers. Le service valide un fichier régulier et ses bornes, identifie le format par extension contrôlée, calcule le hash, déduplique, copie l’original puis catalogue le livre. Un EPUB compatible reçoit une couverture privée si disponible et une variante normalisée avec métadonnées et nom auteur → série. Certains EPUB imparfaits restent catalogués avec avertissements ; une transformation peut être refusée sans bloquer le reste du lot.
@@ -74,7 +83,13 @@ Avec enrichissement automatique activé, chaque nouvel import planifie un job du
 
 L’enrichissement récupère des sources publiques puis demande une proposition JSON. ISBN, dates, langues, listes, champs nullable, indices et confiance sont validés. L’application automatique exige des preuves réellement récupérées et le seuil réglé ; les changements identitaires nécessitent des domaines indépendants. Sinon, la proposition reste disponible pour revue.
 
+L’inspection lit le fichier réel après contrôle de taille et de SHA-256. Elle distingue l’original de l’EPUB inspecté, qui peut être un dérivé, et transmet des extraits bornés de titre/copyright/édition et de chapitre, au plus 12 000 caractères. Elle ne prétend pas lire intégralement chaque livre. Patch et preuves suivent la même normalisation de champs ; un encodage JSON supplémentaire unique peut être décodé strictement, sans supprimer librement des guillemets ni accepter un ISBN au checksum incorrect. Voir [ENRICHMENT.md](ENRICHMENT.md).
+
 Un job d’import conserve sa révision de départ. Une correction humaine durant une attente de clé ou une requête empêche l’application automatique ; une fiche vérifiée manuellement n’est pas rétrogradée. Seul `LibraryService` applique un patch, avec contrôle de révision du repository. Notes, favoris, évaluations et progression ne sont pas modifiables par le LLM.
+
+Les analyses `assistantReview` restent toujours manuelles. Les analyses manuelles et celles issues d’import suivent leurs politiques de preuve, de confiance et de révision décrites dans [METADATA_POLICY.md](METADATA_POLICY.md). Le résultat d’analyse peut porter `{ proposal, review }` ; la revue passe durablement de `pending` à `applied`, `dismissed` ou `obsolete`. `book_review` vérifie le livre, le job et la révision ; un patch vide valide aussi une proposition déjà identique. Les modifications personnelles réancrent une revue compatible, alors qu’une correction bibliographique peut la résoudre ou la rendre obsolète.
+
+La barre commune reste accessible depuis les vues de bibliothèque, les livres locaux sélectionnés dans Appareils et l’Assistant. Analyse grisée si le fournisseur choisi n’est pas reconnu, configuré et prêt, ou si le modèle est vide ; transferts soumis à un appareil connecté accessible en écriture ; retrait soumis à confirmation. La fiche et les listes n’ouvrent que les propositions encore éligibles à la révision courante. Le scheduler sépare changements de recherche et événements de rafraîchissement : un flux d’événements ne maintient plus indéfiniment la bibliothèque à zéro pendant le chargement.
 
 Événements : `library:changed`, `devices:changed`, `job:updated`, `chat:delta`, `reader:progress`. Un AtomicBool partage l’annulation avec les travaux bloquants ; les contrôles avant publication et transaction empêchent les fins tardives de ressusciter un job.
 
@@ -98,17 +113,21 @@ La matrice annonce les capacités réelles. Aucun export AZW3/KF8. PDF/CBZ sont 
 
 ## Fournisseurs et Internet
 
-Z.ai, Kimi/Moonshot, MiniMax, OpenAI/Codex, Claude et Mistral utilisent leurs API officielles. Codex désigne OpenAI Responses. Les modèles proviennent d’endpoints/catalogues officiels avec provenance/date ; cache ancien et erreur de rafraîchissement sont explicites. Les clés restent en session ou dans le coffre Linux à la demande, sans fallback en texte clair dans SQLite.
+Z.ai, Kimi/Moonshot, MiniMax, OpenAI/Codex, Claude et Mistral utilisent leurs API officielles. Codex désigne OpenAI Responses. Les modèles proviennent d’endpoints/catalogues officiels avec provenance/date ; cache ancien et erreur de rafraîchissement sont explicites. Les clés restent privées, en session ou dans le coffre disponible à la demande, sans fallback en texte clair dans SQLite. Les diagnostics d’authentification, requête, réponse incomplète/malformée ou métadonnées invalides utilisent des clés publiques autorisées et traduites ; les réponses brutes et détails inconnus ne sont pas affichés comme erreurs.
 
 `WebClient` obtient des sources avant les appels LLM pour les six fournisseurs. Pages publiques uniquement en HTTPS sur le port 443 ; DNS/redirections revalidés, plages privées refusées, budgets taille/durée. Le client LAN est distinct. Le choix explicite `webEnabled=false` retire la recherche et son absence reste visible.
 
-Aucune boucle modèle d’appels d’outils web_search/web_fetch. Le chat utilise le service commun, des plans de recherche validés et des résultats locaux réels ; les citations doivent correspondre aux sources obtenues. Contexte borné, sans notes/évaluations/favoris/progression automatiques.
+Le chat prépare un plan de recherche en lecture seule puis exécute une boucle JSON stricte de sept outils : `librarySearch`, `bookInspect`, `webSearch`, `webFetch`, `updateMetadata`, `organizeBooks`, `verifyMetadata`. Le contexte initial contient au plus 32 fiches sélectionnées, avec le périmètre complet borné à 200 IDs ; JSON limité à 384 KiB, huit étapes et une seule réparation de format supplémentaire. Les citations doivent correspondre aux sources effectivement obtenues. Notes, évaluations et progression ne sont pas envoyées automatiquement.
+
+L’autorisation de modifier/organiser est désactivée par défaut et s’applique à **une seule question**, pour ses seuls IDs sélectionnés. Le backend persiste ce périmètre avant exécution ; le modèle, les pages web et le texte du livre ne peuvent l’élargir. Une correction exige inspection, preuves, hash des fichiers et révision compatibles. Les reçus durables réutilisent un résultat connu sans seconde mutation ; un résultat interrompu incertain bloque sa réexécution automatique. L’annulation arrête les étapes suivantes et attend les mutations déjà engagées. Ces outils n’accordent ni suppression, ni transfert, ni SQL, ni shell, ni chemin libre. Voir [CHAT.md](CHAT.md).
 
 Les valeurs de contrat `localCli` sont réservées, sans capacité disponible. Aucun CLI Codex, Claude ou Calibre invoqué. La racine du stockage est fixée en lecture seule dans les paramètres ; aucune commande applicative de déplacement ou de sauvegarde du profil n’est distribuée.
 
 ## Appareils et transports
 
-Les montages Linux USB/SD et enfants MTP déjà accessibles sont redécouverts et revalidés. Liens symboliques, montages système, lecture seule et volumes ambigus ne donnent pas de capacité d’écriture. Présence rapprochée par contenu et filtrable pour les seuls appareils actuellement connectés. Le scan périodique indexe les nouvelles connexions sans copie automatique.
+Les montages Linux USB/SD et enfants MTP déjà accessibles sont redécouverts et revalidés. Le code 0.2.1 ajoute des probes en lecture seule : PowerShell système pour les disques USB/volumes amovibles Windows hors boot/system ; `diskutil` pour les volumes physiques externes macOS. Sortie limitée à 4 MiB, 128 volumes et délai global de dix secondes ; identifiants validés avant les appels suivants. Aucun montage automatique ni probe d’écriture. Les tests JSON/plist et Linux passent ; les commandes et garanties de fichiers doivent encore être attestées sur les runners natifs, puis sur les cartes concernées.
+
+Liens, reparse points, montages système, lecture seule et volumes ambigus ne donnent pas de capacité d’écriture. Inventaire, hash et inspection EPUB utilisent les fichiers ouverts relativement à la capacité du répertoire, avec contrôle des snapshots avant/après. Présence rapprochée par contenu et filtrable pour les seuls appareils actuellement connectés. Le scan périodique indexe les nouvelles connexions sans copie automatique. Les identités stables fournies par le système de fichiers sont une exigence : un format qui ne les fournit pas doit être refusé explicitement, sans prétendre à une compatibilité physique non testée.
 
 L’inventaire complet reste en base. Le résultat UI d’un job est limité à 500 lignes et 768 KiB, avec total/truncated/avertissement ; cette limite ne tronque pas la présence enregistrée.
 
@@ -118,9 +137,13 @@ Calibre sans fil est un serveur TCP smart-device autonome démarré explicitemen
 
 ## Contrôles et distribution
 
-Les tests Rust utilisent archives synthétiques, bases temporaires, faux montages, clients HTTP/TCP locaux et fixtures publiques libmobi. Les tests frontend sont `api.test.ts`, `i18n.test.ts`, `preview.test.ts`. `scripts/native-smoke.py` exerce le bridge natif avec profil isolé ; il ne remplace pas un essai physique USB/KOReader/CrossPoint.
+Les tests Rust utilisent archives synthétiques, bases temporaires, faux montages, clients HTTP/TCP locaux et fixtures publiques libmobi. Les tests frontend couvrent contrats, traductions, aperçu, scheduler et disponibilité des actions. `scripts/native-smoke.py` et `native-assistant-smoke.py` exercent le bridge natif avec profil isolé ; ils ne remplacent pas un essai physique USB/KOReader/CrossPoint. Les scénarios de revue/retrait vérifient persistance, répétition idempotente et conservation des octets.
 
-La CI unique `.github/workflows/ci.yml` vérifie frontend, format Rust, core et Clippy workspace, puis construit DEB/RPM/AppImage sur Ubuntu 22.04 avec deux jobs Cargo. Elle contrôle les licences/sidecar dans DEB/RPM, génère source correspondante et SHA-256 puis téléverse des artefacts de revue. Elle ne publie pas une GitHub Release.
+Le workflow Linux `.github/workflows/ci.yml` contrôle frontend, Rust et contenu distribué, construit DEB/RPM/AppImage, puis génère source correspondante, notices et SHA-256. Le workflow distinct `.github/workflows/desktop.yml` construit et teste nativement Windows x64 MSVC sur `windows-2025`, macOS ARM sur `macos-26` et macOS Intel sur `macos-26-intel`. Les plateformes exécutent les tests workspace et Clippy avant leurs paquets. Windows produit MSI/NSIS ; macOS produit application et DMG avec cible minimale macOS 13. Les sidecars sont construits pour leur architecture puis exécutés et contrôlés dans le processus de collecte.
+
+Les artefacts desktop incluent `package-report.json`, version/commit/cible/architecture, statut de signature et SHA-256. Le workflow enregistre explicitement que GUI native et Windows 11 n’ont pas été testés par cette collecte. Windows est actuellement empaqueté unsigned. Sur macOS, aucune configuration Apple signifie un paquet unsigned explicitement identifié ; une configuration partielle bloque le build sans repli silencieux. Une configuration complète prépare un keychain temporaire, signe application/sidecar/DMG, soumet la notarisation puis vérifie codesign, équipe, stapler et Gatekeeper. Ces étapes configurées ne prouvent ni disponibilité des secrets ni notarisation accomplie : leurs rapports et la réussite du run exact sont nécessaires. Les secrets temporaires sont nettoyés dans une étape `always()`.
+
+Les workflows déposent des artefacts de revue. Publication de Release, téléchargements publics anonymes, hash des fichiers publiés et essais du paquet exact constituent une étape de livraison distincte. À cet état, la compilation croisée de l’adaptateur Windows et les tests locaux ne valent pas validation native complète de 0.2.1.
 
 `scripts/third-party-notices.py` génère/vérifie les notices depuis dépendances verrouillées et textes originaux, avec --self-test/--check. Les paquets incluent GPL Library Manager, LGPL libmobi et notices. Node/pnpm/Rust et SDK Linux sont nécessaires à la construction ; les utilisateurs des paquets n’installent pas ces outils ni Calibre. Voir [BUILD.md](BUILD.md).
 

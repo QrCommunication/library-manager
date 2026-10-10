@@ -2,8 +2,10 @@
   import { onDestroy, untrack } from 'svelte';
   import { BookOpen, Cable, Check, Link, RefreshCw, Send, Tablet, Unplug, Wifi, X } from '@lucide/svelte';
   import { isPreview, normalizePublicError, PublicError, request } from '../api';
-  import type { BookFormat, Device, Job, OptimizationProfile, WirelessTransport } from '../contracts';
+  import type { BookFormat, Device, Job, WirelessTransport } from '../contracts';
   import { formatDate, formatSize, locale, t } from '../i18n';
+  import SelectionActions from './SelectionActions.svelte';
+  import { MAX_SELECTED_BOOKS, type MetadataDisabledReason } from '../selection-capabilities';
 
   interface Props {
     devices: Device[];
@@ -12,10 +14,20 @@
     onDevicesChange(devices: Device[]): void;
     onNotify(message: string): void;
     onError(error: unknown): void;
+    metadataReady?: boolean;
+    metadataDisabledReason?: MetadataDisabledReason | null;
+    transferReady?: boolean;
+    onOpenAssistant?(): void;
+    onVerifySelected?(): void;
+    onTransferSelected?(initialDeviceId?: string): void;
+    onRemoveSelected?(): void;
+    onClearSelection?(): void;
+    onOpenSettings?(): void;
   }
-  let { devices, selectedBookIds, refreshVersion, onDevicesChange, onNotify, onError }: Props = $props();
+  let { devices, selectedBookIds, refreshVersion, onDevicesChange, onNotify, onError, metadataReady = false,
+    metadataDisabledReason = null, transferReady = false, onOpenAssistant, onVerifySelected,
+    onTransferSelected, onRemoveSelected, onClearSelection, onOpenSettings }: Props = $props();
   let pairDialog: HTMLDialogElement;
-  let transferDialog: HTMLDialogElement;
   let inventoryDialog: HTMLDialogElement;
   interface InventoryBook {
     relativePath: string;
@@ -63,43 +75,28 @@
     return matchesPresence && (!search || [book.title, book.relativePath, ...book.authors, book.format].join(' ').toLocaleLowerCase($locale).includes(search));
   }));
   let disposed = false;
-  let loadGeneration = 0;
-  let profiles = $state<OptimizationProfile[]>([]);
   let scanning = $state(false);
   let busyDevice = $state<string | null>(null);
   let pairing = $state(false);
   let failure = $state<PublicError | null>(null);
   let pairFailure = $state<PublicError | null>(null);
-  let transferFailure = $state<PublicError | null>(null);
   let transport = $state<WirelessTransport>('crosspoint');
   let address = $state('');
   let label = $state('');
   let password = $state('');
-  let transferDeviceId = $state<string | null>(null);
-  let optimizeTransfer = $state(true);
-  let selectedProfile = $state('');
   const demo = isPreview();
-  const transferDevice = $derived(devices.find((device) => device.id === transferDeviceId));
-  const transferProfile = $derived(profiles.find((profile) => profile.id === selectedProfile));
-  const canTransfer = $derived(!demo && !scanning && !pairing && busyDevice === null && transferDevice?.connected === true
-    && transferDevice.writable && selectedBookIds.length > 0 && (!optimizeTransfer || transferProfile !== undefined));
+  const actionsBusy = $derived(scanning || pairing || busyDevice !== null);
   const number = $derived(new Intl.NumberFormat($locale));
   const percent = $derived(new Intl.NumberFormat($locale, { style: 'percent', maximumFractionDigits: 0 }));
 
-  function report(error: unknown, surface: 'page' | 'pair' | 'transfer' = 'page'): void {
+  function report(error: unknown, surface: 'page' | 'pair' = 'page'): void {
     const normalized = normalizePublicError(error);
     if (surface === 'pair') pairFailure = normalized;
-    else if (surface === 'transfer') transferFailure = normalized;
     else failure = normalized;
     onError(normalized);
   }
   function invalidInput(): never {
     throw new PublicError({ code: 'invalidInput', message: $t('errors.invalidInput'), detail: null, retryable: false });
-  }
-  function profileLabel(profile: OptimizationProfile): string {
-    const key = `optimization.${profile.id}`;
-    const translated = $t(key);
-    return translated === key ? profile.name : translated;
   }
   function storageUsed(device: Device): number | null {
     if (device.totalBytes === null || device.freeBytes === null || device.totalBytes <= 0) return null;
@@ -232,19 +229,6 @@
       }
     }
   }
-  async function loadSupport(): Promise<void> {
-    const generation = ++loadGeneration;
-    const [profileResult] = await Promise.allSettled([
-      request('optimization_profiles', undefined), refreshJobs(),
-    ] as const);
-    if (disposed || generation !== loadGeneration) return;
-    if (profileResult.status === 'fulfilled') {
-      profiles = profileResult.value;
-      if (!profiles.some((profile) => profile.id === selectedProfile)) {
-        selectedProfile = profiles.find((profile) => profile.id === 'xteink')?.id ?? profiles[0]?.id ?? '';
-      }
-    } else report(profileResult.reason);
-  }
   function showInventory(device: Device): void {
     inventoryGeneration += 1;
     inventoryLoading = false;
@@ -263,18 +247,16 @@
   }
   $effect(() => {
     void refreshVersion;
-    untrack(() => { void loadSupport(); });
+    untrack(() => { void refreshJobs(); });
   });
   onDestroy(() => {
     disposed = true;
-    loadGeneration += 1;
     jobsGeneration += 1;
     inventoryGeneration += 1;
     clearTimeout(pollTimer);
     inventoryDialog?.close();
     password = '';
     pairDialog?.close();
-    transferDialog?.close();
   });
 
   async function scan(): Promise<void> {
@@ -366,29 +348,9 @@
     finally { if (!disposed) { pairing = false; password = ''; } }
   }
   function prepareTransfer(device: Device): void {
-    transferDeviceId = device.id;
-    transferFailure = null;
-    transferDialog.showModal();
-  }
-  function closeTransfer(): void {
-    if (busyDevice !== null) return;
-    transferDialog.close();
-    transferDeviceId = null;
-  }
-  async function transfer(): Promise<void> {
-    if (!canTransfer || !transferDevice) return;
-    const id = transferDevice.id;
-    const bookIds = [...new Set(selectedBookIds)];
-    busyDevice = id;
-    transferFailure = null;
-    try {
-      const job = await request('device_transfer', { id, bookIds, profileId: optimizeTransfer ? selectedProfile : null });
-      if (disposed) return;
-      rememberJob(id, job);
-      transferDialog.close();
-      transferDeviceId = null;
-    } catch (error) { if (!disposed) report(error, 'transfer'); }
-    finally { if (!disposed) busyDevice = null; }
+    if (demo || disposed || actionsBusy || !device.connected || !device.writable
+      || selectedBookIds.length === 0 || selectedBookIds.length > MAX_SELECTED_BOOKS) return;
+    onTransferSelected?.(device.id);
   }
 </script>
 
@@ -418,7 +380,9 @@
     <div class="toolbar"><button class="button secondary" type="button" disabled={scanning || pairing || busyDevice !== null} onclick={scan}><RefreshCw size={17} class={scanning ? 'scanning' : ''} />{$t('devices.scan')}</button><button class="button primary" type="button" disabled={demo || scanning || pairing || busyDevice !== null} onclick={showPairing}><Link size={17} />{$t('devices.connectWireless')}</button></div>
   </div>
   {#if failure}<div class="error-banner" role="alert"><div class="grow"><strong>{$t(`errors.${failure.code}`)}</strong>{#if failure.detail}<p>{failure.detail}</p>{/if}</div><button class="icon-button" type="button" onclick={() => { failure = null; }} aria-label={$t('actions.close')}><X size={16} /></button></div>{/if}
-  {#if selectedBookIds.length}<div class="selection-bar"><strong>{$t('library.selectedCount', { count: selectedBookIds.length })}</strong><span class="small">{$t('devices.folderStructure')}</span></div>{/if}
+  <SelectionActions selectedCount={selectedBookIds.length} {metadataReady} {metadataDisabledReason} {transferReady}
+    {demo} busy={actionsBusy} {onOpenAssistant} {onVerifySelected} {onTransferSelected} {onRemoveSelected}
+    {onClearSelection} {onOpenSettings} />
   <p class="field-hint device-hint">{$t('devices.mtpHint')}</p>
   {#if devices.length}
     <div class="device-grid">
@@ -435,7 +399,7 @@
           {#if device.freeBytes !== null}<div class="device-storage"><div class="spread"><span>{$t('devices.freeSpace', { size: formatSize(device.freeBytes, $locale) })}</span>{#if used !== null}<span>{percent.format(used)}</span>{/if}</div>{#if used !== null}<progress value={used} max="1" aria-label={$t('book.size')}></progress>{/if}{#if device.totalBytes !== null}<p class="small muted total-size">{$t('common.size')}: {formatSize(device.totalBytes, $locale)}</p>{/if}</div>{/if}
           {#if device.transport !== 'calibreWireless' || device.bookCount > 0}<div class="stack device-counts"><p>{$t('devices.books', { count: device.bookCount })}</p><p class="small muted">{$t('devices.matched', { count: device.matchedBookCount })}</p></div>{/if}
           <p class="small muted">{$t('common.date')}: {formatDate(device.lastSeenAt, $locale)}</p>
-          <div class="row wrap"><button class="button secondary" type="button" onclick={() => showInventory(device)}><BookOpen size={16} />{$t('devices.viewBooks')}</button><button class="button secondary" type="button" disabled={demo || !device.connected || scanning || pairing || busyDevice !== null} onclick={() => indexDevice(device)}><RefreshCw size={16} />{$t('devices.index')}</button><button class="button primary" type="button" disabled={demo || !device.connected || !device.writable || !selectedBookIds.length || scanning || pairing || busyDevice !== null} onclick={() => prepareTransfer(device)}><Send size={16} />{$t('actions.transfer')}</button></div>
+          <div class="row wrap"><button class="button secondary" type="button" onclick={() => showInventory(device)}><BookOpen size={16} />{$t('devices.viewBooks')}</button><button class="button secondary" type="button" disabled={demo || !device.connected || scanning || pairing || busyDevice !== null} onclick={() => indexDevice(device)}><RefreshCw size={16} />{$t('devices.index')}</button><button class="button primary" type="button" disabled={demo || !onTransferSelected || !device.connected || !device.writable || !selectedBookIds.length || selectedBookIds.length > MAX_SELECTED_BOOKS || actionsBusy} onclick={() => prepareTransfer(device)}><Send size={16} />{$t('actions.transfer')}</button></div>
           {#if device.transport !== 'usb'}<button class="button ghost" type="button" disabled={demo || scanning || pairing || busyDevice !== null} onclick={() => disconnect(device)}><Unplug size={16} />{$t('devices.disconnect')}</button>{/if}
           {#if receipt}<div class="receipt stack" aria-live="polite"><p class="small"><strong>{$t(`jobs.${receipt.kind}`)}</strong> · {$t(`jobs.${receipt.status}`)}</p>{@render jobProgress(receipt)}{#if receipt.message}<p class="field-hint">{receipt.message}</p>{/if}{#if receipt.error}<p class="field-hint">{$t(`errors.${receipt.error.code}`)}</p>{/if}</div>{/if}
         </article>
@@ -463,20 +427,7 @@
   </form>
 </dialog>
 
-<dialog class="modal" bind:this={transferDialog} aria-labelledby="transfer-title" oncancel={(event) => { event.preventDefault(); closeTransfer(); }}>
-  <form onsubmit={(event) => { event.preventDefault(); void transfer(); }}>
-    <div class="panel-header"><div><h2 id="transfer-title">{$t('devices.transferTitle')}</h2><p class="small muted">{transferDevice?.label ?? $t('devices.title')}</p></div><button class="icon-button" type="button" disabled={busyDevice !== null} onclick={closeTransfer} aria-label={$t('actions.close')}><X size={20} /></button></div>
-    <div class="panel-body stack">
-      {#if transferFailure}<div class="error-banner" role="alert"><div><strong>{$t(`errors.${transferFailure.code}`)}</strong>{#if transferFailure.detail}<p>{transferFailure.detail}</p>{/if}</div></div>{/if}
-      <p>{$t('library.selectedCount', { count: selectedBookIds.length })}</p>
-      {#if !transferDevice?.connected}<p class="field-hint">{$t('errors.deviceDisconnected')}</p>{:else if !transferDevice.writable}<p class="field-hint">{$t('devices.readOnly')}</p>{/if}
-      <fieldset disabled={busyDevice !== null || demo}><div class="stack"><label class="checkbox-field"><input type="checkbox" bind:checked={optimizeTransfer} />{$t('devices.optimizeBeforeTransfer')}</label>{#if optimizeTransfer}<div class="field"><label for="transfer-profile">{$t('settings.optimizationProfile')}</label><select id="transfer-profile" class="select" bind:value={selectedProfile} disabled={!profiles.length}>{#each profiles as profile (profile.id)}<option value={profile.id}>{profileLabel(profile)}</option>{/each}</select></div>{#if transferProfile?.removeImages}<p class="field-hint">{$t('optimization.removeImagesWarning')}</p>{/if}{/if}</div></fieldset>
-      {#if transferDevice?.transport === 'calibreWireless'}<p class="field-hint">{$t('devices.calibreTransferHint')}</p>{/if}
-      <p class="field-hint">{$t('devices.folderStructure')}</p><p class="field-hint">{$t('devices.preserveProgress')}</p><p class="field-hint">{$t('editor.preserveOriginal')}</p>
-    </div>
-    <div class="panel-footer"><button class="button secondary" type="button" disabled={busyDevice !== null} onclick={closeTransfer}>{$t('actions.cancel')}</button><button class="button primary" type="submit" disabled={!canTransfer}><Send size={16} />{$t('actions.transfer')}</button></div>
-  </form>
-</dialog>
+
 
 
 <dialog class="modal inventory-modal" bind:this={inventoryDialog} aria-labelledby="inventory-title" oncancel={(event) => { event.preventDefault(); closeInventory(); }}>

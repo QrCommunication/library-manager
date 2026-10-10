@@ -1,15 +1,15 @@
-//! Discovery and read-only indexing of already mounted Linux ebook devices.
+//! Discovery and read-only indexing of already mounted ebook devices.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Take};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use chrono::Utc;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
+#[cfg(unix)]
 use rustix::fs::{Access, access, statvfs};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -20,6 +20,7 @@ use crate::database::Database;
 use crate::epub::EpubDocument;
 use crate::error::{AppError, Result};
 use crate::models::{BookFormat, Device};
+use crate::secure_fs::{self, AccessPolicy, FileIdentity, FileSnapshot, SecureDir};
 use crate::storage::MAX_FILE_BYTES;
 #[cfg(test)]
 use crate::storage::Storage;
@@ -75,7 +76,7 @@ pub struct DeviceInventoryPage {
 struct InventorySnapshot {
     capability: MountCapability,
     books: Vec<IndexedDeviceBook>,
-    versions: BTreeMap<String, fs::Metadata>,
+    versions: BTreeMap<String, FileSnapshot>,
     indexing: bool,
 }
 
@@ -89,11 +90,7 @@ struct MountEntry {
     source: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct RootIdentity {
-    device: u64,
-    inode: u64,
-}
+type RootIdentity = FileIdentity;
 
 #[derive(Clone, Debug)]
 struct MountCapability {
@@ -105,6 +102,7 @@ struct MountCapability {
     identity: RootIdentity,
     stable_identity: String,
     writable: bool,
+    total_bytes: Option<u64>,
 }
 
 impl MountCapability {
@@ -118,12 +116,13 @@ impl MountCapability {
 
 #[derive(Debug)]
 struct MountSource {
+    native: bool,
     mountinfo: PathBuf,
     media_roots: Vec<PathBuf>,
     gvfs_roots: Vec<PathBuf>,
 }
 
-/// Linux mount discovery has no external program or automount dependency.
+/// Probes only mounted volumes; discovery never mounts or modifies a device.
 #[derive(Clone, Debug)]
 pub struct DeviceService {
     database: Database,
@@ -134,15 +133,19 @@ pub struct DeviceService {
 
 impl DeviceService {
     pub fn new(database: Database) -> Self {
+        #[cfg(unix)]
         let runtime = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .filter(|path| path.is_absolute())
             .unwrap_or_else(|| {
                 PathBuf::from(format!("/run/user/{}", rustix::process::getuid().as_raw()))
             });
+        #[cfg(not(unix))]
+        let runtime = PathBuf::new();
         Self {
             database,
             source: Arc::new(MountSource {
+                native: cfg!(any(windows, target_os = "macos")),
                 mountinfo: PathBuf::from("/proc/self/mountinfo"),
                 media_roots: vec![PathBuf::from("/media"), PathBuf::from("/run/media")],
                 gvfs_roots: vec![runtime.join("gvfs")],
@@ -198,12 +201,9 @@ impl DeviceService {
             let id: String = row.get(0)?;
             let capability = current.get(&id);
             let (total_bytes, free_bytes) = capability
-                .and_then(|mounted| statvfs(&mounted.path).ok())
-                .map(|stats| {
-                    (
-                        stats.f_blocks.checked_mul(stats.f_frsize),
-                        stats.f_bavail.checked_mul(stats.f_frsize),
-                    )
+                .map(|mounted| {
+                    let (total, free) = volume_capacity(&mounted.path);
+                    (mounted.total_bytes.or(total), free)
                 })
                 .unwrap_or((None, None));
             let transport: String = row.get(2)?;
@@ -374,15 +374,15 @@ impl DeviceService {
             }
             require_root(&capability.path, &capability.identity)?;
             validate_contained_file(entry.path(), &capability.path)?;
-            let metadata = fs::symlink_metadata(entry.path())?;
+            let metadata = device_snapshot(entry.path(), &capability.path)?;
             discovered_bytes = discovered_bytes
-                .checked_add(metadata.len())
+                .checked_add(metadata.size)
                 .filter(|bytes| *bytes <= MAX_INDEX_BYTES)
                 .ok_or_else(|| {
                     AppError::Unsupported("Device inventory byte limit exceeded".into())
                 })?;
-            if metadata.len() <= MAX_FILE_BYTES {
-                progress.total_bytes += metadata.len();
+            if metadata.size <= MAX_FILE_BYTES {
+                progress.total_bytes += metadata.size;
             }
             discovered.push((entry.path().to_owned(), format, metadata));
             progress.total_books = discovered.len() as u64;
@@ -396,17 +396,18 @@ impl DeviceService {
             check_cancelled(cancelled)?;
             require_root(&capability.path, &capability.identity)?;
             validate_contained_file(&path, &capability.path)?;
-            if !same_file_version(&metadata, &fs::symlink_metadata(&path)?) {
+            if metadata != device_snapshot(&path, &capability.path)? {
                 return Err(AppError::Conflict(
                     "A device file changed during indexing".into(),
                 ));
             }
             let relative_path = relative_utf8_path(&path, &capability.path)?;
             progress.current_path = Some(relative_path.clone());
-            let size_bytes = metadata.len();
+            let size_bytes = metadata.size;
             let mut warnings = Vec::new();
             let sha256 = if size_bytes <= MAX_FILE_BYTES {
-                let mut file = fs::File::open(&path)?;
+                let mut file = open_device_file(&path, &capability.path)?;
+                metadata.verify(&file)?;
                 let mut hash = Sha256::new();
                 let mut buffer = vec![0_u8; 256 * 1024];
                 let mut file_bytes = 0_u64;
@@ -431,6 +432,7 @@ impl DeviceService {
                         "A device file changed during indexing".into(),
                     ));
                 }
+                metadata.verify(&file)?;
                 Some(
                     hash.finalize()
                         .iter()
@@ -448,15 +450,19 @@ impl DeviceService {
             let mut authors = Vec::new();
             if format == BookFormat::Epub && size_bytes <= MAX_FILE_BYTES {
                 check_cancelled(cancelled)?;
-                match crate::epub::read_inventory_metadata(&path) {
+                let file = open_device_file(&path, &capability.path)?;
+                metadata.verify(&file)?;
+                let verify_file = file.try_clone()?;
+                match crate::epub::read_inventory_metadata_file(file, &title) {
                     Ok(metadata) => {
                         title = metadata.title;
                         authors = metadata.authors;
                     }
                     Err(_) => warnings.push("metadataUnavailable".into()),
                 }
+                metadata.verify(&verify_file)?;
             }
-            if !same_file_version(&metadata, &fs::symlink_metadata(&path)?) {
+            if metadata != device_snapshot(&path, &capability.path)? {
                 return Err(AppError::Conflict(
                     "A device file changed during indexing".into(),
                 ));
@@ -602,7 +608,7 @@ impl DeviceService {
         let capability = self.connected_capability(id)?;
         let path = capability.path.join(relative);
         validate_contained_file(&path, &capability.path)?;
-        let current = fs::symlink_metadata(&path)?;
+        let current = device_snapshot(&path, &capability.path)?;
         let remembered = {
             let inventories = self.lock_inventories()?;
             inventories
@@ -616,7 +622,7 @@ impl DeviceService {
                     let version = snapshot.versions.get(relative_path).ok_or_else(|| {
                         AppError::NotFound("File is absent from the device inventory".into())
                     })?;
-                    Ok(same_file_version(version, &current))
+                    Ok(*version == current)
                 })
                 .transpose()?
         };
@@ -638,9 +644,9 @@ impl DeviceService {
             let expected = hash.ok_or_else(|| {
                 AppError::Unsupported("This file cannot be verified for import".into())
             })?;
-            if current.len() != positive_integer(size)?
+            if current.size != positive_integer(size)?
                 || crate::storage::Storage::hash_file(&path)? != expected
-                || !same_file_version(&current, &fs::symlink_metadata(&path)?)
+                || current != device_snapshot(&path, &capability.path)?
             {
                 return Err(AppError::Conflict(
                     "Device file changed since inventory".into(),
@@ -750,6 +756,26 @@ impl DeviceService {
     }
 
     fn discover(&self) -> Result<BTreeMap<String, MountCapability>> {
+        if self.source.native {
+            let mut result = BTreeMap::new();
+            for volume in native_volumes()? {
+                let mount = volume.mount;
+                self.insert_capability(
+                    &mut result,
+                    &mount,
+                    mount.mount_point.clone(),
+                    volume.stable_identity,
+                )?;
+                if let Some(capability) = result.values_mut().find(|entry| entry.mount == mount) {
+                    capability.total_bytes = volume.total_bytes;
+                    if !volume.label.trim().is_empty() {
+                        capability.label = bounded_text(&volume.label);
+                        capability.profile = device_profile(&capability.path, &capability.label);
+                    }
+                }
+            }
+            return Ok(result);
+        }
         let mut input = String::new();
         let mut reader: Take<fs::File> =
             fs::File::open(&self.source.mountinfo)?.take(MAX_MOUNTINFO_BYTES + 1);
@@ -828,8 +854,7 @@ impl DeviceService {
             "usb-{}",
             hex_digest(stable_identity.as_bytes())[..32].to_owned()
         );
-        let writable = mount.options.iter().any(|option| option == "rw")
-            && access(&path, Access::WRITE_OK).is_ok();
+        let writable = mount.options.iter().any(|option| option == "rw") && may_write(&path);
         let capability = MountCapability {
             id: id.clone(),
             label,
@@ -839,6 +864,7 @@ impl DeviceService {
             identity,
             stable_identity,
             writable,
+            total_bytes: None,
         };
         if let Some(previous) = result.get(&id) {
             if previous.path != capability.path || previous.identity != capability.identity {
@@ -857,6 +883,7 @@ impl DeviceService {
         Self {
             database,
             source: Arc::new(MountSource {
+                native: false,
                 mountinfo: mountinfo.into(),
                 media_roots: vec![media.into()],
                 gvfs_roots: vec![gvfs.into()],
@@ -865,6 +892,458 @@ impl DeviceService {
             inventories: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
+}
+
+#[derive(Debug)]
+struct NativeVolume {
+    mount: MountEntry,
+    stable_identity: String,
+    label: String,
+    total_bytes: Option<u64>,
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+const MAX_NATIVE_VOLUMES: usize = 128;
+#[cfg(any(windows, target_os = "macos", test))]
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn native_volumes() -> Result<Vec<NativeVolume>> {
+    #[cfg(windows)]
+    {
+        let system = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| {
+                AppError::Unsupported("Windows system directory is unavailable".into())
+            })?;
+        let executable = system.join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let output = run_probe(
+            &executable,
+            &[
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                WINDOWS_VOLUME_PROBE,
+            ],
+            std::time::Instant::now() + PROBE_TIMEOUT,
+        )?;
+        parse_windows_volumes(&output)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+        let executable = Path::new("/usr/sbin/diskutil");
+        let output = run_probe(
+            executable,
+            &["list", "-plist", "external", "physical"],
+            deadline,
+        )?;
+        let identifiers = mac_volume_identifiers(&output)?;
+        let mut volumes = Vec::new();
+        for identifier in identifiers {
+            // Identifiers are parsed from the OS reply, never accepted from chat
+            // or IPC, and are validated before they become a command argument.
+            let info = run_probe(executable, &["info", "-plist", &identifier], deadline)?;
+            if let Some(volume) = parse_mac_volume(&info, &identifier)? {
+                volumes.push(volume);
+            }
+        }
+        Ok(volumes)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        Err(AppError::Unsupported(
+            "Native volume probe is unavailable".into(),
+        ))
+    }
+}
+
+// No interpolated command fragments, mounting, formatting or write probes.
+// PowerShell 5.1 ships with Windows 11; InputObject keeps 0/1/N results arrays.
+#[cfg(any(windows, test))]
+const WINDOWS_VOLUME_PROBE: &str = r#"
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$result = @()
+foreach ($disk in @(Get-Disk)) {
+  if ($disk.IsBoot -or $disk.IsSystem) { continue }
+  foreach ($partition in @($disk | Get-Partition)) {
+    if (-not $partition.DriveLetter) { continue }
+    foreach ($volume in @($partition | Get-Volume)) {
+      if (($disk.BusType -ne 'USB') -and ($volume.DriveType -ne 'Removable')) { continue }
+      if (-not $volume.DriveLetter -or -not $volume.FileSystemType -or $volume.FileSystemType -eq 'Unknown') { continue }
+      $result += [pscustomobject]@{
+        driveLetter = [string]$volume.DriveLetter
+        volumeId = [string]$volume.UniqueId
+        diskId = [string]$disk.UniqueId
+        diskNumber = [uint32]$disk.Number
+        partitionNumber = [uint32]$partition.PartitionNumber
+        label = [string]$volume.FileSystemLabel
+        filesystem = [string]$volume.FileSystemType
+        readOnly = [bool]($disk.IsReadOnly -or $partition.IsReadOnly)
+        isBoot = [bool]$disk.IsBoot
+        isSystem = [bool]$disk.IsSystem
+        usb = [bool]($disk.BusType -eq 'USB')
+        removable = [bool]($volume.DriveType -eq 'Removable')
+        sizeBytes = [uint64]$volume.Size
+      }
+    }
+  }
+}
+ConvertTo-Json -InputObject @($result) -Depth 4 -Compress
+"#;
+
+#[cfg(any(windows, test))]
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WindowsVolume {
+    drive_letter: String,
+    volume_id: String,
+    disk_id: String,
+    disk_number: u32,
+    partition_number: u32,
+    label: String,
+    filesystem: String,
+    read_only: bool,
+    is_boot: bool,
+    is_system: bool,
+    usb: bool,
+    removable: bool,
+    size_bytes: u64,
+}
+
+#[cfg(any(windows, test))]
+fn parse_windows_volumes(input: &str) -> Result<Vec<NativeVolume>> {
+    ensure_probe_size(input)?;
+    let rows: Vec<WindowsVolume> = serde_json::from_str(input)
+        .map_err(|_| AppError::Unsupported("Invalid Windows volume information".into()))?;
+    if rows.len() > MAX_NATIVE_VOLUMES {
+        return Err(probe_limit());
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    for row in rows {
+        if row.is_boot || row.is_system || !(row.usb || row.removable) {
+            continue;
+        }
+        if row.drive_letter.len() != 1
+            || !row.drive_letter.as_bytes()[0].is_ascii_alphabetic()
+            || !safe_native_identifier(&row.volume_id)
+            || !safe_native_identifier(&row.disk_id)
+            || row.filesystem.is_empty()
+            || row.filesystem.len() > 64
+            || !row
+                .filesystem
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric())
+            || row.size_bytes == 0
+        {
+            return Err(AppError::Unsupported(
+                "Invalid Windows mounted volume".into(),
+            ));
+        }
+        let stable = format!("windows:{}:{}", row.disk_id, row.volume_id);
+        if !seen.insert(stable.clone()) {
+            return Err(AppError::Conflict(
+                "Duplicate mounted volume identity".into(),
+            ));
+        }
+        let path = PathBuf::from(format!("{}:\\", row.drive_letter.to_ascii_uppercase()));
+        result.push(NativeVolume {
+            mount: MountEntry {
+                mount_id: format!(
+                    "{}:{}:{}",
+                    row.disk_number, row.partition_number, row.volume_id
+                ),
+                root: "/".into(),
+                mount_point: path,
+                options: vec![if row.read_only { "ro" } else { "rw" }.into()],
+                filesystem: row.filesystem,
+                source: row.disk_id,
+            },
+            stable_identity: stable,
+            label: row.label,
+            total_bytes: Some(row.size_bytes),
+        });
+    }
+    Ok(result)
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn safe_native_identifier(value: &str) -> bool {
+    !value.trim().is_empty() && value.len() <= 1024 && !value.chars().any(char::is_control)
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn ensure_probe_size(input: &str) -> Result<()> {
+    if input.len() as u64 > MAX_MOUNTINFO_BYTES {
+        return Err(probe_limit());
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn probe_limit() -> AppError {
+    AppError::Unsupported("Mounted volume probe limit exceeded".into())
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn run_probe(program: &Path, arguments: &[&str], deadline: std::time::Instant) -> Result<String> {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    if Instant::now() >= deadline {
+        return Err(AppError::Unsupported(
+            "Mounted volume probe timed out".into(),
+        ));
+    }
+    let mut child = Command::new(program)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AppError::Unsupported("Mounted volume probe output unavailable".into()))?;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let result = stdout
+            .take(MAX_MOUNTINFO_BYTES + 1)
+            .read_to_end(&mut output)
+            .map(|_| output);
+        let _ = sender.send(result);
+    });
+    let mut output = None;
+    let mut status = None;
+    loop {
+        if output.is_none() {
+            match receiver.try_recv() {
+                Ok(Ok(bytes)) if bytes.len() as u64 <= MAX_MOUNTINFO_BYTES => output = Some(bytes),
+                Ok(result) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return match result {
+                        Err(error) => Err(error.into()),
+                        _ => Err(probe_limit()),
+                    };
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(AppError::Unsupported(
+                        "Mounted volume probe output failed".into(),
+                    ));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(value) => status = value,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error.into());
+                }
+            }
+        }
+        if let (Some(bytes), Some(exit)) = (output.as_ref(), status) {
+            let _ = reader.join();
+            if !exit.success() {
+                return Err(AppError::Unsupported("Mounted volume probe failed".into()));
+            }
+            return String::from_utf8(bytes.clone()).map_err(|_| {
+                AppError::Unsupported("Mounted volume probe must return UTF-8".into())
+            });
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(AppError::Unsupported(
+                "Mounted volume probe timed out".into(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_plist(input: &str) -> Result<serde_json::Value> {
+    ensure_probe_size(input)?;
+    // Apple's standard declaration has no internal entities. All other DTDs
+    // remain rejected by roxmltree; no external resource is ever resolved.
+    let input = input.replace("<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">", "");
+    let document = roxmltree::Document::parse_with_options(
+        &input,
+        roxmltree::ParsingOptions {
+            nodes_limit: 100_000,
+            ..Default::default()
+        },
+    )
+    .map_err(|_| AppError::Unsupported("Invalid mounted volume property list".into()))?;
+    let root = document.root_element();
+    if !root.has_tag_name("plist") {
+        return Err(probe_limit());
+    }
+    let children: Vec<_> = root.children().filter(|node| node.is_element()).collect();
+    if children.len() != 1 {
+        return Err(probe_limit());
+    }
+    plist_value(children[0], 0)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn plist_value(node: roxmltree::Node<'_, '_>, depth: usize) -> Result<serde_json::Value> {
+    use serde_json::Value;
+    if depth > 32 {
+        return Err(probe_limit());
+    }
+    Ok(match node.tag_name().name() {
+        "dict" => {
+            let mut children = node.children().filter(|child| child.is_element());
+            let mut fields = serde_json::Map::new();
+            while let Some(key) = children.next() {
+                if !key.has_tag_name("key") {
+                    return Err(probe_limit());
+                }
+                let key = key.text().ok_or_else(probe_limit)?;
+                let value = children.next().ok_or_else(probe_limit)?;
+                if fields
+                    .insert(key.to_owned(), plist_value(value, depth + 1)?)
+                    .is_some()
+                {
+                    return Err(probe_limit());
+                }
+            }
+            Value::Object(fields)
+        }
+        "array" => Value::Array(
+            node.children()
+                .filter(|child| child.is_element())
+                .map(|child| plist_value(child, depth + 1))
+                .collect::<Result<_>>()?,
+        ),
+        "string" => Value::String(node.text().unwrap_or_default().to_owned()),
+        "integer" => Value::from(
+            node.text()
+                .unwrap_or_default()
+                .parse::<u64>()
+                .map_err(|_| probe_limit())?,
+        ),
+        "true" => Value::Bool(true),
+        "false" => Value::Bool(false),
+        _ => return Err(probe_limit()),
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn mac_disk_identifier(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("disk") else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest
+            .split('s')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        && value.len() <= 64
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn mac_volume_identifiers(input: &str) -> Result<Vec<String>> {
+    let list = parse_plist(input)?;
+    let disks = list
+        .get("AllDisksAndPartitions")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(probe_limit)?;
+    let mut identifiers = std::collections::BTreeSet::new();
+    fn collect(
+        value: &serde_json::Value,
+        result: &mut std::collections::BTreeSet<String>,
+        depth: usize,
+    ) -> Result<()> {
+        if depth > 32 {
+            return Err(probe_limit());
+        }
+        let identifier = value
+            .get("DeviceIdentifier")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(probe_limit)?;
+        if !mac_disk_identifier(identifier) {
+            return Err(probe_limit());
+        }
+        // Whole disks are queried too: a superfloppy can have no partition.
+        result.insert(identifier.to_owned());
+        if result.len() > MAX_NATIVE_VOLUMES {
+            return Err(probe_limit());
+        }
+        for key in ["Partitions", "APFSVolumes"] {
+            if let Some(children) = value.get(key) {
+                let children = children.as_array().ok_or_else(probe_limit)?;
+                for child in children {
+                    collect(child, result, depth + 1)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    for disk in disks {
+        collect(disk, &mut identifiers, 0)?;
+    }
+    Ok(identifiers.into_iter().collect())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_mac_volume(input: &str, expected_identifier: &str) -> Result<Option<NativeVolume>> {
+    let info = parse_plist(input)?;
+    let text = |key: &str| info.get(key).and_then(serde_json::Value::as_str);
+    if text("DeviceIdentifier") != Some(expected_identifier)
+        || !mac_disk_identifier(expected_identifier)
+    {
+        return Err(probe_limit());
+    }
+    let Some(mount) = text("MountPoint").filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if info.get("Internal").and_then(serde_json::Value::as_bool) != Some(false)
+        || !mount.starts_with("/Volumes/")
+        || Path::new(mount)
+            .components()
+            .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(AppError::Unsupported("Unsafe external macOS volume".into()));
+    }
+    let media_read_only = info
+        .get("MediaReadOnly")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(probe_limit)?;
+    let volume_read_only = info
+        .get("VolumeReadOnly")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(probe_limit)?;
+    let read_only = media_read_only || volume_read_only;
+    let stable = text("VolumeUUID")
+        .or_else(|| text("MediaUUID"))
+        .filter(|value| safe_native_identifier(value))
+        .ok_or_else(probe_limit)?;
+    let filesystem = text("FilesystemType")
+        .or_else(|| text("FileSystemPersonality"))
+        .ok_or_else(probe_limit)?;
+    Ok(Some(NativeVolume {
+        mount: MountEntry {
+            mount_id: format!("{expected_identifier}:{stable}"),
+            root: "/".into(),
+            mount_point: PathBuf::from(mount),
+            options: vec![if read_only { "ro" } else { "rw" }.into()],
+            filesystem: bounded_text(filesystem),
+            source: expected_identifier.into(),
+        },
+        stable_identity: format!("macos:{stable}"),
+        label: text("VolumeName").unwrap_or("E-reader").into(),
+        total_bytes: info.get("TotalSize").and_then(serde_json::Value::as_u64),
+    }))
 }
 
 fn parse_mountinfo(input: &str) -> Result<Vec<MountEntry>> {
@@ -968,17 +1447,7 @@ fn ignored_filesystem(name: &str) -> bool {
 }
 
 fn directory_identity(path: &Path) -> Result<RootIdentity> {
-    validate_no_symlinks(path)?;
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_dir() || fs::canonicalize(path)? != path {
-        return Err(AppError::InvalidInput(
-            "Device root must be a canonical directory".into(),
-        ));
-    }
-    Ok(RootIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
+    SecureDir::open(path, false, AccessPolicy::Shared)?.identity()
 }
 
 fn require_root(path: &Path, expected: &RootIdentity) -> Result<()> {
@@ -988,42 +1457,52 @@ fn require_root(path: &Path, expected: &RootIdentity) -> Result<()> {
     Ok(())
 }
 
-fn validate_no_symlinks(path: &Path) -> Result<()> {
-    if !path.is_absolute() {
-        return Err(AppError::InvalidInput(
-            "Device path must be absolute".into(),
-        ));
-    }
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::RootDir | Component::Normal(_) => current.push(component),
-            _ => {
-                return Err(AppError::InvalidInput(
-                    "Unsafe device path component".into(),
-                ));
-            }
-        }
-        if fs::symlink_metadata(&current)?.file_type().is_symlink() {
-            return Err(AppError::InvalidInput(
-                "Device symlinks are not followed".into(),
-            ));
-        }
-    }
-    Ok(())
+fn validate_contained_file(path: &Path, root: &Path) -> Result<()> {
+    open_device_file(path, root).map(|_| ())
 }
 
-fn validate_contained_file(path: &Path, root: &Path) -> Result<()> {
-    validate_no_symlinks(path)?;
-    if !path.starts_with(root)
-        || !fs::symlink_metadata(path)?.is_file()
-        || !fs::canonicalize(path)?.starts_with(root)
-    {
-        return Err(AppError::InvalidInput(
-            "Device file escapes its mounted root".into(),
-        ));
+fn open_device_file(path: &Path, root: &Path) -> Result<fs::File> {
+    let relative = relative_utf8_path(path, root)?;
+    let mut components = Path::new(&relative).components().peekable();
+    let mut parent = SecureDir::open(root, false, AccessPolicy::Shared)?;
+    while let Some(Component::Normal(name)) = components.next() {
+        if components.peek().is_none() {
+            return parent.open_regular(name);
+        }
+        parent = parent.child(name, false, AccessPolicy::Shared)?;
     }
-    Ok(())
+    Err(AppError::InvalidInput(
+        "Unsafe device inventory path".into(),
+    ))
+}
+
+fn device_snapshot(path: &Path, root: &Path) -> Result<FileSnapshot> {
+    secure_fs::snapshot(&open_device_file(path, root)?)
+}
+
+fn may_write(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        access(path, Access::WRITE_OK).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        true
+    }
+}
+
+fn volume_capacity(path: &Path) -> (Option<u64>, Option<u64>) {
+    let free = SecureDir::open(path, false, AccessPolicy::Shared)
+        .and_then(|dir| dir.free_space())
+        .ok();
+    #[cfg(unix)]
+    let total = statvfs(path)
+        .ok()
+        .and_then(|stats| stats.f_blocks.checked_mul(stats.f_frsize));
+    #[cfg(not(unix))]
+    let total = None;
+    (total, free)
 }
 
 fn relative_utf8_path(path: &Path, root: &Path) -> Result<String> {
@@ -1065,8 +1544,9 @@ fn reject_replaced_roots(
 fn device_profile(path: &Path, label: &str) -> String {
     let label = label.to_lowercase();
     let marker = |name: &str| {
-        fs::symlink_metadata(path.join(name))
-            .is_ok_and(|metadata| !metadata.file_type().is_symlink())
+        let target = path.join(name);
+        SecureDir::open(&target, false, AccessPolicy::Shared).is_ok()
+            || open_device_file(&target, path).is_ok()
     };
     if label.contains("xteink") || marker(".crosspoint") || marker(".crossink") {
         "xteink"
@@ -1145,24 +1625,187 @@ fn check_cancelled(cancelled: &AtomicBool) -> Result<()> {
     }
 }
 
-fn same_file_version(before: &fs::Metadata, after: &fs::Metadata) -> bool {
-    after.is_file()
-        && before.dev() == after.dev()
-        && before.ino() == after.ino()
-        && before.len() == after.len()
-        && before.mtime() == after.mtime()
-        && before.mtime_nsec() == after.mtime_nsec()
-        && before.ctime() == after.ctime()
-        && before.ctime_nsec() == after.ctime_nsec()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::book_repository::{BookRepository, StoredFile};
     use crate::models::{BookFile, BookMetadata, DeviceTransport, FileVariant};
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
+
+    #[cfg(windows)]
+    fn symlink(source: impl AsRef<Path>, destination: impl AsRef<Path>) -> std::io::Result<()> {
+        if source.as_ref().is_dir() {
+            std::os::windows::fs::symlink_dir(source, destination)
+        } else {
+            std::os::windows::fs::symlink_file(source, destination)
+        }
+    }
+
+    fn windows_volume() -> serde_json::Value {
+        serde_json::json!({"driveLetter":"E","volumeId":"volume-unique","diskId":"usb-serial",
+            "diskNumber":2,"partitionNumber":1,"label":"Reader","filesystem":"FAT32",
+            "readOnly":false,"isBoot":false,"isSystem":false,"usb":true,"removable":true,
+            "sizeBytes":32_000_000})
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn native_readonly_volume_probe_runs_on_its_actual_operating_system() {
+        // CI may have no removable media. This still executes the platform's
+        // actual builtin command and parses its real empty or populated reply.
+        // It does not claim physical reader compatibility.
+        let volumes = native_volumes().unwrap();
+        assert!(volumes.len() <= MAX_NATIVE_VOLUMES);
+        for volume in volumes {
+            assert!(volume.mount.mount_point.is_absolute());
+            assert!(safe_native_identifier(&volume.stable_identity));
+        }
+    }
+
+    #[test]
+    fn windows_probe_filters_system_disks_and_preserves_readonly_volume_identity() {
+        let mut row = windows_volume();
+        let volumes = parse_windows_volumes(&serde_json::json!([row]).to_string()).unwrap();
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0].mount.options, ["rw"]);
+        assert_eq!(volumes[0].mount.mount_point.to_string_lossy(), "E:\\");
+        let stable = volumes[0].stable_identity.clone();
+        row["driveLetter"] = "F".into();
+        row["readOnly"] = true.into();
+        let volumes = parse_windows_volumes(&serde_json::json!([row]).to_string()).unwrap();
+        assert_eq!(volumes[0].stable_identity, stable);
+        assert_eq!(volumes[0].mount.options, ["ro"]);
+        row["isBoot"] = true.into();
+        assert!(
+            parse_windows_volumes(&serde_json::json!([row]).to_string())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(parse_windows_volumes("[]").unwrap().is_empty());
+        assert!(!WINDOWS_VOLUME_PROBE.contains("Set-"));
+        assert_eq!(PROBE_TIMEOUT.as_secs(), 10);
+    }
+
+    #[test]
+    fn windows_probe_rejects_unsafe_paths_types_and_ambiguous_identity() {
+        for letter in ["E:\\", "../E", "\\\\server", "1", ""] {
+            let mut row = windows_volume();
+            row["driveLetter"] = letter.into();
+            assert!(parse_windows_volumes(&serde_json::json!([row]).to_string()).is_err());
+        }
+        let mut row = windows_volume();
+        row["readOnly"] = "false".into();
+        assert!(parse_windows_volumes(&serde_json::json!([row]).to_string()).is_err());
+        let row = windows_volume();
+        assert!(matches!(
+            parse_windows_volumes(&serde_json::json!([row, row]).to_string()),
+            Err(AppError::Conflict(_))
+        ));
+        assert!(parse_windows_volumes(&" ".repeat(MAX_MOUNTINFO_BYTES as usize + 1)).is_err());
+    }
+
+    fn plist(body: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0">{body}</plist>"#
+        )
+    }
+
+    fn mac_info() -> String {
+        plist(
+            "<dict><key>DeviceIdentifier</key><string>disk2s1</string><key>Internal</key><false/><key>MountPoint</key><string>/Volumes/Reader</string><key>MediaReadOnly</key><false/><key>VolumeReadOnly</key><true/><key>VolumeUUID</key><string>volume-uuid</string><key>VolumeName</key><string>Reader</string><key>FilesystemType</key><string>msdos</string><key>TotalSize</key><integer>32000000</integer></dict>",
+        )
+    }
+
+    #[test]
+    fn mac_plist_probe_only_accepts_external_mounted_volumes_and_fixed_disk_identifiers() {
+        let list = plist(
+            "<dict><key>AllDisksAndPartitions</key><array><dict><key>DeviceIdentifier</key><string>disk2</string><key>Partitions</key><array><dict><key>DeviceIdentifier</key><string>disk2s1</string></dict></array></dict></array></dict>",
+        );
+        assert_eq!(mac_volume_identifiers(&list).unwrap(), ["disk2", "disk2s1"]);
+        let volume = parse_mac_volume(&mac_info(), "disk2s1").unwrap().unwrap();
+        assert_eq!(volume.mount.options, ["ro"]);
+        assert_eq!(volume.total_bytes, Some(32_000_000));
+        assert!(parse_mac_volume(&mac_info(), "disk3s1").is_err());
+        for unsafe_id in ["disk2;echo", "--help", "disk", "disk2s", "/dev/disk2"] {
+            assert!(!mac_disk_identifier(unsafe_id));
+        }
+        assert!(parse_mac_volume(&mac_info().replace("/Volumes/Reader", "/"), "disk2s1").is_err());
+        assert!(
+            parse_mac_volume(
+                &mac_info().replace("/Volumes/Reader", "/Volumes/../Users"),
+                "disk2s1"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_mac_volume(
+                &mac_info().replace("<key>Internal</key><false/>", "<key>Internal</key><true/>"),
+                "disk2s1"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_mac_volume(
+                &mac_info().replace("<key>VolumeReadOnly</key><true/>", ""),
+                "disk2s1"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_mac_volume(&mac_info().replace("/Volumes/Reader", ""), "disk2s1")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn mac_plist_parser_rejects_duplicate_keys_entities_and_probe_limits() {
+        assert!(
+            parse_plist(&plist(
+                "<dict><key>x</key><true/><key>x</key><false/></dict>"
+            ))
+            .is_err()
+        );
+        assert!(parse_plist("<!DOCTYPE plist [<!ENTITY external SYSTEM 'file:///etc/passwd'>]><plist><string>&external;</string></plist>").is_err());
+        assert!(parse_plist(&plist("<dict><key>x</key></dict>")).is_err());
+        assert!(parse_plist(&" ".repeat(MAX_MOUNTINFO_BYTES as usize + 1)).is_err());
+        let rows = serde_json::json!(vec![windows_volume(); MAX_NATIVE_VOLUMES + 1]);
+        assert!(parse_windows_volumes(&rows.to_string()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_probe_has_a_bounded_deadline_and_output() {
+        let start = std::time::Instant::now();
+        assert!(
+            run_probe(
+                Path::new("/bin/sleep"),
+                &["5"],
+                start + std::time::Duration::from_millis(30)
+            )
+            .is_err()
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        assert!(
+            run_probe(
+                Path::new("/usr/bin/head"),
+                &["-c", "4194305", "/dev/zero"],
+                std::time::Instant::now() + PROBE_TIMEOUT
+            )
+            .is_err()
+        );
+        assert_eq!(
+            run_probe(
+                Path::new("/bin/printf"),
+                &["[]"],
+                std::time::Instant::now() + PROBE_TIMEOUT
+            )
+            .unwrap(),
+            "[]"
+        );
+    }
 
     struct Fixture {
         _temporary: TempDir,
@@ -1251,7 +1894,9 @@ mod tests {
         assert_eq!(devices.len(), 1);
         assert!(devices[0].connected && devices[0].writable);
         assert_eq!(devices[0].profile, "xteink");
-        assert!(devices[0].total_bytes.is_some());
+        // The mountinfo fixture has no native Windows capacity descriptor.
+        // Real Windows probes supply TotalSize; Unix can query statvfs here.
+        assert_eq!(devices[0].total_bytes.is_some(), cfg!(unix));
         assert_eq!(
             fixture.service.resolve_connected(&id).unwrap(),
             fixture.card

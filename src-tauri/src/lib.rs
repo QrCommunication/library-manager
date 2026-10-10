@@ -187,6 +187,8 @@ pub fn run() {
             commands::book_files,
             commands::import_books,
             commands::book_update,
+            commands::book_review,
+            commands::books_remove,
             commands::book_enrich,
             commands::book_optimize,
             commands::book_convert,

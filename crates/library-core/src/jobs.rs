@@ -166,12 +166,12 @@ impl JobService {
 
     pub fn get(&self, id: &str) -> Result<Job> {
         validate_id(id)?;
-        Ok(decode(load(&self.database.connect()?, id)?)?.0)
+        Ok(decode(load(&*self.database.connect()?, id)?)?.0)
     }
 
     pub fn payload(&self, id: &str) -> Result<Value> {
         validate_id(id)?;
-        Ok(decode(load(&self.database.connect()?, id)?)?.1.payload)
+        Ok(decode(load(&*self.database.connect()?, id)?)?.1.payload)
     }
 
     /// Import recovery schedules automatic enrichment once, regardless of list pagination/status.
@@ -426,7 +426,7 @@ impl JobService {
     pub fn cancellation_token(&self, id: &str) -> Result<Arc<AtomicBool>> {
         validate_id(id)?;
         let mut tokens = self.tokens()?;
-        let (job, envelope) = decode(load(&self.database.connect()?, id)?)?;
+        let (job, envelope) = decode(load(&*self.database.connect()?, id)?)?;
         let terminal_or_waiting = job.status != JobStatus::Running;
         if terminal_or_waiting {
             return Ok(Arc::new(AtomicBool::new(true)));

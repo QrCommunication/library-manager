@@ -1,11 +1,11 @@
 //! Bounded, non-overwriting USB and direct CrossPoint transfers.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
-use std::os::unix::fs::MetadataExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,11 +13,6 @@ use std::time::Duration;
 use chrono::Utc;
 use reqwest::{Client, Response, multipart};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
-use rustix::fd::OwnedFd;
-use rustix::fs::{
-    AtFlags, Mode, OFlags, RenameFlags, fstatvfs, mkdirat, open, openat, renameat_with, unlinkat,
-};
-use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
@@ -33,6 +28,7 @@ use crate::models::{
     Book, BookFile, BookFormat, BookMetadata, Device, DeviceTransport, FileVariant,
 };
 use crate::optimizer;
+use crate::secure_fs::{self, AccessPolicy, FileIdentity, PublishResult, SecureDir};
 use crate::storage::{MAX_FILE_BYTES, Storage};
 
 const MAX_BATCH_BOOKS: usize = 200;
@@ -758,7 +754,7 @@ impl TransferService {
         let mut staging_started = false;
         let result = async {
             verify_wireless(device, Some(cancel)).await?;
-            let file = File::from(open_absolute_regular(&book.path)?);
+            let file = open_absolute_regular(&book.path)?;
             let file = tokio::fs::File::from_std(file);
             let part = multipart::Part::stream_with_length(file, book.file.file.size_bytes)
                 .file_name(temporary_name.clone());
@@ -996,7 +992,7 @@ fn copy_usb(
             validate_relative(&record.relative_path)?;
             let existing = root_path.join(&record.relative_path);
             if let Ok(file) = open_absolute_regular(&existing)
-                && copy_and_hash(File::from(file), None, cancel)? == book.file.file.sha256
+                && copy_and_hash(file, None, cancel)? == book.file.file.sha256
             {
                 return Ok((TransferItemStatus::AlreadyPresent, record.relative_path));
             }
@@ -1018,8 +1014,8 @@ fn copy_usb_at(
     revalidate: impl Fn() -> Result<()>,
 ) -> Result<(TransferItemStatus, String)> {
     check_cancel(cancel)?;
-    let root = File::from(open_absolute_directory(root_path)?);
-    let identity = root.metadata()?;
+    let root = open_absolute_directory(root_path)?;
+    let identity = root.identity()?;
     validate_relative(&book.relative_path)?;
     let components: Vec<&str> = book.relative_path.split('/').collect();
     let filename = components
@@ -1028,30 +1024,8 @@ fn copy_usb_at(
     let mut parent = root.try_clone()?;
     for component in &components[..components.len() - 1] {
         revalidate()?;
-        match openat(
-            &parent,
-            *component,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) {
-            Ok(directory) => parent = File::from(directory),
-            Err(Errno::NOENT) => {
-                match mkdirat(&parent, *component, Mode::from_raw_mode(0o755)) {
-                    Ok(()) | Err(Errno::EXIST) => {}
-                    Err(error) => return Err(std::io::Error::from(error).into()),
-                }
-                parent = File::from(
-                    openat(
-                        &parent,
-                        *component,
-                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                        Mode::empty(),
-                    )
-                    .map_err(std::io::Error::from)?,
-                );
-            }
-            Err(error) => return Err(std::io::Error::from(error).into()),
-        }
+        check_cancel(cancel)?;
+        parent = parent.child(OsStr::new(component), true, AccessPolicy::Shared)?;
     }
     if let Some(hash) = existing_hash(&parent, filename)? {
         if hash == book.file.file.sha256 {
@@ -1064,13 +1038,8 @@ fn copy_usb_at(
             "Device destination already contains different content".into(),
         ));
     }
-    if let Ok(stats) = fstatvfs(&parent)
-        && stats
-            .f_bavail
-            .checked_mul(stats.f_frsize)
-            .is_some_and(|available| {
-                available < book.file.file.size_bytes.saturating_add(1024 * 1024)
-            })
+    if let Ok(available) = parent.free_space()
+        && available < book.file.file.size_bytes.saturating_add(1024 * 1024)
     {
         return Err(AppError::Unsupported(
             "Insufficient free space on device".into(),
@@ -1080,20 +1049,18 @@ fn copy_usb_at(
     let mut stage = UsbStage {
         parent,
         temporary_name,
+        temporary_identity: None,
         published: None,
         committed: false,
     };
-    let mut destination = File::from(
-        openat(
-            &stage.parent,
-            stage.temporary_name.as_str(),
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_raw_mode(0o644),
-        )
-        .map_err(std::io::Error::from)?,
-    );
-    let source = File::from(open_absolute_regular(&book.path)?);
-    let before = source.metadata()?;
+    // Keep destination declared after stage so its handle closes before the
+    // cleanup guard opens an entry for deletion on Windows.
+    let mut destination = stage
+        .parent
+        .create_new(OsStr::new(&stage.temporary_name), AccessPolicy::Shared)?;
+    stage.temporary_identity = Some(secure_fs::identity(&destination)?);
+    let source = open_absolute_regular(&book.path)?;
+    let before = secure_fs::snapshot(&source)?;
     let hash = copy_and_hash(source, Some(&mut destination), cancel)?;
     destination.sync_all()?;
     if hash != book.file.file.sha256 || destination.metadata()?.len() != book.file.file.size_bytes {
@@ -1101,37 +1068,31 @@ fn copy_usb_at(
             "Transfer source changed during copying".into(),
         ));
     }
-    let after = fs::symlink_metadata(&book.path)?;
-    if !same_file(&before, &after) {
-        return Err(AppError::Conflict("Transfer source was replaced".into()));
-    }
+    let reopened_source = open_absolute_regular(&book.path)
+        .map_err(|_| AppError::Conflict("Transfer source was replaced".into()))?;
+    before.verify(&reopened_source)?;
+    drop(reopened_source);
     revalidate()?;
-    let current_root = File::from(open_absolute_directory(root_path)?).metadata()?;
-    if identity.dev() != current_root.dev() || identity.ino() != current_root.ino() {
+    if identity != open_absolute_directory(root_path)?.identity()? {
         return Err(AppError::Conflict(
             "Device root changed before publication".into(),
         ));
     }
     check_cancel(cancel)?;
     let parent_path = root_path.join(components[..components.len() - 1].join("/"));
-    let expected_parent = stage.parent.metadata()?;
-    let reopened_parent = File::from(open_absolute_directory(&parent_path)?).metadata()?;
-    if expected_parent.dev() != reopened_parent.dev()
-        || expected_parent.ino() != reopened_parent.ino()
-    {
+    let expected_parent = stage.parent.identity()?;
+    if expected_parent != open_absolute_directory(&parent_path)?.identity()? {
         return Err(AppError::Conflict(
             "Device destination folder changed before publication".into(),
         ));
     }
-    match renameat_with(
-        &stage.parent,
-        stage.temporary_name.as_str(),
-        &stage.parent,
-        *filename,
-        RenameFlags::NOREPLACE,
-    ) {
-        Ok(()) => {}
-        Err(Errno::EXIST) => {
+    match stage.parent.publish_noreplace(
+        &destination,
+        OsStr::new(&stage.temporary_name),
+        OsStr::new(filename),
+    )? {
+        PublishResult::Published => {}
+        PublishResult::AlreadyExists => {
             if existing_hash(&stage.parent, filename)?.as_deref()
                 == Some(book.file.file.sha256.as_str())
             {
@@ -1144,21 +1105,12 @@ fn copy_usb_at(
                 "Device destination appeared during transfer".into(),
             ));
         }
-        Err(Errno::INVAL | Errno::NOSYS | Errno::OPNOTSUPP) => {
-            return Err(AppError::Unsupported(
-                "Device filesystem cannot publish atomically without overwriting".into(),
-            ));
-        }
-        Err(error) => return Err(std::io::Error::from(error).into()),
     }
-    let published = destination.metadata()?;
-    stage.published = Some((filename.to_string(), published.dev(), published.ino()));
-    stage.parent.sync_all()?;
+    stage.published = Some((filename.to_string(), secure_fs::identity(&destination)?));
+    stage.parent.sync()?;
     revalidate()?;
-    let reopened_parent = File::from(open_absolute_directory(&parent_path)?).metadata()?;
-    if expected_parent.dev() != reopened_parent.dev()
-        || expected_parent.ino() != reopened_parent.ino()
-    {
+    check_cancel(cancel)?;
+    if expected_parent != open_absolute_directory(&parent_path)?.identity()? {
         return Err(AppError::Conflict(
             "Device destination folder changed during publication".into(),
         ));
@@ -1168,47 +1120,39 @@ fn copy_usb_at(
 }
 
 struct UsbStage {
-    parent: File,
+    parent: SecureDir,
     temporary_name: String,
-    published: Option<(String, u64, u64)>,
+    temporary_identity: Option<FileIdentity>,
+    published: Option<(String, FileIdentity)>,
     committed: bool,
 }
 impl Drop for UsbStage {
     fn drop(&mut self) {
         if !self.committed
-            && let Some((name, device, inode)) = &self.published
-            && let Ok(file) = openat(
-                &self.parent,
-                name.as_str(),
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            && File::from(file)
-                .metadata()
-                .is_ok_and(|metadata| metadata.dev() == *device && metadata.ino() == *inode)
+            && let Some((name, identity)) = &self.published
         {
-            let _ = unlinkat(&self.parent, name.as_str(), AtFlags::empty());
+            let _ = self.parent.remove_if_identity(OsStr::new(name), *identity);
         }
-        let _ = unlinkat(&self.parent, self.temporary_name.as_str(), AtFlags::empty());
+        if let Some(identity) = self.temporary_identity {
+            let _ = self
+                .parent
+                .remove_if_identity(OsStr::new(&self.temporary_name), identity);
+        }
     }
 }
 
-fn existing_hash(parent: &File, name: &str) -> Result<Option<String>> {
-    let fd = match openat(
-        parent,
-        name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(Errno::NOENT) => return Ok(None),
-        Err(error) => return Err(std::io::Error::from(error).into()),
+fn existing_hash(parent: &SecureDir, name: &str) -> Result<Option<String>> {
+    let file = match parent.open_regular(OsStr::new(name)) {
+        Ok(file) => file,
+        Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
     };
-    Ok(Some(copy_and_hash(
-        File::from(fd),
-        None,
-        &Arc::new(AtomicBool::new(false)),
-    )?))
+    let before = secure_fs::snapshot(&file)?;
+    let hash = copy_and_hash(file, None, &Arc::new(AtomicBool::new(false)))?;
+    before.verify(&parent.open_regular(OsStr::new(name))?)?;
+    Ok(Some(hash))
 }
 
 fn copy_and_hash(
@@ -1216,8 +1160,8 @@ fn copy_and_hash(
     mut destination: Option<&mut File>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<String> {
-    let before = source.metadata()?;
-    if !before.is_file() || before.len() > MAX_FILE_BYTES {
+    let before = secure_fs::snapshot(&source)?;
+    if before.size > MAX_FILE_BYTES {
         return Err(AppError::Unsupported(
             "Transfer requires a regular file up to 512 MiB".into(),
         ));
@@ -1242,7 +1186,7 @@ fn copy_and_hash(
             writer.write_all(&buffer[..count])?;
         }
     }
-    if copied != before.len() || !same_file(&before, &source.metadata()?) {
+    if copied != before.size || before.verify(&source).is_err() {
         return Err(AppError::Conflict(
             "Transfer source changed during reading".into(),
         ));
@@ -1250,53 +1194,26 @@ fn copy_and_hash(
     Ok(hex_digest(digest.finalize().as_slice()))
 }
 
-fn open_absolute_directory(path: &Path) -> Result<OwnedFd> {
+fn open_absolute_directory(path: &Path) -> Result<SecureDir> {
     if !path.is_absolute() {
         return Err(AppError::InvalidInput(
             "Transfer root must be absolute".into(),
         ));
     }
-    let mut parent = open(
-        "/",
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(std::io::Error::from)?;
-    for component in path.components() {
-        match component {
-            Component::RootDir => {}
-            Component::Normal(name) => {
-                parent = openat(
-                    &parent,
-                    name,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .map_err(std::io::Error::from)?;
-            }
-            _ => return Err(AppError::InvalidInput("Unsafe transfer root path".into())),
-        }
-    }
-    Ok(parent)
+    SecureDir::open(path, false, AccessPolicy::Shared)
 }
 
-fn open_absolute_regular(path: &Path) -> Result<OwnedFd> {
-    let directory = path
+fn open_absolute_regular(path: &Path) -> Result<File> {
+    let absolute = secure_fs::absolute_path(path)?;
+    let directory = absolute
         .parent()
         .ok_or_else(|| AppError::InvalidInput("Missing source parent".into()))?;
-    let name = path
+    let name = absolute
         .file_name()
         .ok_or_else(|| AppError::InvalidInput("Missing source filename".into()))?;
     let parent = open_absolute_directory(directory)?;
-    let file = openat(
-        &parent,
-        name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(std::io::Error::from)?;
-    let metadata = File::from(file.try_clone()?).metadata()?;
-    if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
+    let file = parent.open_regular(name)?;
+    if secure_fs::snapshot(&file)?.size > MAX_FILE_BYTES {
         return Err(AppError::Unsupported(
             "Transfer source must be a regular file up to 512 MiB".into(),
         ));
@@ -1770,16 +1687,6 @@ fn check_cancel(cancel: &Arc<AtomicBool>) -> Result<()> {
         Ok(())
     }
 }
-fn same_file(before: &fs::Metadata, after: &fs::Metadata) -> bool {
-    after.is_file()
-        && before.dev() == after.dev()
-        && before.ino() == after.ino()
-        && before.len() == after.len()
-        && before.mtime() == after.mtime()
-        && before.mtime_nsec() == after.mtime_nsec()
-        && before.ctime() == after.ctime()
-        && before.ctime_nsec() == after.ctime_nsec()
-}
 fn digest_bytes(bytes: &[u8]) -> String {
     hex_digest(Sha256::digest(bytes).as_slice())
 }
@@ -1807,9 +1714,27 @@ fn metadata_from_book(book: &Book) -> BookMetadata {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn link_directory(source: &Path, target: &Path) {
+        #[cfg(unix)]
+        symlink(source, target).unwrap();
+        #[cfg(windows)]
+        {
+            // Junction creation does not require the symlink privilege and
+            // exercises a real reparse point on the Windows NTFS runner.
+            let output = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(target)
+                .arg(source)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "junction fixture creation failed");
+        }
+    }
 
     struct Fixture {
         _temporary: TempDir,
@@ -1820,7 +1745,9 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let temporary = tempfile::tempdir().unwrap();
+            let temporary = tempfile::Builder::new()
+                .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
+                .unwrap();
             let database = Database::new(&temporary.path().join("profile")).unwrap();
             let storage = Storage::new(&temporary.path().join("library")).unwrap();
             let repository = BookRepository::new(database.clone());
@@ -1954,14 +1881,67 @@ mod tests {
             Err(AppError::Cancelled)
         ));
         let link = fixture._temporary.path().join("linked-card");
-        symlink(&root, &link).unwrap();
+        link_directory(&root, &link);
         assert!(copy_usb_at(&link, &book, &Arc::new(AtomicBool::new(false)), || Ok(())).is_err());
         let outside = fixture._temporary.path().join("outside");
         fs::create_dir(&outside).unwrap();
         fs::remove_dir_all(root.join("Books")).unwrap();
-        symlink(&outside, root.join("Books")).unwrap();
+        link_directory(&outside, &root.join("Books"));
         assert!(copy_usb_at(&root, &book, &Arc::new(AtomicBool::new(false)), || Ok(())).is_err());
         assert_eq!(fs::read_dir(outside).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn cancellation_after_publication_rolls_back_only_the_new_usb_file() {
+        let fixture = Fixture::new();
+        let book = fixture.book("book-publish-cancel", b"Book text", BookFormat::Txt);
+        let root = fixture.card();
+        let target = root.join(&book.relative_path);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = copy_usb_at(&root, &book, &cancel, || {
+            if target.exists() {
+                cancel.store(true, Ordering::Release);
+            }
+            Ok(())
+        });
+        assert!(matches!(result, Err(AppError::Cancelled)));
+        assert!(!target.exists());
+        assert_eq!(fs::read_dir(target.parent().unwrap()).unwrap().count(), 0);
+        assert_eq!(
+            Storage::hash_file(&book.path).unwrap(),
+            book.file.file.sha256
+        );
+    }
+
+    #[test]
+    fn usb_cleanup_preserves_a_replacement_with_a_different_identity() {
+        let fixture = Fixture::new();
+        let root = fixture.card();
+        let parent = open_absolute_directory(&root).unwrap();
+        let mut file = parent
+            .create_new(OsStr::new("published"), AccessPolicy::Shared)
+            .unwrap();
+        file.write_all(b"owned temporary book").unwrap();
+        let identity = secure_fs::identity(&file).unwrap();
+        drop(file);
+        let stage = UsbStage {
+            parent,
+            temporary_name: "stage".into(),
+            temporary_identity: Some(identity),
+            published: Some(("published".into(), identity)),
+            committed: false,
+        };
+        fs::rename(root.join("published"), root.join("original-published")).unwrap();
+        fs::write(root.join("published"), b"external replacement").unwrap();
+        drop(stage);
+        assert_eq!(
+            fs::read(root.join("published")).unwrap(),
+            b"external replacement"
+        );
+        assert_eq!(
+            fs::read(root.join("original-published")).unwrap(),
+            b"owned temporary book"
+        );
     }
 
     #[test]

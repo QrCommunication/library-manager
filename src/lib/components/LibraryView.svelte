@@ -8,13 +8,15 @@
 
 <script lang="ts">
   import { onDestroy, untrack } from 'svelte';
-  import { ArrowDownWideNarrow, BookOpen, Check, ChevronLeft, ChevronRight, Grid2X2, Heart, ListFilter, NotebookText, Plus, RefreshCw, Star, Table2, Tablet, X } from '@lucide/svelte';
+  import { ArrowDownWideNarrow, BookOpen, ChevronLeft, ChevronRight, Grid2X2, Heart, ListFilter, NotebookText, Plus, RefreshCw, Star, Table2, Tablet, X } from '@lucide/svelte';
   import { isPreview, normalizePublicError, request } from '../api';
   import { defaultQuery } from '../contracts';
   import type { AppError, Book, BookFormat, BookPage, BookQuery, BookSort, Device, Job, LibraryFacets } from '../contracts';
   import { formatDate, formatSize, locale, t } from '../i18n';
   import { createRequestScheduler } from '../request-scheduler';
   import DeviceOnlyBooks from './DeviceOnlyBooks.svelte';
+  import SelectionActions from './SelectionActions.svelte';
+  import type { MetadataDisabledReason } from '../selection-capabilities';
 
   interface Props {
     initialQuery: BookQuery;
@@ -35,9 +37,15 @@
     onStateChange?: (state: LibraryViewState) => void;
     onOpenAssistant?: () => void;
     onVerifySelected?: () => void;
+    metadataReady?: boolean;
+    metadataDisabledReason?: MetadataDisabledReason | null;
+    transferReady?: boolean;
+    onTransferSelected?: (initialDeviceId?: string) => void;
+    onRemoveSelected?: () => void;
+    onOpenSettings?: () => void;
   }
 
-  let { initialQuery, initialState = null, search, groupBy, refreshVersion, selectedBookIds, importing, devices = [], jobs = [], onSelectionChange, onOpenBook, onReadBook, onImport, onNotify, onError, onStateChange, onOpenAssistant, onVerifySelected }: Props = $props();
+  let { initialQuery, initialState = null, search, groupBy, refreshVersion, selectedBookIds, importing, devices = [], jobs = [], onSelectionChange, onOpenBook, onReadBook, onImport, onNotify, onError, onStateChange, onOpenAssistant, onVerifySelected, metadataReady = false, metadataDisabledReason = null, transferReady = false, onTransferSelected, onRemoveSelected, onOpenSettings }: Props = $props();
   type FacetField = 'authors' | 'series' | 'genres' | 'tags' | 'languages' | 'formats';
   type ScalarFilter = 'deviceId' | 'onDevice' | 'readStatus' | 'favorite' | 'metadataStatus' | 'missingCover' | 'minSizeBytes' | 'maxSizeBytes';
   interface ActiveChip { field: FacetField | ScalarFilter; value: string | null; label: string }
@@ -66,10 +74,10 @@
 
   const items = $derived(page?.items ?? []);
   const total = $derived(page?.total ?? 0);
-  const proposalBookIds = $derived.by(() => new Set(jobs.filter((job) => job.kind === 'enrich' && job.status === 'completed').map(completedProposalBookId).filter((id): id is string => id !== null)));
+  const proposalJobs = $derived(jobs.filter((job) => completedProposalBookId(job) !== null));
+  const proposalBookIds = $derived.by(() => new Set(proposalJobs.map(completedProposalBookId).filter((id): id is string => id !== null)));
   const allVisibleSelected = $derived(items.length > 0 && items.every((book) => selectedBookIds.includes(book.id)));
   const someVisibleSelected = $derived(items.some((book) => selectedBookIds.includes(book.id)));
-  const selectionActionsDisabled = $derived(isPreview() || selectedBookIds.length === 0 || selectedBookIds.length > 200);
   const titleKey = $derived(groupBy === 'author' ? 'filters.authors' : groupBy === 'series' ? 'filters.series' : groupBy === 'genre' ? 'filters.genres' : query.favorite === true ? 'sidebar.favorites' : query.readStatus === 'reading' ? 'sidebar.reading' : 'library.title');
   const numberFormatter = $derived(new Intl.NumberFormat($locale));
   const percentFormatter = $derived(new Intl.NumberFormat($locale, { style: 'percent', maximumFractionDigits: 0 }));
@@ -192,6 +200,12 @@
     const record = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
     const strings = (value: unknown): value is string[] => Array.isArray(value) && value.every((item) => typeof item === 'string');
     const confidence = (value: unknown): boolean => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
+    if (job.kind !== 'enrich' || job.status !== 'completed') return null;
+    if (record(job.result) && 'review' in job.result) {
+      const review = job.result.review;
+      if (!record(review) || review.state !== 'pending' || typeof review.reviewRevision !== 'number'
+        || !Number.isSafeInteger(review.reviewRevision) || review.reviewRevision < 0) return null;
+    }
     const candidate = record(job.result) && 'proposal' in job.result ? job.result.proposal : job.result;
     if (!record(candidate) || typeof candidate.bookId !== 'string' || !job.bookIds.includes(candidate.bookId)
       || !record(candidate.patch) || !confidence(candidate.confidence) || !strings(candidate.warnings)
@@ -215,16 +229,36 @@
     return candidate.bookId;
   }
 
+  function hasCurrentProposal(book: Book): boolean {
+    return proposalJobs.some((job) => {
+      const result = job.result;
+      const candidate = typeof result === 'object' && result !== null && !Array.isArray(result) && 'proposal' in result ? result.proposal : result;
+      if (typeof candidate !== 'object' || candidate === null || Array.isArray(candidate)
+        || !('bookId' in candidate) || candidate.bookId !== book.id) return false;
+      if (typeof result === 'object' && result !== null && !Array.isArray(result) && 'review' in result) {
+        const review = result.review;
+        return typeof review === 'object' && review !== null && !Array.isArray(review)
+          && 'reviewRevision' in review && review.reviewRevision === book.revision;
+      }
+      return book.metadataStatus === 'needsReview';
+    });
+  }
+
   async function openReview(): Promise<void> {
     if (reviewLoading || disposed) return;
     reviewLoading = true;
     try {
-      const visiblePendingIds = new Set(items.filter((book) => book.metadataStatus === 'needsReview').map((book) => book.id));
+      const visiblePendingIds = new Set(items.filter(hasCurrentProposal).map((book) => book.id));
       const ids = [...proposalBookIds].sort((left, right) => Number(visiblePendingIds.has(right)) - Number(visiblePendingIds.has(left)));
       for (const id of ids) {
-        const current = await request('book_get', { id });
+        let current: Book;
+        try { current = await request('book_get', { id }); }
+        catch (error) {
+          if (normalizePublicError(error).code === 'notFound') continue;
+          throw error;
+        }
         if (disposed) return;
-        if (current.metadataStatus === 'needsReview') { onOpenBook(current); return; }
+        if (hasCurrentProposal(current)) { onOpenBook(current); return; }
       }
       if (!disposed) onNotify($t('library.noReviewProposals'));
     } catch (error) {
@@ -341,17 +375,9 @@
   {/if}
 
   {#if chips.length > 0}<div class="active-filters" aria-label={$t('filters.active', { count: chips.length })}>{#each chips as chip (`${chip.field}:${chip.value}`)}<button class="filter-chip active" aria-label={`${$t('actions.remove')} : ${chip.label}`} onclick={() => removeChip(chip)}><span>{chip.label}</span><X size={14} aria-hidden="true" /></button>{/each}<button class="button ghost" onclick={resetFilters}>{$t('filters.clear')}</button></div>{/if}
-  {#if selectedBookIds.length > 0}
-    <div class="selection-bar">
-      <div class="row"><Check size={17} aria-hidden="true" /><strong>{$t('library.selectedCount', { count: selectedBookIds.length })}</strong></div>
-      <div class="selection-actions">
-        <button class="button secondary" disabled={selectionActionsDisabled || !onOpenAssistant} onclick={() => { if (!selectionActionsDisabled) onOpenAssistant?.(); }}><BookOpen size={16} aria-hidden="true" />{$t('sidebar.chat')}</button>
-        <button class="button primary" disabled={selectionActionsDisabled || !onVerifySelected} onclick={() => { if (!selectionActionsDisabled) onVerifySelected?.(); }}><NotebookText size={16} aria-hidden="true" />{$t('library.verifySelected')}</button>
-        <button class="button ghost" onclick={() => onSelectionChange([])}><X size={16} aria-hidden="true" />{$t('library.clearSelection')}</button>
-      </div>
-      {#if selectedBookIds.length > 200}<span class="small">{$t('library.selectionLimit', { count: 200 })}</span>{/if}
-    </div>
-  {/if}
+  <SelectionActions selectedCount={selectedBookIds.length} {metadataReady} {metadataDisabledReason} {transferReady}
+    demo={isPreview()} busy={importing} {onOpenAssistant} {onVerifySelected} {onTransferSelected} {onRemoveSelected}
+    {onOpenSettings} onClearSelection={() => onSelectionChange([])} />
 
   {#if failure}
     <div class="error-banner" role="alert"><span class="grow">{$t(`errors.${failure.code}`)}</span><button class="button ghost" onclick={() => { retryVersion += 1; }}><RefreshCw size={16} aria-hidden="true" />{$t('actions.retry')}</button></div>
@@ -376,7 +402,7 @@
               {#if book.series}<p class="series-line truncate" title={seriesLabel(book)}>{seriesLabel(book)}</p>{/if}
               <div class="book-meta"><span>{book.format.toUpperCase()} · {formatSize(book.sizeBytes)}</span><span class="row flags">{#if book.favorite}<Heart size={13} fill="currentColor" aria-label={$t('sidebar.favorites')} />{/if}{#if book.notes}<NotebookText size={13} aria-label={$t('book.notes')} title={book.notes} />{/if}{#if book.rating !== null}<Star size={12} aria-label={$t('book.rating')} /><span>{numberFormatter.format(book.rating)}</span>{/if}</span></div>
               <div class="book-badges">{#if book.onDeviceIds.length > 0}<span class="badge accent" title={devicesLabel(book)}><Tablet size={12} aria-hidden="true" />{$t('library.onDevice')}</span>{/if}{#if book.metadataStatus === 'needsReview' || book.metadataStatus === 'failed'}<span class="badge" class:warning={book.metadataStatus === 'needsReview'} class:danger={book.metadataStatus === 'failed'}>{$t(`book.${book.metadataStatus}`)}</span>{/if}</div>
-              {#if book.metadataStatus === 'needsReview' && proposalBookIds.has(book.id)}<button class="button secondary review-action" aria-label={`${$t('library.reviewProposal')} : ${book.title}`} onclick={() => onOpenBook(book)}><NotebookText size={15} aria-hidden="true" />{$t('library.reviewProposal')}</button>{/if}
+              {#if hasCurrentProposal(book)}<button class="button secondary review-action" aria-label={`${$t('library.reviewProposal')} : ${book.title}`} onclick={() => onOpenBook(book)}><NotebookText size={15} aria-hidden="true" />{$t('library.reviewProposal')}</button>{/if}
               {#if book.readStatus !== 'unread'}<div class="reading-progress"><progress max="1" value={book.readingProgress} aria-label={$t('reader.progress', { progress: progressLabel(book) })}></progress><span>{progressLabel(book)}</span></div>{/if}
             </article>
           {/each}
@@ -394,7 +420,7 @@
           <th scope="col">{$t('filters.device')}</th><th scope="col"><span class="sr-only">{$t('actions.read')}</span></th>
         </tr></thead><tbody>{#each group.books as book (book.id)}<tr class:on-device={book.onDeviceIds.length > 0}>
           <td><label class="table-check"><input type="checkbox" checked={selectedBookIds.includes(book.id)} aria-label={book.title} onchange={() => toggleSelection(book.id)} /></label></td>
-          <td><button class="table-book" onclick={() => onOpenBook(book)}>{#if coverSource(book)}<img class="table-cover" src={coverSource(book) ?? ''} alt="" loading="lazy" onerror={() => { failedCoverIds = [...failedCoverIds, book.id]; }} />{/if}<span class="table-title">{book.title}{#if book.favorite}<Heart size={12} fill="currentColor" aria-label={$t('sidebar.favorites')} />{/if}</span></button>{#if book.metadataStatus === 'needsReview' && proposalBookIds.has(book.id)}<button class="button secondary review-action" aria-label={`${$t('library.reviewProposal')} : ${book.title}`} onclick={() => onOpenBook(book)}><NotebookText size={15} aria-hidden="true" />{$t('library.reviewProposal')}</button>{/if}</td>
+          <td><button class="table-book" onclick={() => onOpenBook(book)}>{#if coverSource(book)}<img class="table-cover" src={coverSource(book) ?? ''} alt="" loading="lazy" onerror={() => { failedCoverIds = [...failedCoverIds, book.id]; }} />{/if}<span class="table-title">{book.title}{#if book.favorite}<Heart size={12} fill="currentColor" aria-label={$t('sidebar.favorites')} />{/if}</span></button>{#if hasCurrentProposal(book)}<button class="button secondary review-action" aria-label={`${$t('library.reviewProposal')} : ${book.title}`} onclick={() => onOpenBook(book)}><NotebookText size={15} aria-hidden="true" />{$t('library.reviewProposal')}</button>{/if}</td>
           <td>{book.authors.join(', ')}</td><td>{seriesLabel(book)}</td><td>{book.genres.map(genreName).join(', ')}</td><td>{book.language.toUpperCase()}</td><td><span class="badge">{book.format.toUpperCase()}</span></td><td>{formatSize(book.sizeBytes)}</td><td>{progressLabel(book)}</td><td>{formatDate(book.addedAt)}</td><td>{#if book.onDeviceIds.length > 0}<span class="badge accent" title={devicesLabel(book)}><Tablet size={12} aria-hidden="true" />{$t('filters.present')}</span>{:else}<span class="muted">—</span>{/if}</td><td><button class="icon-button" aria-label={`${$t('actions.read')} : ${book.title}`} onclick={() => onReadBook(book)}><BookOpen size={18} aria-hidden="true" /></button></td>
         </tr>{/each}</tbody></table></div>
       {/if}
@@ -406,8 +432,6 @@
 
 <style>
   .sort-select { width: auto; min-width: 155px; }
-  .selection-bar { flex-wrap: wrap; gap: 12px; }
-  .selection-actions { display: flex; flex-wrap: wrap; gap: 8px; }
   .review-action { margin-top: 8px; }
   .facet-field { min-width: 0; margin: 0; padding: 0; border: 0; }
   .facet-field legend { padding: 0; margin-bottom: 10px; color: var(--text-muted); font-size: 12px; font-weight: 650; }

@@ -1,5 +1,7 @@
 # Library Manager — plan de livraison
 
+Le suivi actuel de la version 0.2.1 figure dans [RELEASE_0.2.1_PLAN.md](RELEASE_0.2.1_PLAN.md), avec le [guide utilisateur](USER_GUIDE.md), l’[architecture actuelle](BLUEPRINT.md) et les [preuves de validation](QUALITY.md) ; les nombres et livraisons ci-dessous constituent l’historique des premières versions.
+
 Session : library-manager-20261009. Source : demande de Rony.
 
 Application Linux autonome : aucun Calibre externe à installer. GPL-3.0, dépôt public QrCommunication/library-manager.

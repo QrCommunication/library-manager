@@ -4,9 +4,11 @@
 Start tauri-driver with the same XDG_DATA_HOME as --profile-root, inside a
 network-isolated namespace/container. The caller owns that isolation: a client
 cannot change an already running driver's environment. Never pass a user profile.
-Enrichment jobs must wait for configuration. The permission check temporarily
-uses a non-persistent synthetic key before those jobs exist; external network
-isolation is mandatory and the settings/key are restored afterwards.
+Provider-dependent actions must be disabled without configuration. Permission
+and catalogue checks temporarily use a non-persistent synthetic key; external
+network isolation is mandatory and settings/keys are restored afterwards.
+The catalogue fixture seeds completed results only after stopping the app,
+inside the newly created synthetic profile. It never edits a user database.
 """
 
 import argparse
@@ -16,6 +18,7 @@ import os
 from pathlib import Path
 import sqlite3
 import tempfile
+import uuid
 
 
 spec = importlib.util.spec_from_file_location("native_smoke", Path(__file__).with_name("native-smoke.py"))
@@ -26,8 +29,8 @@ require = native.require
 checked = native.checked
 REVIEW_BOOK_ID = "9c9928f9-afc6-44a2-90aa-980f1262edfb"
 REVIEW_JOB_ID = "dd7b0ba9-e12d-464e-8975-6207d13f103a"
-VERIFY_SELECTED = ".selected-books .spread > .row > button.button.secondary"
-CHOOSE_BOOKS = ".selected-books .spread > .row > button.button.ghost"
+VERIFY_SELECTED = ".selected-books .selection-actions button.button.primary"
+CHOOSE_BOOKS = ".selected-books .spread > button.button.ghost"
 
 
 def review_profile(value):
@@ -273,6 +276,14 @@ def persisted_chat_payloads(profile, job_ids):
     return [found[identifier] for identifier in job_ids]
 
 
+def reload_ui(driver, count, select=False):
+    driver.execute("window.__fixtureReloadPending=true; setTimeout(()=>location.reload(),0); return true;")
+    driver.wait(lambda: driver.execute("return window.__fixtureReloadPending!==true && document.querySelectorAll('.book-grid .book-card').length===arguments[0] && !!document.querySelector('#library-sort');", [count]), "fixtureUiReloadMissing")
+    if select:
+        click(driver, ".toolbar input[type=checkbox]", "fixtureSelectPageMissing")
+        driver.wait(lambda: driver.execute("return document.querySelectorAll('.selection-control input:checked').length===arguments[0];", [count]), "fixtureSelectionMissing")
+
+
 def consumed_permission_smoke(driver, profile, report):
     """Exercise real UI/IPC with a synthetic key in the isolated offline profile."""
     real_settings = driver.invoke("settings_get")
@@ -294,8 +305,7 @@ def consumed_permission_smoke(driver, profile, report):
         temporary_settings = {**real_settings, "providerId": provider_id,
                               "modelId": "MiniMax-M2.7", "autoEnrich": False, "webEnabled": False}
         driver.invoke("settings_save", {"settings": temporary_settings})
-        navigate(driver, False)
-        driver.wait(lambda: driver.execute("return document.querySelectorAll('.book-grid .book-card').length===33;"), "permissionFixtureLibraryRemountMissing")
+        reload_ui(driver, 33, select=True)
         navigate(driver, True)
         driver.wait(lambda: driver.execute("return !document.querySelector('.configuration-hint');"), "permissionUiFixtureNotReady")
         checkbox = ".chat-composer input[type=checkbox]"
@@ -376,8 +386,7 @@ def consumed_permission_smoke(driver, profile, report):
     require(driver.invoke("settings_get") == real_settings, "permissionFixtureChangedBackendSettings")
     require(not any(provider["id"] == provider_id and provider["configured"]
                     for provider in driver.invoke("providers_list")), "permissionSyntheticSecretNotCleared")
-    navigate(driver, False)
-    driver.wait(lambda: driver.execute("return document.querySelectorAll('.book-grid .book-card').length===33;"), "permissionFixtureRestoreLibraryMissing")
+    reload_ui(driver, 33, select=True)
     navigate(driver, True)
     driver.wait(lambda: driver.execute("return !!document.querySelector('.configuration-hint');"), "permissionRealConfigurationNotRestored")
 
@@ -445,17 +454,17 @@ def smoke(driver, binary, profile, report):
             driver.wait(lambda: (state if (state := title_field(driver)) and not state["conflict"] and state["value"] == remote["title"] and state["notes"] == remote_notes else False), "explicitReloadDidNotClearDraft")
             click(driver, ".drawer-header button", "bookPanelCloseMissing")
 
-        with checked(report, "33SelectedBooksHaveUnblockedBulkAnalysis"):
+        with checked(report, "33SelectedBooksRetainAssistantAccessWithoutProvider"):
             script = "const done=arguments[arguments.length-1]; (async()=>{ const nodes=[...document.querySelectorAll('.selection-control input[type=checkbox]')]; for(const node of nodes){ if(!node.checked) node.click(); await new Promise(r=>setTimeout(r,0)); } done({count:nodes.length,checked:nodes.filter(n=>n.checked).length}); })().catch(()=>done({error:true}));"
             selection = driver.request("POST", driver.endpoint("/execute/async"), {"script": script, "args": []})
             require(selection.get("checked") == 33, "selectionDidNotInclude33Books")
-            require(driver.execute("const assistant=document.querySelector('.selection-actions button.button.secondary');const verify=document.querySelector('.selection-actions button.button.primary');return !!assistant && !assistant.disabled && !!verify && !verify.disabled;"), "librarySelectionActionsMissing")
+            require(driver.execute("const assistant=document.querySelector('.selection-actions button.button.secondary');const verify=document.querySelector('.selection-actions button.button.primary');return !!assistant && !assistant.disabled && !!verify && verify.disabled;"), "librarySelectionActionsMissing")
             click(driver, ".toolbar button[aria-controls=library-facets]", "libraryFiltersButtonMissing")
             require(driver.execute("const sort=document.querySelector('#library-sort');const read=document.querySelector('#filter-read');if(!sort||!read)return false;sort.value='updated';sort.dispatchEvent(new Event('change',{bubbles:true}));read.value='unread';read.dispatchEvent(new Event('change',{bubbles:true}));return true;"), "libraryPreservationControlsMissing")
             driver.wait(lambda: (state if (state := library_view_state(driver)) and state["sort"] == "updated" and state["readStatus"] == "unread" and len(state["orderedTitles"]) == 33 else False), "libraryPreservationStateDidNotLoad")
             library_before = library_view_state(driver)
             click(driver, ".selection-actions button.button.secondary", "libraryAssistantActionMissing")
-            driver.wait(lambda: driver.execute("return document.querySelectorAll('.selected-book-list .source-chip').length===33 && !!document.querySelector('.selected-books .spread > .row > button.button.secondary') && !document.querySelector('.selected-books .spread > .row > button.button.secondary').disabled;"), "bulkAnalysisBlockedAt33Books")
+            driver.wait(lambda: driver.execute("return document.querySelectorAll('.selected-book-list .source-chip').length===33 && !!document.querySelector('.selected-books .selection-actions button.button.primary') && document.querySelector('.selected-books .selection-actions button.button.primary').disabled;"), "bulkAnalysisBlockedAt33Books")
             require(driver.execute("return document.querySelector('.chat-composer input[type=checkbox]')?.checked===false && !document.querySelector('.context-overflow');"), "assistantPermissionOrContextLimitIncorrect")
             click(driver, CHOOSE_BOOKS, "assistantChooseBooksMissing")
             driver.wait(lambda: library_view_state(driver) == library_before, "assistantReturnDiscardedLibraryState")
@@ -471,20 +480,13 @@ def smoke(driver, binary, profile, report):
         with checked(report, "acceptedNativeSendConsumesPermissionForOneRequest"):
             consumed_permission_smoke(driver, profile, report)
 
-        with checked(report, "bulkAnalysisEnqueues33OfflineJobsWithoutDuplicates"):
+        with checked(report, "bulkAnalysisDisabledWithoutConfiguredProvider"):
             require(not enrich_jobs(), "unexpectedPreexistingEnrichmentJobs")
-            click(driver, CHOOSE_BOOKS, "bulkChooseBooksMissing")
-            driver.wait(lambda: driver.execute("return document.querySelectorAll('.book-grid .book-card').length===33 && !!document.querySelector('.selection-actions button.button.primary');"), "bulkLibraryDidNotReturn")
-            click(driver, ".selection-actions button.button.primary", "libraryVerifyActionMissing")
-            jobs = driver.wait(lambda: (jobs if len(jobs := enrich_jobs()) == 33 and all(job["status"] == "waitingForConfiguration" for job in jobs) else False), "bulkJobsDidNotWaitForConfiguration")
-            require({identifier for job in jobs for identifier in job["bookIds"]} == {book["id"] for book in books}, "bulkJobsOmittedSelectedBooks")
-            driver.wait(lambda: driver.execute("return document.querySelector('.selected-books .spread > .row > button.button.secondary')?.disabled===false;"), "bulkAnalysisDidNotSettle")
-            original_ids = {job["id"] for job in jobs}
-            click(driver, ".selected-books .spread > .row > button.button.secondary", "repeatBulkAnalysisButtonMissing")
-            driver.wait(lambda: driver.execute("const node=document.querySelector('.selected-books [role=status]'); if(!node || document.querySelector('.selected-books .spread > .row > button.button.secondary')?.disabled) return false; const numbers=[...node.querySelectorAll('span')].map(n=>Number(n.textContent.match(/\\d+/)?.[0])); return numbers.length===3 && numbers[0]===0 && numbers[1]===33 && numbers[2]===0;"), "repeatBulkAnalysisDidNotSkipActiveJobs")
-            require({job["id"] for job in enrich_jobs()} == original_ids, "repeatBulkAnalysisCreatedDuplicateJobs")
-            report["enrichmentJobs"] = {"count": 33, "waitingForConfiguration": 33, "repeatCreated": 0,
-                                        "startedFromLibraryWithoutSecondClick": True}
+            driver.wait(lambda: driver.execute("return document.querySelector(arguments[0])?.disabled===true;", [VERIFY_SELECTED]), "unconfiguredBulkAnalysisWasEnabled")
+            click(driver, VERIFY_SELECTED, "disabledBulkAnalysisButtonMissing")
+            require(not enrich_jobs(), "disabledBulkAnalysisEnqueuedJob")
+            report["enrichmentJobs"] = {"count": 0, "disabledWithoutProvider": True,
+                                        "configuredOfflineQueueCoveredByCatalogueMode": True}
 
         with checked(report, "selectedBookChipOpensFreshBookPanel"):
             require(driver.execute("const node=[...document.querySelectorAll('.selected-book-list .source-chip')].find(n=>n.textContent.includes(arguments[0])); if(!node)return false; node.click(); return true;", [book["title"]]), "selectedBookChipMissing")
@@ -508,6 +510,314 @@ def smoke(driver, binary, profile, report):
             report["permissionReset"] = {"newConversation": True, "selectionNavigation": True}
 
 
+def navigate_index(driver, index):
+    require(driver.execute("const node=document.querySelectorAll('.nav-item')[arguments[0]]; if(!node)return false;node.click();return true;", [index]), "catalogueNavigationMissing")
+
+
+def stored_bytes(root):
+    hashes = {}
+    for path in root.rglob("*"):
+        require(not path.is_symlink(), "catalogueFixtureStorageSymlink")
+        if path.is_file():
+            require(path.resolve(strict=True).is_relative_to(root), "catalogueFixtureStorageEscape")
+            hashes[str(path.relative_to(root))] = native.file_sha256(path)
+    return hashes
+
+
+def fixture_database(profile):
+    databases = []
+    for path in profile.rglob("*"):
+        if not path.is_file() or path.is_symlink():
+            continue
+        with path.open("rb") as stream:
+            if stream.read(16) != b"SQLite format 3\x00":
+                continue
+        require(path.resolve(strict=True).is_relative_to(profile), "catalogueFixtureDatabaseEscape")
+        connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            names = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if {"books", "jobs"}.issubset(names):
+                databases.append(path)
+        finally:
+            connection.close()
+    require(len(databases) == 1, "catalogueFixtureDatabaseAmbiguous")
+    return databases[0]
+
+
+def seed_catalogue_proposals(profile, books, queued_jobs):
+    """Only called on the fresh synthetic fixture after its application stops."""
+    marker = profile / ".native-catalogue-actions-fixture.json"
+    require(marker.is_file() and not marker.is_symlink(), "catalogueFixtureMarkerMissing")
+    recorded = json.loads(marker.read_text(encoding="utf-8"))
+    require(recorded.get("purpose") == "fresh-synthetic-catalogue-actions"
+            and recorded.get("bookIds") == [book["id"] for book in books], "catalogueFixtureMarkerMismatch")
+    connection = sqlite3.connect(fixture_database(profile), timeout=10)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        require(connection.execute("SELECT count(*) FROM books").fetchone()[0] == 2, "catalogueFixtureWasNotSynthetic")
+        for index, book in enumerate(books):
+            identifier = next(job["id"] for job in queued_jobs if job["bookIds"] == [book["id"]])
+            title = "Catalogue fixture reviewed title" if index == 0 else book["title"]
+            proposal = {"bookId": book["id"], "patch": {"title": title}, "confidence": 0.9,
+                        "warnings": [], "providerId": "minimax", "modelId": "offline-fixture",
+                        "evidence": [{"field": "title", "value": title, "confidence": 0.9, "sourceUrls": []}]}
+            result = {"proposal": proposal, "review": {"state": "pending",
+                      "sourceRevision": book["revision"], "reviewRevision": book["revision"]}}
+            changed = connection.execute("UPDATE books SET metadata_status='needsReview' WHERE id=? AND revision=?",
+                                         (book["id"], book["revision"])).rowcount
+            require(changed == 1, "catalogueFixtureRevisionChanged")
+            changed = connection.execute("UPDATE jobs SET status='completed',progress=1,result_json=?,error_json=NULL WHERE id=? AND kind='enrich' AND status='waitingForConfiguration'",
+                                         (json.dumps(result), identifier)).rowcount
+            require(changed == 1, "catalogueFixtureJobChanged")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def catalogue_removal_receipt(profile, expected_books):
+    """Read only the marked synthetic fixture after its application stops."""
+    marker = profile / ".native-catalogue-actions-fixture.json"
+    require(marker.is_file() and not marker.is_symlink(), "catalogueReceiptMarkerMissing")
+    require(marker.resolve(strict=True).is_relative_to(profile), "catalogueReceiptMarkerEscape")
+    recorded = json.loads(marker.read_text(encoding="utf-8"))
+    expected = sorted((book["bookId"], book["expectedRevision"]) for book in expected_books)
+    require(recorded.get("purpose") == "fresh-synthetic-catalogue-actions"
+            and len(expected) == 2 and len({identifier for identifier, _ in expected}) == 2
+            and set(recorded.get("bookIds", [])) == {identifier for identifier, _ in expected},
+            "catalogueReceiptFixtureMismatch")
+    connection = sqlite3.connect(fixture_database(profile).resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        require(connection.execute("SELECT count(*) FROM books").fetchone()[0] == 0,
+                "catalogueReceiptBooksNotRemoved")
+        rows = connection.execute("SELECT id,status,after_json FROM operations WHERE kind='catalogueRemove' ORDER BY id").fetchall()
+        require(len(rows) == 2, "catalogueReceiptOperationCountMismatch")
+        request_ids, removed_ids, operation_ids = set(), set(), set()
+        for identifier, status, encoded in rows:
+            receipt = json.loads(encoded)
+            require(isinstance(receipt, dict) and status == "applied", "catalogueReceiptNotApplied")
+            request_id = receipt.get("requestId")
+            try:
+                canonical_id = str(uuid.UUID(request_id))
+            except (ValueError, TypeError, AttributeError):
+                canonical_id = None
+            require(canonical_id is not None and canonical_id == request_id,
+                    "catalogueReceiptRequestIdInvalid")
+            require(receipt.get("books") == [list(selection) for selection in expected],
+                    "catalogueReceiptIntentMismatch")
+            book = receipt.get("book")
+            require(isinstance(book, dict)
+                    and (book.get("id"), book.get("revision")) in expected,
+                    "catalogueReceiptBookMismatch")
+            request_ids.add(request_id)
+            removed_ids.add(book["id"])
+            operation_ids.add(identifier)
+        require(len(request_ids) == 1 and len(operation_ids) == 2
+                and removed_ids == {identifier for identifier, _ in expected},
+                "catalogueReceiptBatchMismatch")
+        return {"requestId": request_ids.pop(),
+                "books": [{"bookId": identifier, "expectedRevision": revision}
+                          for identifier, revision in expected]}, operation_ids
+    finally:
+        connection.close()
+
+
+def undo_catalogue_operation(driver, operation_id, report):
+    """Retry an idempotent undo once only if the same native session is alive."""
+    try:
+        result = driver.invoke("operation_undo", {"id": operation_id})
+    except native.SmokeFailure as error:
+        if str(error) != "webdriverUnreachable":
+            raise
+        # The tauri-driver proxy can lose an HTTP connection after a session
+        # restart. Never recover by restarting a crashed application/session.
+        require(driver.execute("return document.readyState==='complete' && typeof window.__TAURI_INTERNALS__?.invoke==='function';") is True,
+                "catalogueUndoNativeSessionNotAlive")
+        current = next((operation for operation in driver.invoke("operations_list")
+                        if operation["id"] == operation_id), None)
+        require(current is not None and current["kind"] == "catalogueRemove"
+                and current["status"] in {"applied", "reverted"},
+                "catalogueUndoUncertainOperationState")
+        report.setdefault("catalogueUndoTransportRetries", []).append({
+            "sameNativeSessionAlive": True,
+            "observedOperationStatus": current["status"],
+            "retryCount": 1,
+        })
+        result = driver.invoke("operation_undo", {"id": operation_id})
+    require(result["status"] == "reverted", "catalogueUndoFailed")
+
+
+def catalogue_actions_smoke(driver, binary, profile, report):
+    """All writes and fixture SQL are confined to a new synthetic profile."""
+    with checked(report, "freshSyntheticCatalogueActionsProfile"):
+        driver.start(binary)
+        bootstrap = driver.invoke("app_bootstrap")
+        settings = driver.invoke("settings_get")
+        root = Path(settings["libraryRoot"]).resolve(strict=True)
+        require(root.is_relative_to(profile) and root != profile, "catalogueLibraryOutsidePrivateProfile")
+        require(driver.invoke("library_list", {"query": native.QUERY})["total"] == 0, "catalogueProfileNotEmpty")
+        settings.update({"language": "fr", "autoEnrich": False, "webEnabled": False,
+                         "providerId": None, "modelId": None, "maxConcurrentJobs": 1})
+        driver.invoke("settings_save", {"settings": settings})
+        with tempfile.TemporaryDirectory(prefix="library-manager-catalogue-synthetic-") as temporary:
+            paths = []
+            for index in range(2):
+                path = Path(temporary) / f"Catalogue fixture {index}.txt"
+                path.write_text(f"Catalogue fixture {index}\n\nSynthetic distinct text {index}.\n", encoding="utf-8")
+                paths.append(str(path))
+            driver.job(driver.invoke("import_books", {"paths": paths}))
+        books = driver.invoke("library_list", {"query": native.QUERY})["items"]
+        require(len(books) == 2, "catalogueFixtureImportCountMismatch")
+        marker = profile / ".native-catalogue-actions-fixture.json"
+        with marker.open("x", encoding="utf-8") as target:
+            os.chmod(marker, 0o600)
+            json.dump({"purpose": "fresh-synthetic-catalogue-actions", "bookIds": [book["id"] for book in books]}, target)
+        report["version"] = bootstrap["version"]
+        report["profileMode"] = "freshSyntheticCatalogueActions"
+        reload_ui(driver, 2, select=True)
+
+    with checked(report, "metadataDisabledAcrossAllLibraryViewsWithoutProvider"):
+        for index in range(8):
+            navigate_index(driver, index)
+            driver.wait(lambda: driver.execute("return !!document.querySelector('.selection-actions button.button.primary') && document.querySelector('.selection-actions button.button.primary').disabled;"), "unconfiguredMetadataActionEnabled")
+        navigate_index(driver, 0)
+        driver.wait(lambda: driver.execute("return document.querySelectorAll('.book-card').length===2;"), "catalogueLibraryDidNotReturn")
+        click(driver, ".book-cover", "catalogueBookMissing")
+        driver.wait(lambda: title_field(driver), "cataloguePanelMissing")
+        require(driver.execute("return document.querySelector('.operations button.button.secondary')?.disabled===true && !!document.querySelector('#book-metadata-hint');"), "unconfiguredPanelEnrichmentEnabled")
+        click(driver, ".drawer-header button", "cataloguePanelCloseMissing")
+        require(not any(job["kind"] == "enrich" for job in driver.invoke("jobs_list")), "disabledMetadataEnqueuedJob")
+        report["metadataReadiness"] = {"disabledViews": 8, "disabledBookPanel": True}
+
+    with checked(report, "configuredSyntheticProviderAllowsOfflineMetadataQueue"):
+        installed = False
+        try:
+            driver.invoke("provider_set_secret", {"id": "minimax", "secret": "synthetic-offline-catalogue-key", "persist": False})
+            installed = True
+            driver.invoke("settings_save", {"settings": {**settings, "providerId": "minimax", "modelId": "MiniMax-M2.7"}})
+            reload_ui(driver, 2, select=True)
+            driver.wait(lambda: driver.execute("return document.querySelector('.selection-actions button.button.primary')?.disabled===false;"), "configuredLibraryMetadataDisabled")
+            for index in (1, 2, 3, 4, 5, 6, 7):
+                navigate_index(driver, index)
+                driver.wait(lambda: driver.execute("return document.querySelector('.selection-actions button.button.primary')?.disabled===false;"), "configuredMetadataViewDisabled")
+            navigate_index(driver, 0)
+            driver.wait(lambda: driver.execute("return document.querySelectorAll('.book-card').length===2;"), "configuredLibraryMissing")
+            click(driver, ".book-cover", "configuredBookMissing")
+            driver.wait(lambda: title_field(driver), "configuredBookPanelMissing")
+            require(driver.execute("return document.querySelector('.operations button.button.secondary')?.disabled===false;"), "configuredPanelMetadataDisabled")
+            click(driver, ".drawer-header button", "configuredPanelCloseMissing")
+            before_jobs = {job["id"] for job in driver.invoke("jobs_list")}
+            click(driver, ".selection-actions button.button.primary", "configuredBulkActionMissing")
+            queued = driver.wait(lambda: (jobs if len(jobs := [job for job in driver.invoke("jobs_list") if job["kind"] == "enrich" and job["id"] not in before_jobs]) == 2 else False), "configuredBulkJobsMissing")
+            require({identifier for job in queued for identifier in job["bookIds"]} == {book["id"] for book in books}, "configuredBulkScopeMismatch")
+            for job in queued:
+                current = next(item for item in driver.invoke("jobs_list") if item["id"] == job["id"])
+                if current["status"] not in {"completed", "failed", "cancelled"}:
+                    driver.invoke("job_cancel", {"id": job["id"]})
+            driver.wait(lambda: all(job["status"] in {"completed", "failed", "cancelled"} for job in driver.invoke("jobs_list")), "offlineMetadataJobsDidNotSettle")
+            require(not any(job["kind"] == "enrich" and job["status"] == "completed" for job in driver.invoke("jobs_list")), "offlineProviderUnexpectedlyCompleted")
+            report["metadataReadiness"].update({"configuredViews": 8, "configuredBookPanel": True,
+                                                "nativeQueuedBooks": 2, "fixtureProviderOnly": True})
+        finally:
+            driver.invoke("settings_save", {"settings": settings})
+            if installed:
+                try:
+                    driver.invoke("provider_clear_secret", {"id": "minimax"})
+                except native.IpcFailure as error:
+                    if error.code != "secretStoreUnavailable":
+                        raise
+            require(not any(provider["configured"] for provider in driver.invoke("providers_list")), "catalogueSyntheticSecretNotCleared")
+
+    with checked(report, "completedSyntheticProposalsSeededOnlyInStoppedFixture"):
+        original_files = {book["id"]: [file for file in driver.invoke("book_files", {"id": book["id"]})
+                          if file["variant"] == "original"] for book in books}
+        original_digests = {file["sha256"] for files in original_files.values() for file in files}
+        original_bytes = {path: digest for path, digest in stored_bytes(root).items() if digest in original_digests}
+        require(len(original_bytes) == len(original_digests), "catalogueOriginalFilesMissing")
+        fixture_jobs = [driver.invoke("book_enrich", {"id": book["id"]}) for book in books]
+        driver.wait(lambda: all(next(job for job in driver.invoke("jobs_list") if job["id"] == queued["id"])["status"] == "waitingForConfiguration" for queued in fixture_jobs), "catalogueFixtureJobsNotWaiting")
+        driver.close()
+        seed_catalogue_proposals(profile, books, fixture_jobs)
+        driver.start(binary)
+        reload_ui(driver, 2)
+        require(len([job for job in driver.invoke("jobs_list") if job["kind"] == "enrich" and job["status"] == "completed"]) == 2, "catalogueFixtureProposalsMissing")
+
+    for index, original in enumerate(books):
+        name = "differentProposalManualApplyDurable" if index == 0 else "noDifferenceProposalAcknowledgementDurable"
+        with checked(report, name):
+            require(driver.execute("const button=[...document.querySelectorAll('.book-cover')].find(n=>n.getAttribute('aria-label')===arguments[0]);if(!button)return false;button.click();return true;", [original["title"]]), "catalogueReviewBookMissing")
+            driver.wait(lambda: driver.execute("return !!document.querySelector('section[aria-labelledby=metadata-proposal-title] button.button.primary:not(:disabled)');"), "catalogueReviewProposalMissing")
+            before = driver.invoke("book_get", {"id": original["id"]})
+            fields = driver.execute("return document.querySelectorAll('.metadata-review .proposal-field').length;")
+            require((fields > 0) if index == 0 else (fields == 0), "catalogueReviewDifferencePresentationWrong")
+            if index == 1:
+                before = driver.invoke("book_update", {"id": original["id"], "patch": {"notes": "Synthetic personal note"}, "expectedRevision": before["revision"]})
+                driver.wait(lambda: (state if (state := title_field(driver)) and state["notes"] == "Synthetic personal note" else False), "personalUpdateDidNotRefreshPanel")
+                driver.wait(lambda: driver.execute("return !!document.querySelector('section[aria-labelledby=metadata-proposal-title] button.button.primary:not(:disabled)');"), "personalUpdateHidPendingProposal")
+            click(driver, "section[aria-labelledby=metadata-proposal-title] button.button.primary", "catalogueReviewApplyMissing")
+            applied = driver.wait(lambda: (current if (current := driver.invoke("book_get", {"id": original["id"]}))["revision"] > before["revision"] and current["metadataStatus"] == "verified" else False), "catalogueReviewNotPersisted")
+            require(applied["title"] == ("Catalogue fixture reviewed title" if index == 0 else original["title"]), "catalogueReviewPatchMismatch")
+            driver.wait(lambda: driver.execute("return !document.querySelector('section[aria-labelledby=metadata-proposal-title]');"), "catalogueResolvedReviewStillVisible")
+            result = next(job["result"] for job in driver.invoke("jobs_list") if job["id"] == fixture_jobs[index]["id"])
+            require(result["review"]["state"] == "applied" and result["review"]["resolvedRevision"] == applied["revision"], "catalogueReviewResolutionNotDurable")
+            click(driver, ".drawer-header button", "catalogueReviewCloseMissing")
+            reload_ui(driver, 2)
+            require(driver.execute("return document.querySelectorAll('.review-action').length===arguments[0];", [1 - index]), "catalogueResolvedReviewReappeared")
+            require(driver.execute("const button=[...document.querySelectorAll('.book-cover')].find(n=>n.getAttribute('aria-label')===arguments[0]);if(!button)return false;button.click();return true;", [applied["title"]]), "catalogueResolvedBookMissing")
+            driver.wait(lambda: title_field(driver), "catalogueResolvedPanelMissing")
+            require(driver.execute("return !document.querySelector('section[aria-labelledby=metadata-proposal-title]');"), "catalogueResolvedPanelReopenedReview")
+            click(driver, ".drawer-header button", "catalogueResolvedPanelCloseMissing")
+
+    with checked(report, "catalogueRemoveConfirmReceiptAndStoredBytesPreserved"):
+        before_files = {book["id"]: driver.invoke("book_files", {"id": book["id"]}) for book in books}
+        before_bytes = stored_bytes(root)
+        require(all([file for file in before_files[identifier] if file["variant"] == "original"] == originals
+                    for identifier, originals in original_files.items()), "catalogueReviewChangedOriginalRecords")
+        require(all(before_bytes.get(path) == digest for path, digest in original_bytes.items()), "catalogueReviewChangedOriginalBytes")
+        require(all(any(value == file["sha256"] for value in before_bytes.values()) for files in before_files.values() for file in files), "catalogueStoredFileHashMissing")
+        expected_books = [{"bookId": book["id"],
+                           "expectedRevision": driver.invoke("book_get", {"id": book["id"]})["revision"]}
+                          for book in books]
+        click(driver, ".toolbar input[type=checkbox]", "catalogueRemoveSelectMissing")
+        click(driver, ".selection-actions .remove-action", "catalogueRemoveActionMissing")
+        driver.wait(lambda: driver.execute("return document.querySelectorAll('dialog[open] .removal-books li').length===2 && document.querySelector('dialog[open] button[type=submit]')?.disabled===false;"), "catalogueRemoveConfirmationMissing")
+        require(driver.invoke("library_list", {"query": native.QUERY})["total"] == 2, "catalogueRemovedBeforeConfirmation")
+        click(driver, "dialog[open] button[type=submit]", "catalogueRemoveSubmitMissing")
+        driver.wait(lambda: driver.invoke("library_list", {"query": native.QUERY})["total"] == 0, "catalogueRemoveNotPersisted")
+        driver.wait(lambda: driver.execute("return !document.querySelector('dialog[open]') && document.querySelectorAll('.book-card').length===0;"), "catalogueRemovedBooksRemainInUi")
+        driver.close()
+        receipt, persisted_operation_ids = catalogue_removal_receipt(profile, expected_books)
+        driver.start(binary)
+        driver.wait(lambda: driver.execute("return !!document.querySelector('#library-sort') && document.querySelector('main section.page')?.getAttribute('aria-busy')==='false' && document.querySelectorAll('.book-card').length===0;"),
+                    "catalogueRestartedEmptyLibraryNotReady")
+        require(driver.invoke("library_list", {"query": native.QUERY})["total"] == 0,
+                "catalogueRemovalDidNotSurviveRestart")
+        repeated = driver.invoke("books_remove", receipt)
+        require(set(repeated["removedBookIds"]) == {book["id"] for book in books} and len(repeated["operations"]) == 2, "catalogueRemovalReceiptMismatch")
+        operations = [operation for operation in driver.invoke("operations_list") if operation["kind"] == "catalogueRemove"]
+        require(len(operations) == 2 and {operation["id"] for operation in operations}
+                == {operation["id"] for operation in repeated["operations"]}
+                == persisted_operation_ids, "catalogueRepeatedRemovalCreatedOperations")
+        require(stored_bytes(root) == before_bytes, "catalogueRemovalChangedStoredBytes")
+        report["catalogueRemoval"] = {"removedBooks": 2, "explicitConfirmation": True,
+                                      "receiptRetryIdempotent": True, "storedBytesUnchanged": True,
+                                      "receiptSource": "stoppedMarkedFixtureReadOnlyAudit",
+                                      "removalSurvivedRestart": True,
+                                      "reviewOriginalBytesUnchanged": True}
+
+    with checked(report, "catalogueUndoRestoresFreshUiAndActiveFiles"):
+        for operation in repeated["operations"]:
+            undo_catalogue_operation(driver, operation["id"], report)
+        driver.wait(lambda: driver.invoke("library_list", {"query": native.QUERY})["total"] == 2, "catalogueUndoDidNotRestoreBooks")
+        driver.wait(lambda: driver.execute("return document.querySelectorAll('.book-card').length===2 && document.querySelector('main section.page')?.getAttribute('aria-busy')==='false';"), "catalogueUndoUiDidNotRefresh")
+        for book in books:
+            require(sorted(driver.invoke("book_files", {"id": book["id"]}), key=lambda file: file["id"])
+                    == sorted(before_files[book["id"]], key=lambda file: file["id"]), "catalogueUndoChangedActiveFileRecords")
+        require(stored_bytes(root) == before_bytes, "catalogueUndoChangedStoredBytes")
+        report["catalogueRemoval"].update({"undoRestoredBooks": 2, "undoUiRefreshed": True,
+                                           "activeFilesRestored": True, "undoBytesUnchanged": True})
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
@@ -517,6 +827,7 @@ def main():
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--driver-url", default="http://127.0.0.1:4444")
     parser.add_argument("--timeout", type=float, default=300)
+    parser.add_argument("--catalogue-actions", action="store_true", help="Run 0.2.1 actions on a fresh synthetic profile only")
     arguments = parser.parse_args()
     report = {"schemaVersion": 1, "status": "running", "checks": [], "paidApiCalls": 0,
               "physicalDeviceWrites": 0, "networkIsolation": "requiredFromCaller"}
@@ -527,6 +838,7 @@ def main():
         binary = arguments.binary.resolve(strict=True)
         require(binary.is_file() and os.access(binary, os.X_OK), "packagedApplicationNotExecutable")
         if arguments.review_profile:
+            require(not arguments.catalogue_actions, "catalogueActionsRequireFreshSyntheticProfile")
             profile, marker = review_profile(arguments.review_profile)
         else:
             profile = native.isolated_profile(arguments.profile_root)
@@ -535,6 +847,8 @@ def main():
         driver = Driver(arguments.driver_url, arguments.timeout)
         if arguments.review_profile:
             review_smoke(driver, binary, profile, marker, report)
+        elif arguments.catalogue_actions:
+            catalogue_actions_smoke(driver, binary, profile, report)
         else:
             smoke(driver, binary, profile, report)
         report["status"] = "passed"

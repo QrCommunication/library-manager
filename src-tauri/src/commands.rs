@@ -13,8 +13,8 @@ use library_core::{
     AppError, Book, BookFile, BookFormat, BookPage, BookPatch, BookQuery, ChatMessage,
     Conversation, ConversionCapabilities, Device, DeviceTransport, ErrorCode, Job, LibraryFacets,
     LibraryManager, ManagerEventSink, ModelCatalog, Operation, OptimizationProfile, Provider,
-    ProviderId, PublicError, ReaderManifest, ReaderSection, Settings, optimizer,
-    providers::public_provider_error,
+    ProviderId, PublicError, ReaderManifest, ReaderSection, RemoveBookSelection, RemoveBooksResult,
+    Settings, optimizer, providers::public_provider_error,
 };
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -248,6 +248,32 @@ pub async fn book_update(
 ) -> IpcResult<Book> {
     blocking(state.inner(), move |manager| {
         manager.book_update(&id, &patch, expected_revision)
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn book_review(
+    state: State<'_, AppState>,
+    id: String,
+    job_id: String,
+    patch: BookPatch,
+    expected_revision: u64,
+) -> IpcResult<Book> {
+    blocking(state.inner(), move |manager| {
+        manager.book_review(&id, &job_id, &patch, expected_revision)
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn books_remove(
+    state: State<'_, AppState>,
+    request_id: String,
+    books: Vec<RemoveBookSelection>,
+) -> IpcResult<RemoveBooksResult> {
+    blocking(state.inner(), move |manager| {
+        manager.books_remove(&request_id, &books)
     })
     .await
 }

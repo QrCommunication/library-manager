@@ -4,7 +4,7 @@
 
 **Your library, wherever you read.** A standalone application for organizing ebooks, reading EPUBs, and preparing files for ereaders. Linux packages are available; Windows and macOS installers are being prepared for version **0.2.1**.
 
-[Français](README.md) · [Downloads](https://github.com/QrCommunication/library-manager/releases) · [Architecture](docs/BLUEPRINT.md) · [Issues](https://github.com/QrCommunication/library-manager/issues)
+[Français](README.md) · [Downloads](https://github.com/QrCommunication/library-manager/releases) · [User guide (French)](docs/USER_GUIDE.md) · [Architecture](docs/BLUEPRINT.md) · [Issues](https://github.com/QrCommunication/library-manager/issues)
 
 Developed by QR Communication under **GPL-3.0**. The Rust engine, SQLite database, and MOBI converter are bundled. **Calibre, Node, Rust, and Python are not required to run release packages.**
 

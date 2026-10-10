@@ -4,7 +4,9 @@
 //! background jobs, and engine tests. Filesystem and network operations remain
 //! inside focused services; callers receive structured errors.
 
-#![forbid(unsafe_code)]
+// Native Windows filesystem guarantees require audited FFI in its adapter;
+// all other engine modules continue to reject unsafe code by default.
+#![deny(unsafe_code)]
 
 pub mod book_repository;
 pub mod calibre_wireless;
@@ -23,6 +25,7 @@ pub mod models;
 pub mod optimizer;
 pub mod providers;
 pub mod reader;
+pub(crate) mod secure_fs;
 pub mod settings;
 pub mod storage;
 pub mod transfer;

@@ -2,9 +2,8 @@
 
 use std::{
     collections::HashSet,
-    fs::{self, OpenOptions},
+    fs,
     io::{Cursor, Read, Write},
-    os::unix::fs::DirBuilderExt,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -24,7 +23,9 @@ use crate::{
     AppError, Book, BookFile, BookFormat, BookMetadata, BookPage, BookPatch, BookQuery,
     BookRepository, ConversionReport, Converter, EpubDocument, FileVariant, LibraryFacets,
     MetadataStatus, Operation, OptimizationReport, Result, Storage, StoredArtifact, StoredFile,
-    epub::inspect_for_import, optimizer,
+    epub::inspect_for_import,
+    optimizer,
+    secure_fs::{AccessPolicy, SecureDir},
 };
 
 const MAX_COVER_BYTES: usize = 8 * 1024 * 1024;
@@ -45,6 +46,14 @@ pub struct LibraryService {
     converter: Converter,
     gate: Arc<Mutex<()>>,
     cancellation: Option<Arc<AtomicBool>>,
+}
+
+#[derive(Default)]
+struct UpdateContext<'a> {
+    enrichment: Option<(MetadataStatus, f64)>,
+    original_sha256: Option<&'a str>,
+    inspected_file: Option<(&'a str, &'a str)>,
+    review_job_id: Option<&'a str>,
 }
 
 impl LibraryService {
@@ -239,7 +248,26 @@ impl LibraryService {
     }
 
     pub fn update(&self, id: &str, patch: &BookPatch, expected_revision: u64) -> Result<Book> {
-        self.update_internal(id, patch, expected_revision, None, None, None)
+        self.update_internal(id, patch, expected_revision, UpdateContext::default())
+    }
+
+    /// Resolve an explicit human review even when its metadata values are already unchanged.
+    pub fn review_book(
+        &self,
+        id: &str,
+        job_id: &str,
+        patch: &BookPatch,
+        expected_revision: u64,
+    ) -> Result<Book> {
+        self.update_internal(
+            id,
+            patch,
+            expected_revision,
+            UpdateContext {
+                review_job_id: Some(job_id),
+                ..UpdateContext::default()
+            },
+        )
     }
 
     /// Apply a reviewed patch only while the inspected immutable original still matches.
@@ -261,9 +289,10 @@ impl LibraryService {
             id,
             patch,
             expected_revision,
-            None,
-            Some(original_sha256),
-            None,
+            UpdateContext {
+                original_sha256: Some(original_sha256),
+                ..UpdateContext::default()
+            },
         )
     }
 
@@ -288,9 +317,11 @@ impl LibraryService {
             id,
             patch,
             expected_revision,
-            None,
-            Some(original_sha256),
-            Some((inspected_file_id, inspected_sha256)),
+            UpdateContext {
+                original_sha256: Some(original_sha256),
+                inspected_file: Some((inspected_file_id, inspected_sha256)),
+                ..UpdateContext::default()
+            },
         )
     }
 
@@ -321,9 +352,10 @@ impl LibraryService {
             id,
             patch,
             expected_revision,
-            Some((status, confidence)),
-            None,
-            None,
+            UpdateContext {
+                enrichment: Some((status, confidence)),
+                ..UpdateContext::default()
+            },
         )
     }
 
@@ -332,9 +364,7 @@ impl LibraryService {
         id: &str,
         patch: &BookPatch,
         expected_revision: u64,
-        enrichment: Option<(MetadataStatus, f64)>,
-        original_sha256: Option<&str>,
-        inspected_file: Option<(&str, &str)>,
+        context: UpdateContext<'_>,
     ) -> Result<Book> {
         let _guard = self
             .gate
@@ -345,7 +375,7 @@ impl LibraryService {
         if before.revision != expected_revision {
             return Err(AppError::RevisionConflict);
         }
-        if let Some(expected) = original_sha256 {
+        if let Some(expected) = context.original_sha256 {
             let original = self
                 .repository
                 .files(id)?
@@ -363,7 +393,7 @@ impl LibraryService {
                 return Err(AppError::Conflict("Inspected original changed".into()));
             }
         }
-        if let Some((file_id, expected)) = inspected_file {
+        if let Some((file_id, expected)) = context.inspected_file {
             let file = self.repository.file_by_id(file_id)?;
             if file.file.book_id != id
                 || file.file.format != BookFormat::Epub
@@ -376,14 +406,14 @@ impl LibraryService {
         let before_metadata = book_metadata(&before);
         let mut updated = apply_patch(before.clone(), patch)?;
         let metadata_changed = book_metadata(&updated) != before_metadata;
-        if let Some((status, confidence)) = enrichment {
+        if let Some((status, confidence)) = context.enrichment {
             updated.metadata_status = status;
             updated.metadata_confidence = Some(confidence);
-        } else if metadata_changed {
+        } else if metadata_changed || context.review_job_id.is_some() {
             updated.metadata_status = MetadataStatus::Verified;
             updated.metadata_confidence = None;
         }
-        if updated == before {
+        if updated == before && context.review_job_id.is_none() {
             return Ok(self.decorate(before));
         }
         let work = WorkDirectory::new()?;
@@ -410,17 +440,21 @@ impl LibraryService {
         };
         let kind = if catalog_only {
             "metadataUpdateCatalogOnly"
-        } else if metadata_changed || enrichment.is_some() {
+        } else if metadata_changed
+            || context.enrichment.is_some()
+            || context.review_job_id.is_some()
+        {
             "metadataUpdate"
         } else {
             "personalUpdate"
         };
         self.check_cancelled()?;
-        Ok(self.decorate(self.repository.update_audited(
+        Ok(self.decorate(self.repository.update_audited_with_review(
             &updated,
             expected_revision,
             file,
             kind,
+            context.review_job_id,
         )?))
     }
 
@@ -596,11 +630,48 @@ impl LibraryService {
         )?))
     }
 
+    /// Catalogue-only removal: immutable bytes remain available for a verified undo.
+    pub fn remove_books(
+        &self,
+        request_id: &str,
+        books: &[(String, u64)],
+    ) -> Result<Vec<Operation>> {
+        let _guard = self
+            .gate
+            .lock()
+            .map_err(|_| invalid("Library operation is unavailable"))?;
+        self.check_cancelled()?;
+        // The repository receipt must handle a retry whose catalogue rows are already gone.
+        self.repository.remove_audited(request_id, books)
+    }
+
     pub fn undo(&self, operation_id: &str) -> Result<Operation> {
         let _guard = self
             .gate
             .lock()
             .map_err(|_| invalid("Library operation is unavailable"))?;
+        self.check_cancelled()?;
+        if let Some(files) = self.repository.removal_files_for_undo(operation_id)? {
+            for file in files {
+                self.check_cancelled()?;
+                let path = self.storage.resolve(&file.relative_path)?;
+                let before = fs::symlink_metadata(&path)?;
+                if !before.is_file() || before.len() != file.file.size_bytes {
+                    return Err(AppError::Conflict("A retained book file changed".into()));
+                }
+                // Source's streaming hash is bounded to 512 MiB and checks path/inode changes.
+                // It also supports files above the 64 MiB in-memory reading limit.
+                let hash = Storage::hash_file(&path)?;
+                let checked = self.storage.resolve(&file.relative_path)?;
+                let after = fs::symlink_metadata(&checked)?;
+                if !after.is_file()
+                    || after.len() != file.file.size_bytes
+                    || !hash.eq_ignore_ascii_case(&file.file.sha256)
+                {
+                    return Err(AppError::Conflict("A retained book file changed".into()));
+                }
+            }
+        }
         self.check_cancelled()?;
         self.repository.undo_audited(operation_id)
     }
@@ -1118,21 +1189,37 @@ fn normalized_date(value: &str) -> Option<String> {
 
 struct WorkDirectory {
     path: PathBuf,
+    directory: Option<SecureDir>,
 }
 impl WorkDirectory {
     fn new() -> Result<Self> {
-        let path = Path::new("/tmp").join(format!("library-manager-library-{}", Uuid::new_v4()));
-        fs::DirBuilder::new().mode(0o700).create(&path)?;
-        Ok(Self { path })
+        let root = std::env::temp_dir().canonicalize()?;
+        let name = format!("library-manager-library-{}", Uuid::new_v4());
+        let parent = SecureDir::open(&root, false, AccessPolicy::Shared)?;
+        let directory = parent.child(std::ffi::OsStr::new(&name), true, AccessPolicy::Private)?;
+        let path = root.join(name);
+        Ok(Self {
+            path,
+            directory: Some(directory),
+        })
     }
 }
 impl Drop for WorkDirectory {
     fn drop(&mut self) {
+        // Release the Windows directory pin before removing the private workspace.
+        drop(self.directory.take());
         let _ = fs::remove_dir_all(&self.path);
     }
 }
 fn write_stage(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::InvalidInput("Missing staging parent".into()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| AppError::InvalidInput("Missing staging filename".into()))?;
+    let directory = SecureDir::open(parent, false, AccessPolicy::Private)?;
+    let mut file = directory.create_new(name, AccessPolicy::Private)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
@@ -1147,8 +1234,68 @@ mod tests {
     use tempfile::TempDir;
     use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
+    fn replace_fixture_bytes(path: &Path, bytes: &[u8]) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let retained = path.with_file_name(format!("retained-original-{}", Uuid::new_v4()));
+            fs::rename(path, retained).unwrap();
+        }
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn link_fixture_path(source: &Path, target: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(source, target).unwrap();
+        #[cfg(windows)]
+        {
+            // A junction requires no symlink privilege and must also be refused
+            // when it occupies a path where a regular EPUB/TXT file is expected.
+            let source = if source.is_dir() {
+                source
+            } else {
+                source.parent().unwrap()
+            };
+            let output = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(target)
+                .arg(source)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "junction fixture creation failed");
+        }
+    }
+
+    #[test]
+    fn working_directory_uses_canonical_system_temp_and_releases_cleanup_handles() {
+        let working = WorkDirectory::new().unwrap();
+        let path = working.path.clone();
+        assert!(path.starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        assert!(
+            working
+                .directory
+                .as_ref()
+                .unwrap()
+                .as_file()
+                .metadata()
+                .unwrap()
+                .is_dir()
+        );
+        write_stage(&path.join("test.epub"), b"private stage").unwrap();
+        assert_eq!(fs::read(path.join("test.epub")).unwrap(), b"private stage");
+        assert!(write_stage(&path.join("test.epub"), b"must not replace").is_err());
+        drop(working);
+        assert!(!path.exists());
+    }
+
     fn fixture() -> (TempDir, LibraryService) {
-        let directory = TempDir::new().unwrap();
+        let directory = tempfile::Builder::new()
+            .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
+            .unwrap();
         let repository =
             BookRepository::new(Database::new(&directory.path().join("database")).unwrap());
         let storage = Storage::new(&directory.path().join("library")).unwrap();
@@ -1160,6 +1307,175 @@ mod tests {
             )),
         );
         (directory, service)
+    }
+
+    fn seed_pending_review(directory: &TempDir, book: &Book) -> Database {
+        let database = Database::new(&directory.path().join("database")).unwrap();
+        let proposal = serde_json::json!({"bookId":book.id,"patch":{"title":"Reviewed edition"},"confidence":0.8,"evidence":[{"field":"title","value":"Reviewed edition","confidence":0.8,"sourceUrls":[]}],"warnings":["Manual review"],"providerId":"minimax","modelId":"fixture"});
+        let result = serde_json::json!({"proposal":proposal,"review":{"state":"pending","sourceRevision":book.revision,"reviewRevision":book.revision}});
+        database.connect().unwrap().execute("INSERT INTO jobs(id,kind,status,progress,payload_json,result_json,created_at,updated_at) VALUES('review-job','enrich','completed',1,?1,?2,'2026-10-10T00:00:00Z','2026-10-10T00:00:00Z')",rusqlite::params![serde_json::json!({"version":1,"payload":{"id":book.id,"bookIds":[book.id]}}).to_string(),result.to_string()]).unwrap();
+        database
+    }
+
+    fn pending_review_result(database: &Database) -> serde_json::Value {
+        let raw: String = database
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT result_json FROM jobs WHERE id='review-job'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    #[test]
+    fn explicit_review_without_field_changes_is_durable_and_preserves_files() {
+        let (directory, service) = fixture();
+        let source = write_epub(&directory, false);
+        let book = service.import(&source).unwrap().book;
+        let database = seed_pending_review(&directory, &book);
+        let files = service.repository.files(&book.id).unwrap();
+        let operations = service.operations().unwrap().len();
+        let updated = service
+            .review_book(&book.id, "review-job", &BookPatch::default(), book.revision)
+            .unwrap();
+        assert_eq!(updated.title, book.title);
+        assert_eq!(updated.metadata_status, MetadataStatus::Verified);
+        assert_eq!(updated.metadata_confidence, None);
+        assert_eq!(updated.revision, book.revision + 1);
+        assert_eq!(service.repository.files(&book.id).unwrap(), files);
+        assert_eq!(
+            pending_review_result(&database)["review"]["state"],
+            "applied"
+        );
+        assert_eq!(service.operations().unwrap().len(), operations + 1);
+        let duplicate = service
+            .review_book(
+                &book.id,
+                "review-job",
+                &BookPatch::default(),
+                updated.revision,
+            )
+            .unwrap();
+        assert_eq!(duplicate.revision, updated.revision);
+        assert_eq!(service.operations().unwrap().len(), operations + 1);
+        assert_eq!(
+            Storage::hash_file(&source).unwrap(),
+            files
+                .iter()
+                .find(|file| file.file.variant == FileVariant::Original)
+                .unwrap()
+                .file
+                .sha256
+        );
+    }
+
+    #[test]
+    fn explicit_review_updates_the_active_epub_and_undo_restores_pending_state() {
+        let (directory, service) = fixture();
+        let source = write_epub(&directory, false);
+        let original_hash = Storage::hash_file(&source).unwrap();
+        let book = service.import(&source).unwrap().book;
+        let database = seed_pending_review(&directory, &book);
+        let original = service
+            .repository
+            .files(&book.id)
+            .unwrap()
+            .into_iter()
+            .find(|file| file.file.variant == FileVariant::Original)
+            .unwrap();
+        let updated = service
+            .review_book(
+                &book.id,
+                "review-job",
+                &BookPatch {
+                    title: Some("Reviewed edition".into()),
+                    ..BookPatch::default()
+                },
+                book.revision,
+            )
+            .unwrap();
+        let active = service.source_epub(&book.id).unwrap();
+        let metadata = EpubDocument::from_bytes(
+            &service.storage.read(&active.relative_path).unwrap(),
+            &updated.title,
+        )
+        .unwrap()
+        .metadata;
+        assert_eq!(metadata.title, updated.title);
+        assert_eq!(
+            pending_review_result(&database)["review"]["state"],
+            "applied"
+        );
+        assert_eq!(Storage::hash_file(&source).unwrap(), original_hash);
+        assert_eq!(
+            service.storage.read(&original.relative_path).unwrap(),
+            fs::read(&source).unwrap()
+        );
+        let operation = service
+            .operations()
+            .unwrap()
+            .into_iter()
+            .find(|operation| operation.kind == "metadataUpdate")
+            .unwrap();
+        service.undo(&operation.id).unwrap();
+        let restored = service.get(&book.id, &[]).unwrap();
+        assert_eq!(restored.title, book.title);
+        assert_eq!(
+            pending_review_result(&database)["review"]["state"],
+            "pending"
+        );
+        assert_eq!(
+            pending_review_result(&database)["review"]["reviewRevision"],
+            restored.revision
+        );
+    }
+
+    #[test]
+    fn explicit_review_keeps_revision_source_and_cancellation_guards() {
+        let (directory, service) = fixture();
+        let book = service.import(&write_epub(&directory, false)).unwrap().book;
+        let database = seed_pending_review(&directory, &book);
+        let original = pending_review_result(&database);
+        let count = service.operations().unwrap().len();
+        assert!(matches!(
+            service.review_book(
+                &book.id,
+                "review-job",
+                &BookPatch::default(),
+                book.revision + 1
+            ),
+            Err(AppError::RevisionConflict)
+        ));
+        let cancelled = service
+            .clone()
+            .with_cancellation(Arc::new(AtomicBool::new(true)));
+        assert!(matches!(
+            cancelled.review_book(&book.id, "review-job", &BookPatch::default(), book.revision),
+            Err(AppError::Cancelled)
+        ));
+        let active = service.source_epub(&book.id).unwrap();
+        let path = service.storage.resolve(&active.relative_path).unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[0] ^= 1;
+        replace_fixture_bytes(&path, &bytes);
+        assert!(matches!(
+            service.review_book(
+                &book.id,
+                "review-job",
+                &BookPatch {
+                    title: Some("Must not apply".into()),
+                    ..BookPatch::default()
+                },
+                book.revision
+            ),
+            Err(AppError::Conflict(_))
+        ));
+        assert_eq!(service.get(&book.id, &[]).unwrap().revision, book.revision);
+        assert_eq!(pending_review_result(&database), original);
+        assert_eq!(service.operations().unwrap().len(), count);
     }
 
     fn epub_entries(missing_font: bool) -> BTreeMap<String, Vec<u8>> {
@@ -1438,7 +1754,6 @@ mod tests {
 
     #[test]
     fn inspected_update_rejects_corrupted_original_bytes_even_if_catalog_hash_matches() {
-        use std::os::unix::fs::PermissionsExt;
         let (directory, service) = fixture();
         let book = service.import(&write_epub(&directory, false)).unwrap().book;
         let original = service
@@ -1449,8 +1764,7 @@ mod tests {
             .find(|file| file.file.variant == FileVariant::Original)
             .unwrap();
         let path = service.storage.resolve(&original.relative_path).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        fs::write(&path, b"Unexpected original bytes").unwrap();
+        replace_fixture_bytes(&path, b"Unexpected original bytes");
         let operation_count = service.operations().unwrap().len();
         assert!(matches!(
             service.update_inspected(
@@ -1560,7 +1874,6 @@ mod tests {
 
     #[test]
     fn corrupt_inspected_derived_epub_is_rejected_before_metadata_or_history_changes() {
-        use std::os::unix::fs::PermissionsExt;
         let (directory, service) = fixture();
         let (book, converted) = derived_inspection_fixture(&directory, &service);
         let original = service
@@ -1574,8 +1887,7 @@ mod tests {
         let mut corrupt = service.storage.read(&converted.relative_path).unwrap();
         corrupt[0] ^= 1;
         let path = service.storage.resolve(&converted.relative_path).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        fs::write(path, corrupt).unwrap();
+        replace_fixture_bytes(&path, &corrupt);
         let operations = service.operations().unwrap();
         let files = service.repository.files(&book.id).unwrap();
         assert!(matches!(
@@ -1603,7 +1915,6 @@ mod tests {
 
     #[test]
     fn corrupt_active_normalized_epub_cannot_be_used_after_valid_original_inspection() {
-        use std::os::unix::fs::PermissionsExt;
         let (directory, service) = fixture();
         let book = service.import(&write_epub(&directory, false)).unwrap().book;
         let files = service.repository.files(&book.id).unwrap();
@@ -1619,8 +1930,7 @@ mod tests {
         let mut corrupt = service.storage.read(&normalized.relative_path).unwrap();
         corrupt[0] ^= 1;
         let path = service.storage.resolve(&normalized.relative_path).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        fs::write(path, corrupt).unwrap();
+        replace_fixture_bytes(&path, &corrupt);
         let operations = service.operations().unwrap();
         let patch = BookPatch {
             title: Some("Must not publish changed reading text".into()),
@@ -1745,7 +2055,6 @@ mod tests {
 
     #[test]
     fn organization_rejects_corrupted_variant_before_publishing_and_recovers_after_restore() {
-        use std::os::unix::fs::PermissionsExt;
         let (directory, service) = fixture();
         let book = service.import(&write_epub(&directory, false)).unwrap().book;
         let before = service.repository.files(&book.id).unwrap();
@@ -1755,8 +2064,7 @@ mod tests {
             .unwrap();
         let bytes = service.storage.read(&variant.relative_path).unwrap();
         let path = service.storage.resolve(&variant.relative_path).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        fs::write(&path, b"Unexpected managed bytes").unwrap();
+        replace_fixture_bytes(&path, b"Unexpected managed bytes");
         let operation_count = service.operations().unwrap().len();
         assert!(matches!(
             service.organize(&book.id, book.revision),
@@ -1770,6 +2078,163 @@ mod tests {
             service.organize(&book.id, book.revision).unwrap().revision,
             book.revision + 1
         );
+    }
+
+    const REMOVE_REQUEST: &str = "d1879315-08e9-4304-af4a-536c8b3fe8a2";
+
+    #[test]
+    fn catalogue_removal_preserves_every_artifact_and_replay_then_undo_restore_associations() {
+        let (directory, service) = fixture();
+        let source = write_epub(&directory, false);
+        let imported = service.import(&source).unwrap().book;
+        let book = service
+            .update(
+                &imported.id,
+                &BookPatch {
+                    title: Some("Library edition".into()),
+                    ..Default::default()
+                },
+                imported.revision,
+            )
+            .unwrap();
+        let files = service.repository.files(&book.id).unwrap();
+        let before: Vec<_> = files
+            .iter()
+            .map(|file| {
+                (
+                    file.relative_path.clone(),
+                    fs::read(service.storage.resolve(&file.relative_path).unwrap()).unwrap(),
+                )
+            })
+            .collect();
+        let request = vec![(book.id.clone(), book.revision)];
+        let operations = service.remove_books(REMOVE_REQUEST, &request).unwrap();
+        assert_eq!(service.list(&BookQuery::default(), &[]).unwrap().total, 0);
+        assert_eq!(
+            service.remove_books(REMOVE_REQUEST, &request).unwrap(),
+            operations
+        );
+        for (path, bytes) in &before {
+            assert_eq!(
+                &fs::read(service.storage.resolve(path).unwrap()).unwrap(),
+                bytes
+            );
+        }
+        service.undo(&operations[0].id).unwrap();
+        let restored = service.get(&book.id, &[]).unwrap();
+        assert!(restored.revision > book.revision);
+        assert_eq!(restored.title, book.title);
+        assert_eq!(service.repository.files(&book.id).unwrap(), files);
+        assert_eq!(
+            service.undo(&operations[0].id).unwrap().status,
+            OperationStatus::Reverted
+        );
+        assert_eq!(
+            service.get(&book.id, &[]).unwrap().revision,
+            restored.revision
+        );
+        for (path, bytes) in before {
+            assert_eq!(
+                fs::read(service.storage.resolve(&path).unwrap()).unwrap(),
+                bytes
+            );
+        }
+    }
+
+    #[test]
+    fn removal_undo_rejects_missing_corrupt_or_symlinked_files_without_overwriting_bytes() {
+        for damage in [
+            "missing",
+            "corruptOriginal",
+            "corruptActive",
+            "symlinkFile",
+            "symlinkParent",
+        ] {
+            let (directory, service) = fixture();
+            let source = write_epub(&directory, false);
+            let book = service.import(&source).unwrap().book;
+            let files = service.repository.files(&book.id).unwrap();
+            let chosen = if damage == "corruptOriginal" {
+                files
+                    .iter()
+                    .find(|file| file.file.variant == FileVariant::Original)
+                    .unwrap()
+            } else {
+                files
+                    .iter()
+                    .find(|file| file.file.variant != FileVariant::Original)
+                    .unwrap()
+            };
+            let path = service.storage.resolve(&chosen.relative_path).unwrap();
+            let operation = service
+                .remove_books(REMOVE_REQUEST, &[(book.id.clone(), book.revision)])
+                .unwrap()
+                .remove(0);
+            let outside = directory.path().join("untouched-outside.epub");
+            let original = fs::read(&path).unwrap();
+            fs::write(&outside, &original).unwrap();
+            match damage {
+                "missing" => fs::remove_file(&path).unwrap(),
+                "corruptOriginal" | "corruptActive" => {
+                    let mut changed = original.clone();
+                    changed[0] ^= 1;
+                    replace_fixture_bytes(&path, &changed);
+                }
+                "symlinkFile" => {
+                    fs::remove_file(&path).unwrap();
+                    link_fixture_path(&outside, &path);
+                }
+                "symlinkParent" => {
+                    let parent = path.parent().unwrap();
+                    let moved = directory.path().join("moved-managed-directory");
+                    fs::rename(parent, &moved).unwrap();
+                    link_fixture_path(&moved, parent);
+                }
+                _ => unreachable!(),
+            }
+            assert!(service.undo(&operation.id).is_err(), "{damage}");
+            assert!(matches!(
+                service.get(&book.id, &[]),
+                Err(AppError::NotFound(_))
+            ));
+            assert_eq!(
+                service
+                    .operations()
+                    .unwrap()
+                    .iter()
+                    .find(|candidate| candidate.id == operation.id)
+                    .unwrap()
+                    .status,
+                OperationStatus::Applied
+            );
+            assert_eq!(fs::read(&outside).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn catalogue_removal_and_restoration_honor_cancellation() {
+        let (directory, service) = fixture();
+        let source = write_epub(&directory, false);
+        let book = service.import(&source).unwrap().book;
+        let cancelled = service
+            .clone()
+            .with_cancellation(Arc::new(AtomicBool::new(true)));
+        let request = vec![(book.id.clone(), book.revision)];
+        assert!(matches!(
+            cancelled.remove_books(REMOVE_REQUEST, &request),
+            Err(AppError::Cancelled)
+        ));
+        assert_eq!(service.get(&book.id, &[]).unwrap().revision, book.revision);
+        let operation = service
+            .remove_books(REMOVE_REQUEST, &request)
+            .unwrap()
+            .remove(0);
+        assert!(matches!(
+            cancelled.undo(&operation.id),
+            Err(AppError::Cancelled)
+        ));
+        assert_eq!(service.list(&BookQuery::default(), &[]).unwrap().total, 0);
+        service.undo(&operation.id).unwrap();
     }
 
     #[test]
@@ -1964,7 +2429,7 @@ mod tests {
                 .any(|file| file.format == BookFormat::Epub)
         );
         let link = directory.path().join("linked.txt");
-        std::os::unix::fs::symlink(&source, &link).unwrap();
+        link_fixture_path(&source, &link);
         assert!(service.import(&link).is_err());
         assert_eq!(fs::read_to_string(source).unwrap(), "Café et texte.");
     }

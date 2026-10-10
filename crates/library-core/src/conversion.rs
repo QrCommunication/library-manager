@@ -4,7 +4,6 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{Cursor, Read, Write},
-    os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -14,6 +13,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use image::{ImageFormat, ImageReader, Limits};
@@ -25,6 +27,7 @@ use uuid::Uuid;
 use crate::{
     AppError, BookFormat, BookMetadata, ConversionCapabilities, EpubDocument, Result,
     epub::{escape_xml, resolve_href},
+    secure_fs::{self, AccessPolicy, SecureDir},
 };
 
 const MAX_TEXT_BYTES: u64 = 12 * 1024 * 1024;
@@ -243,9 +246,32 @@ impl Converter {
     }
 
     fn engine_available(&self) -> bool {
-        fs::symlink_metadata(&self.mobitool_path).is_ok_and(|metadata| {
-            metadata.file_type().is_file() && metadata.permissions().mode() & 0o111 != 0
-        })
+        self.open_engine().is_ok()
+    }
+
+    fn open_engine(&self) -> Result<(SecureDir, File)> {
+        let path = secure_fs::absolute_path(&self.mobitool_path)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| invalid("MOBI engine has no parent directory"))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| invalid("MOBI engine has no filename"))?;
+        let directory = SecureDir::open(parent, false, AccessPolicy::Shared)?;
+        let file = directory.open_regular(name)?;
+        #[cfg(unix)]
+        if file.metadata()?.permissions().mode() & 0o111 == 0 {
+            return Err(invalid("MOBI engine is not executable"));
+        }
+        #[cfg(windows)]
+        if !path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+        {
+            return Err(invalid("MOBI engine must be a Windows executable"));
+        }
+        Ok((directory, file))
     }
 
     fn reconstruct_mobi(
@@ -254,16 +280,21 @@ impl Converter {
         staging: &StagingDirectory,
         warnings: &mut Vec<String>,
     ) -> Result<EpubDocument> {
-        if !self.engine_available() {
-            return Err(AppError::Unsupported(
-                "The bundled MOBI input engine is unavailable".into(),
-            ));
-        }
-        let run = staging.path.join(Uuid::new_v4().to_string());
-        fs::DirBuilder::new().mode(0o700).create(&run)?;
+        // Keep both handles alive while the subprocess uses the bundled path.
+        // On Windows this also prevents deletion of the opened engine/parent.
+        let (_engine_directory, _engine_file) = self.open_engine().map_err(|_| {
+            AppError::Unsupported("The bundled MOBI input engine is unavailable".into())
+        })?;
+        let run_name = Uuid::new_v4().to_string();
+        let run = staging.path.join(&run_name);
+        let _run_directory = staging
+            .directory
+            .as_ref()
+            .ok_or_else(|| invalid("Conversion staging directory is closed"))?
+            .child(run_name.as_ref(), true, AccessPolicy::Private)?;
         let input = run.join("input.mobi");
         copy_bounded(source, &input, MAX_SOURCE_BYTES)?;
-        let engine = fs::canonicalize(&self.mobitool_path)?;
+        let engine = secure_fs::absolute_path(&self.mobitool_path)?;
         run_mobitool(&engine, &input, &run)?;
         let output = run.join("input.epub");
         if !fs::symlink_metadata(&output).is_ok_and(|metadata| {
@@ -1189,18 +1220,28 @@ fn copy_bounded(source: &Path, destination: &Path, maximum: u64) -> Result<()> {
 
 struct StagingDirectory {
     path: PathBuf,
+    directory: Option<SecureDir>,
 }
 
 impl StagingDirectory {
     fn new() -> Result<Self> {
-        let path = Path::new("/tmp").join(format!("library-manager-convert-{}", Uuid::new_v4()));
-        fs::DirBuilder::new().mode(0o700).create(&path)?;
-        Ok(Self { path })
+        // macOS exposes its system temporary directory through a symlink.
+        // Resolve only this OS-provided root before enforcing no-follow walks.
+        let root = fs::canonicalize(std::env::temp_dir())?;
+        let root_directory = SecureDir::open(&root, false, AccessPolicy::Shared)?;
+        let name = format!("library-manager-convert-{}", Uuid::new_v4());
+        let directory = root_directory.child(name.as_ref(), true, AccessPolicy::Private)?;
+        Ok(Self {
+            path: root.join(name),
+            directory: Some(directory),
+        })
     }
 }
 
 impl Drop for StagingDirectory {
     fn drop(&mut self) {
+        // Windows denies deletion while these directory handles are open.
+        drop(self.directory.take());
         let _ = fs::remove_dir_all(&self.path);
     }
 }
@@ -1250,6 +1291,8 @@ fn run_mobitool(engine: &Path, source: &Path, directory: &Path) -> Result<()> {
         .env_clear()
         .env("LC_ALL", "C.UTF-8")
         .env("TMPDIR", directory)
+        .env("TMP", directory)
+        .env("TEMP", directory)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1573,8 +1616,73 @@ mod tests {
     use tempfile::TempDir;
 
     fn engine() -> PathBuf {
+        let target = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
+            ("macos", "aarch64") => "aarch64-apple-darwin",
+            ("macos", "x86_64") => "x86_64-apple-darwin",
+            ("windows", "x86_64") => "x86_64-pc-windows-msvc",
+            platform => panic!("No bundled MOBI test engine is configured for {platform:?}"),
+        };
+        let suffix = if cfg!(windows) { ".exe" } else { "" };
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../src-tauri/binaries/library-manager-mobitool-x86_64-unknown-linux-gnu")
+            .ancestors()
+            .nth(2)
+            .expect("workspace root")
+            .join(format!(
+                "src-tauri/binaries/library-manager-mobitool-{target}{suffix}"
+            ))
+    }
+
+    #[test]
+    fn staging_uses_canonical_system_temp_and_closes_handles_before_cleanup() {
+        let staging = StagingDirectory::new().unwrap();
+        let path = staging.path.clone();
+        assert_eq!(
+            path.parent().unwrap(),
+            fs::canonicalize(std::env::temp_dir()).unwrap()
+        );
+        assert!(staging.directory.as_ref().unwrap().identity().is_ok());
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        drop(staging);
+        assert!(!path.try_exists().unwrap());
+    }
+
+    #[test]
+    fn engine_availability_rejects_directories_and_missing_files() {
+        let directory = TempDir::new().unwrap();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        assert!(!Converter::new(root.clone()).engine_available());
+        assert!(!Converter::new(root.join("missing.exe")).engine_available());
+        #[cfg(windows)]
+        {
+            let non_executable = root.join("engine.txt");
+            fs::write(&non_executable, "not an executable").unwrap();
+            assert!(!Converter::new(non_executable).engine_available());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn engine_availability_refuses_symlink_files_and_parent_directories() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TempDir::new().unwrap();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        let executable = root.join("engine");
+        fs::write(&executable, "test engine").unwrap();
+        assert!(!Converter::new(executable.clone()).engine_available());
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(Converter::new(executable.clone()).engine_available());
+        let linked = root.join("linked-engine");
+        symlink(&executable, &linked).unwrap();
+        assert!(!Converter::new(linked).engine_available());
+        let parent_link = root.join("linked-parent");
+        symlink(&root, &parent_link).unwrap();
+        assert!(!Converter::new(parent_link.join("engine")).engine_available());
     }
 
     fn metadata() -> BookMetadata {
@@ -1930,6 +2038,7 @@ mod tests {
         assert!(!destination.exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn sidecar_output_is_bounded_and_credentials_are_not_inherited() {
         let directory = TempDir::new().unwrap();

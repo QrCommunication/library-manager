@@ -1,5 +1,42 @@
 # Qualité et validations de Library Manager
 
+## Version 0.2.1 — préparation et validations partielles
+
+État au 10 octobre 2026 : les actions groupées communes, la revue persistante des propositions et le retrait réversible du catalogue sont en cours de livraison, avec le portage natif Windows et macOS. Les preuves ci-dessous couvrent des périmètres distincts ; elles ne constituent pas encore une validation globale du commit final ni des installateurs distribués. Les résultats historiques des versions publiées restent conservés dans les sections suivantes.
+
+### Sources actuelles : tests ciblés et analyse statique
+
+| Périmètre ciblé | Résultat exécuté |
+| --- | --- |
+| Base de données | 12 tests réussis |
+| Façade de fichiers sécurisés | Huit tests réussis |
+| Stockage géré | 12 tests réussis |
+| Transfert | 11 tests réussis |
+| Manager | 26 tests réussis |
+| Service de bibliothèque | 24 tests réussis |
+| Conversion | 12 tests réussis, dont les conversions natives libmobi sur l’hôte Linux |
+| Appareils | 19 tests réussis |
+| Inventaire EPUB | Cinq tests réussis, avec lecture par fichier ouvert, limites et sources remplacées |
+| Analyse statique du moteur | Clippy `library-core`, toutes cibles, avec `-D warnings`, réussi sur l’hôte Linux |
+| Interface | 53 tests réussis ; contrôle TypeScript/Svelte sans erreur ni avertissement |
+| Compilation croisée Windows | Neuf tests spécifiques compilés, **non exécutés** sur Windows |
+
+Ces suites ciblées portent sur les modifications du portage et leurs contrats ; leurs comptes ne sont pas à additionner pour annoncer une suite globale. L’exécution complète après les derniers ports reste en cours à cet état de la documentation. La compilation croisée ne prouve ni l’exécution des tests Windows, ni le comportement de sa GUI ou de ses installateurs.
+
+### Parcours natif local du catalogue
+
+Le scénario `scripts/native-assistant-smoke.py --catalogue-actions` a réussi **huit contrôles sur huit** dans un profil synthétique neuf et un conteneur Linux sans réseau externe. Le rapport local `native-catalogue-report.json` conserve l’empreinte du binaire exécuté : `004a5c9c23cc21040068d0abaf9c339f34096a0af77e380cd073ebac95c34056`.
+
+Le scénario vérifie les actions de métadonnées indisponibles sans fournisseur dans les huit vues, leur activation avec une configuration synthétique et la création de deux analyses hors ligne. Il vérifie ensuite la validation durable d’une proposition avec changements et d’une proposition déjà identique, puis le retrait de deux livres, leur absence après redémarrage, la répétition idempotente du reçu et la restauration par les commandes officielles avec les fichiers conservés. Les propositions sont préparées uniquement dans la fixture marquée, application arrêtée. Le rapport indique zéro appel API payant et zéro écriture sur appareil physique.
+
+Cette preuve porte sur un **binaire local figé avant les derniers ports**. Elle ne porte pas sur le futur binaire final de CI, ne valide pas Windows ou macOS et ne doit pas être présentée comme un rapport de livraison publique. La validation native du binaire final reste à effectuer.
+
+### CI et paquets restant à valider
+
+Le checkpoint Linux incluant le correctif de calcul des empreintes [efd58c7](https://github.com/QrCommunication/library-manager/commit/efd58c7) a réussi. Ce checkpoint précède les derniers changements du portage ; il ne remplace pas la CI du commit final. Les paquets Windows et macOS, les parcours natifs finaux et la signature/notarisation macOS restent à valider. Aucune notarisation accomplie n’est revendiquée dans ce compte rendu.
+
+Voir [le guide utilisateur](USER_GUIDE.md), [le plan de livraison 0.2.1](RELEASE_0.2.1_PLAN.md) et [les environnements et commandes de construction](BUILD.md). Le plan distingue la construction, la signature, la notarisation et la vérification des paquets effectivement publiés.
+
 ## Version 0.2.0 — assistant et revue des métadonnées
 
 État au 10 octobre 2026 : CI, parcours natifs, publication et téléchargements publics validés. Les sources testées sont figées dans [fbcd2f7](https://github.com/QrCommunication/library-manager/commit/fbcd2f7c5828be6e83a9982a66bc85fa0bf7bbcc). Cette version rassemble les corrections du chargement de la bibliothèque et des fiches pendant l’inventaire, la normalisation commune des valeurs et preuves de métadonnées, les diagnostics du fournisseur et les outils d’inspection et de modification autorisée de l’assistant. Les actions de sélection et les accès à la revue sont maintenant visibles depuis la bibliothèque. Une proposition déjà appliquée ne reste pas présentée comme un changement à faire. Le détail du parcours et de ses garanties figure dans [ASSISTANT_METADATA_PLAN.md](ASSISTANT_METADATA_PLAN.md) et [CHANGELOG.md](../CHANGELOG.md).

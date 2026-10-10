@@ -5,6 +5,7 @@
   import type { Book, BookFile, BookFormat, BookPatch, ConversionCapabilities, Job, MetadataProposal, OptimizationProfile, ReadStatus } from '../contracts';
   import { formatDate, formatProviderDiagnostic, formatSize, locale, t } from '../i18n';
   import { createRequestScheduler } from '../request-scheduler';
+  import type { MetadataDisabledReason } from '../selection-capabilities';
 
   interface Props {
     book: Book;
@@ -14,6 +15,9 @@
     onUpdated(book: Book): void;
     onNotify(message: string): void;
     onError(error: unknown): void;
+    metadataReady?: boolean;
+    metadataDisabledReason?: MetadataDisabledReason | null;
+    onOpenSettings?(): void;
   }
   interface Draft {
     title: string; authors: string; authorSort: string; series: string; seriesIndex: string;
@@ -22,7 +26,8 @@
     favorite: boolean; rating: string;
   }
 
-  let { book, refreshVersion, onClose, onReadBook, onUpdated, onNotify, onError }: Props = $props();
+  let { book, refreshVersion, onClose, onReadBook, onUpdated, onNotify, onError,
+    metadataReady = false, metadataDisabledReason = null, onOpenSettings }: Props = $props();
   let dialog: HTMLDialogElement;
   let previousFocus: HTMLElement | null = null;
   let disposed = false;
@@ -36,6 +41,7 @@
   let profiles = $state<OptimizationProfile[]>([]);
   let capabilities = $state<ConversionCapabilities | null>(null);
   let proposal = $state<MetadataProposal | null>(null);
+  let proposalJobId = $state<string | null>(null);
   let warnings = $state<string[]>([]);
   let latestJob = $state<Job | null>(null);
   let selectedProfile = $state('');
@@ -54,6 +60,7 @@
   const percent = $derived(new Intl.NumberFormat($locale, { style: 'percent', maximumFractionDigits: 0 }));
   const failureDetail = $derived(failure ? errorDetail(failure) : null);
   const latestJobDetail = $derived(latestJob?.error ? errorDetail(latestJob.error) : null);
+  const metadataHint = $derived($t(metadataDisabledReason === 'modelMissing' ? 'chat.noModel' : 'errors.providerNotConfigured'));
 
   function errorDetail(error: { code: string; detail: string | null }): string | null {
     return error.code === 'providerError' ? formatProviderDiagnostic(error.code, error.detail, $locale) : error.detail;
@@ -99,6 +106,8 @@
   function applyData({ results, discardDraft }: Awaited<ReturnType<typeof loadData>>, id: string): void {
     if (disposed || book.id !== id) return;
     const [bookResult, filesResult, jobsResult, profilesResult, capabilitiesResult] = results;
+    const staleBookSnapshot = bookResult.status === 'fulfilled' && baseline?.id === id
+      && bookResult.value.revision < baseline.revision;
     if (bookResult.status === 'fulfilled') {
       // A refresh started before a successful save must not restore an older revision.
       if (baseline?.id !== id || bookResult.value.revision >= baseline.revision) {
@@ -121,13 +130,16 @@
       capabilities = capabilitiesResult.value;
       if (!capabilities.outputs.some((format) => format === selectedFormat)) selectedFormat = capabilities.outputs[0] ?? '';
     } else showFailure(capabilitiesResult.reason);
-    if (jobsResult.status === 'fulfilled') {
+    if (jobsResult.status === 'fulfilled' && !staleBookSnapshot) {
       const bookJobs = jobsResult.value.filter((job) => job.bookIds.includes(id)).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
       latestJob = bookJobs[0] ?? null;
-      proposal = bookJobs.filter((job) => job.kind === 'enrich' && job.status === 'completed')
-        .map((job) => proposalFromResult(job.result, id)).find((value) => value !== null) ?? null;
+      const current = remoteBook ?? baseline ?? book;
+      const proposalJob = bookJobs.find((job) => proposalFromJob(job, current) !== null);
+      proposal = proposalJob ? proposalFromJob(proposalJob, current) : null;
+      proposalJobId = proposalJob?.id ?? null;
       warnings = [...new Set([...bookJobs.flatMap((job) => resultWarnings(job.result)), ...(proposal?.warnings ?? [])])];
-    } else showFailure(jobsResult.reason);
+    } else if (jobsResult.status === 'rejected') showFailure(jobsResult.reason);
+    if (staleBookSnapshot) scheduler.refresh();
   }
 
   const scheduler = createRequestScheduler<string, Awaited<ReturnType<typeof loadData>>>({
@@ -151,6 +163,7 @@
       draft = emptyDraft();
       files = [];
       proposal = null;
+      proposalJobId = null;
       warnings = [];
       latestJob = null;
       failure = null;
@@ -219,6 +232,18 @@
   function proposalFromResult(result: unknown, id: string): MetadataProposal | null {
     const candidate = isRecord(result) && 'proposal' in result ? result.proposal : result;
     return isMetadataProposal(candidate) && candidate.bookId === id ? candidate : null;
+  }
+  function proposalFromJob(job: Job, current: Book): MetadataProposal | null {
+    if (job.kind !== 'enrich' || job.status !== 'completed' || !job.bookIds.includes(current.id)) return null;
+    const candidate = proposalFromResult(job.result, current.id);
+    if (!candidate) return null;
+    if (isRecord(job.result) && 'review' in job.result) {
+      const review = job.result.review;
+      return isRecord(review) && review.state === 'pending' && typeof review.reviewRevision === 'number'
+        && Number.isSafeInteger(review.reviewRevision) && review.reviewRevision >= 0
+        && review.reviewRevision === current.revision ? candidate : null;
+    }
+    return current.metadataStatus === 'needsReview' ? candidate : null;
   }
   function resultWarnings(result: unknown): string[] {
     return isRecord(result) && isStringArray(result.warnings) ? result.warnings : [];
@@ -293,18 +318,26 @@
     return patch;
   }
 
-  async function persist(patch: BookPatch): Promise<void> {
-    if (!baseline || busy || conflict || demo || !Object.keys(patch).length) return;
+  async function persist(patch: BookPatch, reviewJobId?: string): Promise<void> {
+    if (!baseline || busy || conflict || demo || (!reviewJobId && !Object.keys(patch).length)) return;
+    if (reviewJobId && (reviewJobId !== proposalJobId || !proposal || dirty)) return;
     const id = baseline.id;
     const expectedRevision = baseline.revision;
     const currentGeneration = generation;
     busy = true;
     failure = null;
     try {
-      const updated = await request('book_update', { id, patch, expectedRevision });
+      const updated = reviewJobId
+        ? await request('book_review', { id, jobId: reviewJobId, patch, expectedRevision })
+        : await request('book_update', { id, patch, expectedRevision });
       if (disposed || book.id !== id || currentGeneration !== generation) return;
       acceptBook(updated);
+      if (reviewJobId || Object.keys(bibliographicPatch(patch)).length > 0) {
+        proposal = null;
+        proposalJobId = null;
+      }
       onUpdated(updated);
+      scheduler.refresh();
       onNotify(`${$t('actions.save')} · ${updated.title}`);
     } catch (error) {
       if (disposed || book.id !== id || currentGeneration !== generation) return;
@@ -331,7 +364,7 @@
     scheduler.setQuery(book.id);
   }
   async function startJob(kind: 'enrich' | 'optimize' | 'convert'): Promise<void> {
-    if (busy || demo || !baseline) return;
+    if (busy || demo || !baseline || (kind === 'enrich' && !metadataReady)) return;
     const id = baseline.id;
     const currentGeneration = generation;
     busy = true;
@@ -399,16 +432,17 @@
     </div>
     <div class="row wrap small muted"><span>{$t('sort.added')}: {formatDate(displayedBook.addedAt, $locale)}</span><span>{$t('reader.progress', { progress: percent.format(displayedBook.readingProgress) })}</span></div>
 
-    {#if proposal && proposalEntries.length > 0}
+    {#if proposal && proposalJobId}
       <section class="metadata-review stack" aria-labelledby="metadata-proposal-title">
         <div class="spread"><h3 id="metadata-proposal-title">{$t('editor.reviewTitle')}</h3><span class="badge">{$t('book.confidence', { progress: percent.format(proposal.confidence) })}</span></div>
         <p class="field-hint">{$t('editor.reviewPending')}</p>
         {#if dirty || conflict}<p class="field-hint">{$t('editor.reviewDraftBlocked')}</p>{/if}
         <p class="small muted">{proposal.providerId} · {proposal.modelId}</p>
         {#each proposalEntries as [field, value] (field)}<div class="proposal-field"><strong>{fieldLabel(field)}</strong><p class="small muted">{$t('editor.currentValue')}: {displayValue(currentValue(field))}</p><p>{$t('editor.proposedValue')}: {displayValue(value)}</p></div>{/each}
+        {#if !proposalEntries.length}<p class="field-hint">{$t('editor.proposalNoChanges')}</p>{/if}
         <h4>{$t('book.sources')}</h4>
         {#each proposal.evidence as evidence, index (index)}<div class="stack evidence"><p class="small"><strong>{fieldLabel(evidence.field)}</strong> · {percent.format(evidence.confidence)}</p><p class="small">{evidence.value}</p><div class="row wrap">{#each [...new Set(evidence.sourceUrls)] as url (url)}<button type="button" class="source-chip" onclick={() => visitSource(url)} title={url}><ExternalLink size={14} />{new URL(url).hostname}</button>{/each}</div></div>{/each}
-        <button class="button primary" type="button" disabled={demo || busy || loading || dirty || conflict || !proposalEntries.length} onclick={() => persist(proposalPatch)}><Check size={16} />{$t('editor.applyProposal')}</button>
+        <button class="button primary" type="button" disabled={demo || busy || loading || baseline === null || dirty || conflict} onclick={() => { if (proposalJobId) void persist(proposalPatch, proposalJobId); }}><Check size={16} />{$t(proposalEntries.length ? 'editor.applyProposal' : 'editor.validateProposal')}</button>
       </section>
     {/if}
 
@@ -449,7 +483,8 @@
     </section>
     <section class="stack operations" aria-labelledby="book-operations-title">
       <h3 id="book-operations-title">{$t('jobs.title')}</h3>
-      <button class="button secondary" type="button" disabled={demo || busy || loading || baseline === null || dirty || conflict} onclick={() => startJob('enrich')}><Sparkles size={16} />{$t('actions.enrich')}</button>
+      <button class="button secondary" type="button" disabled={demo || !metadataReady || busy || loading || baseline === null || dirty || conflict} aria-describedby={!metadataReady ? 'book-metadata-hint' : undefined} title={!metadataReady ? metadataHint : undefined} onclick={() => startJob('enrich')}><Sparkles size={16} />{$t('actions.enrich')}</button>
+      {#if !metadataReady}<div id="book-metadata-hint" class="row wrap"><p class="field-hint">{metadataHint}</p>{#if onOpenSettings}<button class="button ghost" type="button" disabled={busy} onclick={() => { if (!busy) onOpenSettings?.(); }}>{$t('chat.configure')}</button>{/if}</div>{/if}
       <div class="field"><label for="book-profile">{$t('settings.optimizationProfile')}</label><select id="book-profile" class="select" bind:value={selectedProfile} disabled={!profiles.length || busy}>{#each profiles as profile (profile.id)}<option value={profile.id}>{profileLabel(profile)}</option>{/each}</select></div>
       {#if chosenProfile?.removeImages}<p class="field-hint">{$t('optimization.removeImagesWarning')}</p>{/if}
       <button class="button secondary" type="button" disabled={demo || busy || loading || baseline === null || !selectedProfile || dirty || conflict} onclick={() => startJob('optimize')}>{$t('actions.optimize')}</button>

@@ -2,8 +2,7 @@
 
 use std::{
     collections::{BTreeMap, HashSet},
-    fs::File,
-    os::unix::fs::PermissionsExt,
+    fs::{File, TryLockError},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -12,7 +11,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rustix::fs::{FlockOperation, Mode, OFlags};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{
@@ -26,8 +24,10 @@ use crate::{
     DeviceTransport, EnrichmentService, ErrorCode, FileVariant, IndexedDeviceBook, Job, JobKind,
     JobService, JobStatus, LibraryFacets, LibraryService, MetadataStatus, Operation, PreparedChat,
     ProviderId, ProviderService, ProviderStatus, PublicError, ReaderService, Result, Settings,
-    SettingsService, Storage, TransferService, WebClient, chat::ChatProgress,
+    SettingsService, Storage, TransferService, WebClient,
+    chat::ChatProgress,
     providers::public_provider_error,
+    secure_fs::{self, AccessPolicy, SecureDir},
 };
 
 pub type ManagerEventSink = Arc<dyn Fn(&str, Value) + Send + Sync>;
@@ -68,13 +68,10 @@ impl LibraryManager {
                 "The library profile requires an absolute directory",
             ));
         }
+        // Acquire ownership before SQLite initialization or interrupted-job
+        // recovery can mutate the profile from a second process.
+        let profile_lock = Arc::new(lock_profile(root)?);
         let database = Database::new(root)?;
-        let profile_lock = Arc::new(lock_profile(
-            database
-                .path()
-                .parent()
-                .ok_or_else(|| invalid("Missing profile directory"))?,
-        )?);
         let storage = Storage::new(&root.join("books"))?;
         let repository = BookRepository::new(database.clone());
         let settings = SettingsService::new(database.clone(), storage.root())?;
@@ -156,6 +153,34 @@ impl LibraryManager {
         let book = self.library.update(id, patch, revision)?;
         self.library_changed(vec![id.to_owned()], "metadataUpdate");
         Ok(book)
+    }
+    pub fn book_review(
+        &self,
+        id: &str,
+        job_id: &str,
+        patch: &BookPatch,
+        revision: u64,
+    ) -> Result<Book> {
+        let book = self.library.review_book(id, job_id, patch, revision)?;
+        self.library_changed(vec![id.to_owned()], "metadataReview");
+        Ok(book)
+    }
+    pub fn books_remove(
+        &self,
+        request_id: &str,
+        books: &[crate::models::RemoveBookSelection],
+    ) -> Result<crate::models::RemoveBooksResult> {
+        let selections: Vec<_> = books
+            .iter()
+            .map(|book| (book.book_id.clone(), book.expected_revision))
+            .collect();
+        let operations = self.library.remove_books(request_id, &selections)?;
+        let removed_book_ids: Vec<_> = selections.into_iter().map(|(id, _)| id).collect();
+        self.library_changed(removed_book_ids.clone(), "catalogueRemove");
+        Ok(crate::models::RemoveBooksResult {
+            removed_book_ids,
+            operations,
+        })
     }
     pub fn import_books(&self, paths: &[String]) -> Result<Job> {
         validate_batch(paths)?;
@@ -807,18 +832,36 @@ impl LibraryManager {
         let before = self.repository.get(&payload.id, &[])?;
         let baseline = payload.baseline_revision.unwrap_or(before.revision);
         let automatic_allowed = enrichment_may_apply(&before, baseline, &payload.origin);
-        let outcome = self.enrichment.propose(&payload.id, &settings).await?;
+        // Provider I/O is cancellable; once publication starts, wait for its blocking write.
+        let outcome = tokio::select! {
+            result = self.enrichment.propose(&payload.id, &settings) => result?,
+            _ = cancelled(claim.cancellation.clone()) => return Err(AppError::Cancelled),
+        };
+        self.publish_enrichment(claim, &payload, baseline, automatic_allowed, outcome)
+            .await
+    }
+    async fn publish_enrichment(
+        &self,
+        claim: &ClaimedJob,
+        payload: &EnrichPayload,
+        baseline: u64,
+        automatic_allowed: bool,
+        outcome: crate::enrichment::EnrichmentOutcome,
+    ) -> Result<Value> {
         check_cancelled(claim)?;
-        let result = serde_json::to_value(&outcome.proposal)?;
-        self.jobs.update_result(claim, result.clone())?;
-        if outcome.auto_applicable && automatic_allowed && outcome.expected_revision == baseline {
+        // Serialize proofs before changing the book; they remain intact in both review states.
+        let proposal = serde_json::to_value(&outcome.proposal)?;
+        let (review, reason) = if outcome.auto_applicable
+            && automatic_allowed
+            && outcome.expected_revision == baseline
+        {
             let library = self
                 .library
                 .clone()
                 .with_cancellation(claim.cancellation.clone());
             let id = payload.id.clone();
             let patch = outcome.proposal.patch;
-            blocking(move || {
+            let applied = blocking(move || {
                 library.apply_enrichment(
                     &id,
                     &patch,
@@ -828,10 +871,26 @@ impl LibraryManager {
                 )
             })
             .await?;
-            self.library_changed(vec![payload.id], "enrichment");
+            (
+                json!({"state":"applied", "sourceRevision":outcome.expected_revision,
+                        "reviewRevision":applied.revision, "resolvedRevision":applied.revision}),
+                "enrichment",
+            )
         } else {
             let current = self.repository.get(&payload.id, &[])?;
-            if current.metadata_status != MetadataStatus::Verified {
+            if current.revision != outcome.expected_revision {
+                return Err(AppError::RevisionConflict);
+            }
+            if payload.origin == "import" && current.metadata_status == MetadataStatus::Verified {
+                // A recovered import must not reopen metadata already validated by its owner.
+                (
+                    json!({"state":"obsolete", "sourceRevision":outcome.expected_revision,
+                        "reviewRevision":current.revision,"resolvedRevision":current.revision}),
+                    "metadataReview",
+                )
+            } else {
+                let status_changes = current.metadata_status != MetadataStatus::NeedsReview
+                    || current.metadata_confidence != Some(outcome.proposal.confidence);
                 check_cancelled(claim)?;
                 self.repository.set_metadata_status_if_revision(
                     &payload.id,
@@ -839,9 +898,23 @@ impl LibraryManager {
                     Some(outcome.proposal.confidence),
                     outcome.expected_revision,
                 )?;
-                self.library_changed(vec![payload.id], "metadataReview");
+                // The CAS increments only on a status/confidence change. A later read could
+                // observe somebody else's revision and incorrectly admit this old proposal.
+                let revision = outcome.expected_revision + u64::from(status_changes);
+                (
+                    json!({"state":"pending", "sourceRevision":outcome.expected_revision,
+                        "reviewRevision":revision}),
+                    "metadataReview",
+                )
             }
+        };
+        let result = json!({"proposal":proposal,"review":review});
+        // The book commit has succeeded. Do not turn it into a failed/retryable application
+        // if the separate job write fails. execute_claim still attempts final publication.
+        if let Err(error) = self.jobs.update_result(claim, result.clone()) {
+            eprintln!("Enrichment result publication failed: {}", error.code());
         }
+        self.library_changed(vec![payload.id.clone()], reason);
         Ok(result)
     }
     async fn index_job(&self, claim: &ClaimedJob) -> Result<Value> {
@@ -957,13 +1030,15 @@ fn enrichment_may_apply(book: &Book, baseline: u64, origin: &str) -> bool {
 }
 
 fn claim_needs_cleanup(claim: &ClaimedJob) -> bool {
-    matches!(claim.job.kind, JobKind::Transfer | JobKind::Chat)
-        || (claim.job.kind == JobKind::DeviceIndex
-            && claim
-                .payload
-                .get("deviceId")
-                .and_then(Value::as_str)
-                .is_some_and(|id| !id.starts_with("calibre-") && !id.starts_with("crosspoint-")))
+    matches!(
+        claim.job.kind,
+        JobKind::Transfer | JobKind::Chat | JobKind::Enrich
+    ) || (claim.job.kind == JobKind::DeviceIndex
+        && claim
+            .payload
+            .get("deviceId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.starts_with("calibre-") && !id.starts_with("crosspoint-")))
 }
 
 fn limited_index_result(
@@ -1000,28 +1075,48 @@ fn limited_index_result(
 }
 
 fn lock_profile(root: &Path) -> Result<File> {
-    let fd = rustix::fs::open(
-        root.join("runtime.lock"),
-        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
-    )
-    .map_err(std::io::Error::from)?;
-    let file = File::from(fd);
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o777 != 0o600 {
+    let root = secure_fs::absolute_path(root)?;
+    if !root
+        .components()
+        .any(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(invalid("The filesystem root cannot be a library profile"));
+    }
+    let directory = SecureDir::open(&root, true, AccessPolicy::Private)?;
+    secure_fs::make_private(directory.as_file(), false)?;
+    let name = std::ffi::OsStr::new("runtime.lock");
+    let file = match directory.open_regular(name) {
+        Ok(file) => file,
+        Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            match directory.create_new(name, AccessPolicy::Private) {
+                Ok(file) => {
+                    directory.sync()?;
+                    file
+                }
+                Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    directory.open_regular(name)?
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    if !secure_fs::is_private_read_write(&file)? {
         return Err(invalid("Profile lock must be a private regular file"));
     }
-    let stat = rustix::fs::fstat(&file).map_err(std::io::Error::from)?;
-    if stat.st_uid != rustix::process::getuid().as_raw() {
-        return Err(invalid("Profile lock is owned by another user"));
+    let identity = secure_fs::identity(&file)?;
+    if secure_fs::identity(&directory.open_regular(name)?)? != identity {
+        return Err(AppError::Conflict("Profile lock identity changed".into()));
     }
-    rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive).map_err(|error| {
-        if error == rustix::io::Errno::WOULDBLOCK {
-            AppError::ProfileInUse
-        } else {
-            AppError::Io(error.into())
-        }
+    file.try_lock().map_err(|error| match error {
+        TryLockError::WouldBlock => AppError::ProfileInUse,
+        TryLockError::Error(error) => AppError::Io(error),
     })?;
+    if secure_fs::identity(&directory.open_regular(name)?)? != identity {
+        return Err(AppError::Conflict(
+            "Profile lock identity changed during acquisition".into(),
+        ));
+    }
     Ok(file)
 }
 fn validate_batch(values: &[String]) -> Result<()> {
@@ -1154,7 +1249,8 @@ fn job_public_error(kind: JobKind, error: &AppError) -> PublicError {
 mod tests {
     use super::*;
     use crate::JobStatus;
-    use std::os::unix::fs::symlink;
+    #[cfg(unix)]
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use tempfile::TempDir;
 
     type Events = Arc<Mutex<Vec<(String, Value)>>>;
@@ -1170,7 +1266,9 @@ mod tests {
     }
 
     fn fixture() -> (TempDir, LibraryManager, Events, PathBuf) {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::Builder::new()
+            .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
+            .unwrap();
         let events = Arc::new(Mutex::new(Vec::new()));
         let manager = create(&directory.path().join("profile"), events.clone()).unwrap();
         let source = directory.path().join("Synthetic story.txt");
@@ -1180,6 +1278,108 @@ mod tests {
         )
         .unwrap();
         (directory, manager, events, source)
+    }
+
+    #[test]
+    fn catalogue_removal_returns_only_public_receipts_replays_and_notifies_restoration() {
+        let (_directory, manager, events, source) = fixture();
+        let book = manager.library.import(&source).unwrap().book;
+        let completed = manager.enqueue_enrichment(&book, "manual").unwrap();
+        let claim = manager.jobs.claim_next(1).unwrap().unwrap();
+        manager
+            .jobs
+            .complete(&claim, json!({"bookId":book.id,"skipped":"fixture"}))
+            .unwrap();
+        let previous_operations = manager.library.operations().unwrap().len();
+        events.lock().unwrap().clear();
+        let selected = vec![crate::models::RemoveBookSelection {
+            book_id: book.id.clone(),
+            expected_revision: book.revision,
+        }];
+        let request = "aa5e42f6-8d44-4d32-a1d4-51dc32416821";
+        let result = manager.books_remove(request, &selected).unwrap();
+        assert_eq!(
+            result.removed_book_ids.as_slice(),
+            std::slice::from_ref(&book.id)
+        );
+        assert_eq!(result.operations.len(), 1);
+        assert_eq!(result.operations[0].kind, "catalogueRemove");
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains("relativePath"));
+        assert!(!serialized.contains("sha256"));
+        assert!(!serialized.contains(source.to_str().unwrap()));
+        assert_eq!(
+            manager.library_list(&BookQuery::default()).unwrap().total,
+            0
+        );
+        assert_eq!(manager.books_remove(request, &selected).unwrap(), result);
+        assert_eq!(
+            manager.library.operations().unwrap().len(),
+            previous_operations + 1
+        );
+        assert_eq!(
+            manager.jobs.get(&completed.id).unwrap().status,
+            JobStatus::Completed
+        );
+        let notifications = events.lock().unwrap().clone();
+        assert_eq!(notifications.len(), 2);
+        for (name, value) in notifications {
+            assert_eq!(name, "library:changed");
+            assert_eq!(
+                value,
+                json!({"bookIds":[book.id],"reason":"catalogueRemove"})
+            );
+        }
+        manager.operation_undo(&result.operations[0].id).unwrap();
+        assert_eq!(manager.book_get(&book.id).unwrap().title, book.title);
+        assert_eq!(
+            events.lock().unwrap().last().unwrap(),
+            &(
+                "library:changed".into(),
+                json!({"bookIds":[],"reason":"undo"})
+            )
+        );
+        assert_eq!(std::fs::read(source).unwrap(), b"Premier paragraphe.\n\nUn deuxi\xc3\xa8me chapitre : \xc3\xa9t\xc3\xa9, lumi\xc3\xa8re.");
+    }
+
+    #[test]
+    fn catalogue_removal_keeps_active_job_guard_and_revisions_authoritative() {
+        let (_directory, manager, events, source) = fixture();
+        let book = manager.library.import(&source).unwrap().book;
+        let job = manager.book_enrich(&book.id).unwrap();
+        events.lock().unwrap().clear();
+        let selected = vec![crate::models::RemoveBookSelection {
+            book_id: book.id.clone(),
+            expected_revision: book.revision,
+        }];
+        let request = "d2ac9aa5-d4c0-4a9d-8930-27c9f723dc76";
+        let error = manager.books_remove(request, &selected).unwrap_err();
+        assert_eq!(PublicError::from(&error).code, ErrorCode::OperationConflict);
+        assert_eq!(manager.book_get(&book.id).unwrap().revision, book.revision);
+        assert!(events.lock().unwrap().is_empty());
+        manager.jobs.cancel(&job.id).unwrap();
+        events.lock().unwrap().clear();
+        let stale = vec![crate::models::RemoveBookSelection {
+            book_id: book.id.clone(),
+            expected_revision: book.revision + 1,
+        }];
+        assert!(matches!(
+            manager.books_remove(request, &stale),
+            Err(AppError::RevisionConflict)
+        ));
+        assert!(events.lock().unwrap().is_empty());
+        assert!(matches!(
+            manager.books_remove("not-a-uuid", &selected),
+            Err(AppError::InvalidInput(_))
+        ));
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(
+            manager
+                .books_remove(request, &selected)
+                .unwrap()
+                .removed_book_ids,
+            [book.id]
+        );
     }
 
     #[test]
@@ -1507,6 +1707,209 @@ mod tests {
         assert_eq!(payload["baselineRevision"], book.revision);
     }
 
+    fn proposed_outcome(
+        book: &Book,
+        auto_applicable: bool,
+    ) -> crate::enrichment::EnrichmentOutcome {
+        crate::enrichment::EnrichmentOutcome {
+            proposal: crate::MetadataProposal {
+                book_id: book.id.clone(),
+                patch: BookPatch {
+                    title: Some("Proposed title".into()),
+                    ..Default::default()
+                },
+                confidence: 0.95,
+                evidence: vec![crate::MetadataEvidence {
+                    field: "title".into(),
+                    value: "Proposed title".into(),
+                    confidence: 0.95,
+                    source_urls: vec!["https://example.org/edition".into()],
+                }],
+                warnings: vec!["Synthetic manual review".into()],
+                provider_id: ProviderId::Minimax,
+                model_id: "synthetic-model".into(),
+            },
+            expected_revision: book.revision,
+            auto_applicable,
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_analysis_of_verified_book_publishes_pending_review_and_can_be_consumed() {
+        let (_directory, manager, events, source) = fixture();
+        let imported = manager.library.import(&source).unwrap().book;
+        let book = manager
+            .book_update(
+                &imported.id,
+                &BookPatch {
+                    title: Some("Human title".into()),
+                    ..Default::default()
+                },
+                imported.revision,
+            )
+            .unwrap();
+        assert_eq!(book.metadata_status, MetadataStatus::Verified);
+        let job = manager.enqueue_enrichment(&book, "manual").unwrap();
+        let claim = manager.jobs.claim_next(1).unwrap().unwrap();
+        let payload: EnrichPayload = decode(&claim.payload).unwrap();
+        let outcome = proposed_outcome(&book, false);
+        let original_proposal = serde_json::to_value(&outcome.proposal).unwrap();
+        let result = manager
+            .publish_enrichment(&claim, &payload, book.revision, true, outcome)
+            .await
+            .unwrap();
+        let published = manager.book_get(&book.id).unwrap();
+        assert_eq!(published.title, "Human title");
+        assert_eq!(published.metadata_status, MetadataStatus::NeedsReview);
+        assert_eq!(result["proposal"], original_proposal);
+        assert_eq!(result["review"]["state"], "pending");
+        assert_eq!(result["review"]["sourceRevision"], book.revision);
+        assert_eq!(result["review"]["reviewRevision"], published.revision);
+        assert_eq!(
+            manager.jobs.get(&job.id).unwrap().result,
+            Some(result.clone())
+        );
+        manager.jobs.complete(&claim, result).unwrap();
+        let reviewed = manager
+            .book_review(&book.id, &job.id, &BookPatch::default(), published.revision)
+            .unwrap();
+        assert_eq!(reviewed.metadata_status, MetadataStatus::Verified);
+        assert_eq!(
+            manager.jobs.get(&job.id).unwrap().result.unwrap()["review"]["state"],
+            "applied"
+        );
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(name, value)| name == "library:changed"
+                    && value["reason"] == "metadataReview")
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_publication_preserves_proofs_and_records_the_committed_revision() {
+        let (_directory, manager, _events, source) = fixture();
+        let book = manager.library.import(&source).unwrap().book;
+        let job = manager.enqueue_enrichment(&book, "manual").unwrap();
+        let claim = manager.jobs.claim_next(1).unwrap().unwrap();
+        let payload: EnrichPayload = decode(&claim.payload).unwrap();
+        let outcome = proposed_outcome(&book, true);
+        let proposal = serde_json::to_value(&outcome.proposal).unwrap();
+        let result = manager
+            .publish_enrichment(&claim, &payload, book.revision, true, outcome)
+            .await
+            .unwrap();
+        let applied = manager.book_get(&book.id).unwrap();
+        assert_eq!(applied.title, "Proposed title");
+        assert_eq!(applied.metadata_status, MetadataStatus::Verified);
+        assert_eq!(result["proposal"], proposal);
+        assert_eq!(result["review"]["state"], "applied");
+        assert_eq!(result["review"]["sourceRevision"], book.revision);
+        assert_eq!(result["review"]["reviewRevision"], applied.revision);
+        assert_eq!(result["review"]["resolvedRevision"], applied.revision);
+        assert_eq!(manager.jobs.get(&job.id).unwrap().result, Some(result));
+    }
+
+    #[tokio::test]
+    async fn deferred_import_does_not_reopen_a_book_verified_by_its_owner() {
+        let (_directory, manager, _events, source) = fixture();
+        let imported = manager.library.import(&source).unwrap().book;
+        let job = manager.enqueue_enrichment(&imported, "import").unwrap();
+        let claim = manager.jobs.claim_next(1).unwrap().unwrap();
+        let payload: EnrichPayload = decode(&claim.payload).unwrap();
+        let verified = manager
+            .book_update(
+                &imported.id,
+                &BookPatch {
+                    title: Some("Owner verified edition".into()),
+                    ..Default::default()
+                },
+                imported.revision,
+            )
+            .unwrap();
+        let result = manager
+            .publish_enrichment(
+                &claim,
+                &payload,
+                imported.revision,
+                false,
+                proposed_outcome(&verified, true),
+            )
+            .await
+            .unwrap();
+        assert_eq!(manager.book_get(&verified.id).unwrap(), verified);
+        assert_eq!(result["review"]["state"], "obsolete");
+        assert_eq!(result["review"]["sourceRevision"], verified.revision);
+        assert_eq!(result["review"]["resolvedRevision"], verified.revision);
+        assert_eq!(manager.jobs.get(&job.id).unwrap().result, Some(result));
+    }
+
+    #[tokio::test]
+    async fn stale_or_cancelled_analysis_cannot_publish_review_and_assistant_stays_manual() {
+        let (_directory, manager, _events, source) = fixture();
+        let book = manager.library.import(&source).unwrap().book;
+        let job = manager
+            .enqueue_enrichment(&book, "assistantReview")
+            .unwrap();
+        let claim = manager.jobs.claim_next(1).unwrap().unwrap();
+        let payload: EnrichPayload = decode(&claim.payload).unwrap();
+        let personal = manager
+            .book_update(
+                &book.id,
+                &BookPatch {
+                    favorite: Some(true),
+                    ..Default::default()
+                },
+                book.revision,
+            )
+            .unwrap();
+        assert!(matches!(
+            manager
+                .publish_enrichment(
+                    &claim,
+                    &payload,
+                    book.revision,
+                    false,
+                    proposed_outcome(&book, true)
+                )
+                .await,
+            Err(AppError::RevisionConflict)
+        ));
+        assert!(manager.jobs.get(&job.id).unwrap().result.is_none());
+        let result = manager
+            .publish_enrichment(
+                &claim,
+                &payload,
+                book.revision,
+                false,
+                proposed_outcome(&personal, true),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["review"]["state"], "pending");
+        assert_eq!(manager.book_get(&book.id).unwrap().title, book.title);
+        let current = manager.book_get(&book.id).unwrap();
+        manager.jobs.cancel(&job.id).unwrap();
+        assert!(matches!(
+            manager
+                .publish_enrichment(
+                    &claim,
+                    &payload,
+                    current.revision,
+                    true,
+                    proposed_outcome(&current, true)
+                )
+                .await,
+            Err(AppError::Cancelled)
+        ));
+        assert_eq!(
+            manager.book_get(&book.id).unwrap().revision,
+            current.revision
+        );
+    }
+
     #[test]
     fn cleanup_covers_chat_tools_and_keeps_network_index_cancellation() {
         let (_directory, manager, _events, _source) = fixture();
@@ -1524,7 +1927,7 @@ mod tests {
                 json!({"deviceId":"crosspoint-host"}),
                 false,
             ),
-            (JobKind::Enrich, json!({}), false),
+            (JobKind::Enrich, json!({}), true),
         ] {
             let job = manager.jobs.enqueue(kind, payload).unwrap();
             let claim = manager.jobs.claim_next(1).unwrap().unwrap();
@@ -1596,14 +1999,76 @@ mod tests {
         drop(create(&root, events.clone()).unwrap());
         assert!(create(Path::new("relative-profile"), events.clone()).is_err());
         let lock = root.join("runtime.lock");
+        #[cfg(unix)]
         std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+        #[cfg(windows)]
+        {
+            let mut permissions = std::fs::metadata(&lock).unwrap().permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(&lock, permissions).unwrap();
+        }
         assert!(create(&root, events.clone()).is_err());
+        #[cfg(windows)]
+        {
+            let mut permissions = std::fs::metadata(&lock).unwrap().permissions();
+            permissions.set_readonly(false);
+            std::fs::set_permissions(&lock, permissions).unwrap();
+        }
         std::fs::remove_file(&lock).unwrap();
         let unrelated = directory.path().join("unrelated");
         std::fs::write(&unrelated, b"unchanged").unwrap();
+        #[cfg(unix)]
         symlink(&unrelated, &lock).unwrap();
+        #[cfg(windows)]
+        {
+            let target = directory.path().join("unrelated-directory");
+            std::fs::create_dir(&target).unwrap();
+            std::fs::write(target.join("preserved"), b"unchanged").unwrap();
+            let output = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&lock)
+                .arg(&target)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "junction fixture creation failed");
+        }
         assert!(create(&root, events).is_err());
         assert_eq!(std::fs::read(unrelated).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    fn concurrent_profile_openers_have_only_one_owner() {
+        let directory = tempfile::Builder::new()
+            .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
+            .unwrap();
+        let root = directory.path().join("profile");
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let opened = Arc::new(std::sync::Barrier::new(2));
+        let workers = (0..2)
+            .map(|_| {
+                let root = root.clone();
+                let start = start.clone();
+                let opened = opened.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    let result = create(&root, Arc::new(Mutex::new(Vec::new())));
+                    opened.wait();
+                    result
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(AppError::ProfileInUse)))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1686,7 +2151,9 @@ mod tests {
     }
 
     fn device_fixture(count: usize) -> (TempDir, LibraryManager, Events, PathBuf, PathBuf, String) {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::Builder::new()
+            .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
+            .unwrap();
         let events = Arc::new(Mutex::new(Vec::new()));
         let profile = directory.path().join("profile");
         let mut manager = create(&profile, events.clone()).unwrap();

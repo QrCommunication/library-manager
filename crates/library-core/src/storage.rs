@@ -1,13 +1,9 @@
-use std::fs::{self, File, Metadata};
+use std::ffi::OsStr;
+use std::fs::{self, File};
 use std::io::{Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use rustix::fd::OwnedFd;
-use rustix::fs::{
-    AtFlags, Mode, OFlags, RenameFlags, mkdirat, open, openat, renameat_with, unlinkat,
-};
-use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
@@ -15,6 +11,9 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::{BookFormat, BookMetadata};
+use crate::secure_fs::{
+    self, AccessPolicy, FileIdentity, FileSnapshot, PublishResult, SecureDir, absolute_path,
+};
 
 pub const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_READ_BYTES: u64 = 64 * 1024 * 1024;
@@ -36,7 +35,7 @@ pub type StoredOriginal = StoredArtifact;
 #[derive(Debug, Clone)]
 pub struct Storage {
     root: PathBuf,
-    root_fd: Arc<OwnedFd>,
+    root_dir: Arc<SecureDir>,
     identity: FileIdentity,
 }
 
@@ -58,21 +57,20 @@ impl Storage {
                 "The filesystem root cannot be managed storage".into(),
             ));
         }
-        let root_fd = open_absolute_directory(&absolute, true)?;
-        let directory = File::from(root_fd.try_clone()?);
-        let identity = FileIdentity::from_metadata(&directory.metadata()?);
+        let root_dir = SecureDir::open(&absolute, true, AccessPolicy::Private)?;
+        let identity = root_dir.identity()?;
         let canonical = fs::canonicalize(&absolute)?;
-        if FileIdentity::from_metadata(&fs::symlink_metadata(&canonical)?) != identity {
+        if SecureDir::open(&canonical, false, AccessPolicy::Private)?.identity()? != identity {
             return Err(AppError::Conflict(
                 "The storage directory changed during opening".into(),
             ));
         }
-        ensure_owned_directory(&root_fd, &canonical)?;
-        make_private(&directory, 0o700)?;
-        directory.sync_all()?;
+        ensure_owned_directory(&root_dir, &canonical)?;
+        secure_fs::make_private(root_dir.as_file(), false)?;
+        root_dir.sync()?;
         Ok(Self {
             root: canonical,
-            root_fd: Arc::new(root_fd),
+            root_dir: Arc::new(root_dir),
             identity,
         })
     }
@@ -83,8 +81,12 @@ impl Storage {
 
     pub fn resolve(&self, relative: &str) -> Result<PathBuf> {
         let components = relative_components(relative)?;
+        // Validate Windows namespaces and stream/device components even when
+        // the requested leaf does not exist yet.
+        absolute_path(&self.root.join(relative))?;
         self.verify_root()?;
         let mut candidate = self.root.clone();
+        let mut parent = self.root_dir.try_clone()?;
         let mut missing = false;
         for (index, component) in components.iter().enumerate() {
             candidate.push(component);
@@ -98,10 +100,11 @@ impl Storage {
                             "Symbolic links are not allowed in managed paths".into(),
                         ));
                     }
-                    if index + 1 < components.len() && !metadata.is_dir() {
-                        return Err(AppError::InvalidInput(
-                            "A managed path parent is not a directory".into(),
-                        ));
+                    if index + 1 < components.len() || metadata.is_dir() {
+                        parent =
+                            parent.child(OsStr::new(component), false, AccessPolicy::Private)?;
+                    } else {
+                        parent.open_regular(OsStr::new(component))?;
                     }
                     if !fs::canonicalize(&candidate)?.starts_with(&self.root) {
                         return Err(AppError::InvalidInput(
@@ -119,7 +122,7 @@ impl Storage {
     pub fn import_original(&self, source: &Path, format: BookFormat) -> Result<StoredOriginal> {
         let parent = self.parent_for("originals/pending", true)?;
         let mut stage = Stage::new(parent)?;
-        let copied = copy_source(source, &mut stage.file)?;
+        let copied = copy_source(source, stage.file_mut())?;
         let relative = format!("originals/{}.{}", copied.sha256, format.as_str());
         let target = format!("{}.{}", copied.sha256, format.as_str());
         self.finish(stage, &target, &relative, copied, true)
@@ -134,7 +137,7 @@ impl Storage {
         }
         let parent = self.parent_for(relative, true)?;
         let mut stage = Stage::new(parent)?;
-        stage.file.write_all(bytes)?;
+        stage.file_mut().write_all(bytes)?;
         let copied = CopiedContent {
             sha256: hex_digest(Sha256::digest(bytes).as_slice()),
             size_bytes: bytes.len() as u64,
@@ -147,7 +150,7 @@ impl Storage {
         validate_publish_path(relative)?;
         let parent = self.parent_for(relative, true)?;
         let mut stage = Stage::new(parent)?;
-        let copied = copy_source(source_temp, &mut stage.file)?;
+        let copied = copy_source(source_temp, stage.file_mut())?;
         let target = leaf_name(relative)?;
         self.finish(stage, target, relative, copied, false)
     }
@@ -155,7 +158,7 @@ impl Storage {
     pub fn read(&self, relative: &str) -> Result<Vec<u8>> {
         let parent = self.parent_for(relative, false)?;
         let mut file = open_regular_at(&parent, leaf_name(relative)?)?;
-        let before = FileSnapshot::new(&file.metadata()?)?;
+        let before = bounded_snapshot(&file)?;
         if before.size > MAX_READ_BYTES {
             return Err(AppError::Unsupported(
                 "The resource exceeds the in-memory read limit".into(),
@@ -173,7 +176,7 @@ impl Storage {
                 "The resource grew beyond the read limit".into(),
             ));
         }
-        before.verify(&file.metadata()?)?;
+        before.verify(&file)?;
         verify_target_identity(&parent, leaf_name(relative)?, &before)?;
         Ok(bytes)
     }
@@ -192,17 +195,9 @@ impl Storage {
     }
 
     fn verify_root(&self) -> Result<()> {
-        let metadata = fs::symlink_metadata(&self.root)?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_dir()
-            || FileIdentity::from_metadata(&metadata) != self.identity
-        {
-            return Err(AppError::Conflict(
-                "The managed storage directory was replaced".into(),
-            ));
-        }
-        let reopened = open_absolute_directory(&self.root, false)?;
-        if FileIdentity::from_metadata(&File::from(reopened).metadata()?) != self.identity {
+        let reopened = SecureDir::open(&self.root, false, AccessPolicy::Private)
+            .map_err(|_| AppError::Conflict("The managed storage directory was replaced".into()))?;
+        if reopened.identity()? != self.identity {
             return Err(AppError::Conflict(
                 "The managed storage path no longer identifies the profile".into(),
             ));
@@ -210,12 +205,12 @@ impl Storage {
         Ok(())
     }
 
-    fn parent_for(&self, relative: &str, create: bool) -> Result<OwnedFd> {
+    fn parent_for(&self, relative: &str, create: bool) -> Result<SecureDir> {
         let components = relative_components(relative)?;
         self.verify_root()?;
-        let mut parent = self.root_fd.try_clone()?;
+        let mut parent = self.root_dir.try_clone()?;
         for component in components.iter().take(components.len() - 1) {
-            parent = descend_directory(&parent, Path::new(component), create)?;
+            parent = parent.child(OsStr::new(component), create, AccessPolicy::Private)?;
         }
         Ok(parent)
     }
@@ -228,46 +223,35 @@ impl Storage {
         copied: CopiedContent,
         original: bool,
     ) -> Result<StoredArtifact> {
-        stage.file.sync_all()?;
+        stage.file().sync_all()?;
         if original {
-            make_private(&stage.file, 0o400)?;
-            stage.file.sync_all()?;
+            secure_fs::make_private(stage.file(), true)?;
+            stage.file().sync_all()?;
         }
         self.verify_root()?;
-        match renameat_with(
-            &stage.parent,
-            &stage.name,
-            &stage.parent,
-            target,
-            RenameFlags::NOREPLACE,
-        ) {
-            Ok(()) => rustix::fs::fsync(&stage.parent).map_err(std::io::Error::from)?,
-            Err(Errno::EXIST) => {
+        match stage.parent.publish_noreplace(
+            stage.file(),
+            OsStr::new(&stage.name),
+            OsStr::new(target),
+        )? {
+            PublishResult::Published => stage.parent.sync()?,
+            PublishResult::AlreadyExists => {
                 let mut existing = open_regular_at(&stage.parent, target)?;
-                let before = FileSnapshot::new(&existing.metadata()?)?;
+                let before = bounded_snapshot(&existing)?;
                 let content = digest_reader(&mut existing, None)?;
-                before.verify(&existing.metadata()?)?;
+                before.verify(&existing)?;
                 verify_target_identity(&stage.parent, target, &before)?;
                 if content.sha256 != copied.sha256 || content.size_bytes != copied.size_bytes {
                     return Err(AppError::Conflict(
                         "A different file already exists at this library path".into(),
                     ));
                 }
-                if original {
-                    use std::os::unix::fs::PermissionsExt;
-                    if existing.metadata()?.permissions().mode() & 0o777 != 0o400 {
-                        return Err(AppError::Conflict(
-                            "The immutable original permissions were changed".into(),
-                        ));
-                    }
+                if original && !secure_fs::is_private_read_only(&existing)? {
+                    return Err(AppError::Conflict(
+                        "The immutable original permissions were changed".into(),
+                    ));
                 }
             }
-            Err(Errno::NOSYS | Errno::INVAL | Errno::NOTSUP) => {
-                return Err(AppError::Unsupported(
-                    "The filesystem cannot publish files without replacement".into(),
-                ));
-            }
-            Err(error) => return Err(std::io::Error::from(error).into()),
         }
         Ok(StoredArtifact {
             relative_path: relative.into(),
@@ -379,58 +363,6 @@ fn truncate_utf8(value: &mut String, max_bytes: usize) {
     value.truncate(boundary);
 }
 
-fn absolute_path(path: &Path) -> Result<PathBuf> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    if absolute
-        .components()
-        .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
-    {
-        return Err(AppError::InvalidInput(
-            "Filesystem paths cannot contain parent traversal".into(),
-        ));
-    }
-    Ok(absolute)
-}
-
-fn open_absolute_directory(path: &Path, create: bool) -> Result<OwnedFd> {
-    let mut directory =
-        open(Path::new("/"), directory_flags(), Mode::empty()).map_err(std::io::Error::from)?;
-    for component in path.components() {
-        match component {
-            Component::Normal(component) => {
-                directory = descend_directory(&directory, Path::new(component), create)?
-            }
-            Component::RootDir | Component::CurDir => {}
-            _ => return Err(AppError::InvalidInput("Unsafe directory path".into())),
-        }
-    }
-    Ok(directory)
-}
-
-fn descend_directory(parent: &OwnedFd, name: &Path, create: bool) -> Result<OwnedFd> {
-    match openat(parent, name, directory_flags(), Mode::empty()) {
-        Ok(directory) => Ok(directory),
-        Err(Errno::NOENT) if create => {
-            match mkdirat(parent, name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
-                Ok(()) => rustix::fs::fsync(parent).map_err(std::io::Error::from)?,
-                Err(Errno::EXIST) => {}
-                Err(error) => return Err(std::io::Error::from(error).into()),
-            }
-            Ok(openat(parent, name, directory_flags(), Mode::empty())
-                .map_err(std::io::Error::from)?)
-        }
-        Err(error) => Err(std::io::Error::from(error).into()),
-    }
-}
-
-fn directory_flags() -> OFlags {
-    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
-}
-
 fn relative_components(relative: &str) -> Result<Vec<&str>> {
     if relative.is_empty()
         || relative.len() > 4096
@@ -467,7 +399,7 @@ fn validate_publish_path(relative: &str) -> Result<()> {
     Ok(())
 }
 
-fn ensure_owned_directory(directory: &OwnedFd, path: &Path) -> Result<()> {
+fn ensure_owned_directory(directory: &SecureDir, path: &Path) -> Result<()> {
     match open_regular_at(directory, OWNERSHIP_MARKER) {
         Ok(mut marker) => {
             if marker.metadata()?.len() != MARKER_CONTENT.len() as u64 {
@@ -493,14 +425,8 @@ fn ensure_owned_directory(directory: &OwnedFd, path: &Path) -> Result<()> {
                         .into(),
                 ));
             }
-            let fd = openat(
-                directory,
-                OWNERSHIP_MARKER,
-                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::RUSR | Mode::WUSR,
-            )
-            .map_err(std::io::Error::from)?;
-            let mut marker = File::from(fd);
+            let mut marker =
+                directory.create_new(OsStr::new(OWNERSHIP_MARKER), AccessPolicy::Private)?;
             marker.write_all(MARKER_CONTENT)?;
             marker.sync_all()?;
             Ok(())
@@ -509,59 +435,47 @@ fn ensure_owned_directory(directory: &OwnedFd, path: &Path) -> Result<()> {
     }
 }
 
-fn open_regular_at(parent: &OwnedFd, name: &str) -> Result<File> {
-    let fd = openat(
-        parent,
-        name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-        Mode::empty(),
-    )
-    .map_err(std::io::Error::from)?;
-    let file = File::from(fd);
-    if !file.metadata()?.is_file() {
-        return Err(AppError::InvalidInput("A regular file is required".into()));
-    }
-    Ok(file)
-}
-
-fn make_private(file: &File, mode: u32) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(mode))?;
-    }
-    #[cfg(not(unix))]
-    let _ = (file, mode);
-    Ok(())
+fn open_regular_at(parent: &SecureDir, name: &str) -> Result<File> {
+    parent.open_regular(OsStr::new(name))
 }
 
 struct Stage {
-    parent: OwnedFd,
+    parent: SecureDir,
     name: String,
-    file: File,
+    file: Option<File>,
+    identity: FileIdentity,
 }
 
 impl Stage {
-    fn new(parent: OwnedFd) -> Result<Self> {
+    fn new(parent: SecureDir) -> Result<Self> {
         let name = format!("{STAGING_PREFIX}{}", Uuid::new_v4());
-        let fd = openat(
-            &parent,
-            &name,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::RUSR | Mode::WUSR,
-        )
-        .map_err(std::io::Error::from)?;
+        let file = parent.create_new(OsStr::new(&name), AccessPolicy::Private)?;
+        let identity = secure_fs::identity(&file)?;
         Ok(Self {
             parent,
             name,
-            file: File::from(fd),
+            file: Some(file),
+            identity,
         })
+    }
+
+    fn file(&self) -> &File {
+        self.file.as_ref().expect("stage is open until cleanup")
+    }
+
+    fn file_mut(&mut self) -> &mut File {
+        self.file.as_mut().expect("stage is open until cleanup")
     }
 }
 
 impl Drop for Stage {
     fn drop(&mut self) {
-        let _ = unlinkat(&self.parent, &self.name, AtFlags::empty());
+        // Windows pins the stage against external deletion/rename while this
+        // handle is open. Release it before the adapter opens a delete handle.
+        drop(self.file.take());
+        let _ = self
+            .parent
+            .remove_if_identity(OsStr::new(&self.name), self.identity);
     }
 }
 
@@ -580,16 +494,9 @@ impl Source {
         let leaf = absolute
             .file_name()
             .ok_or_else(|| AppError::InvalidInput("Missing source filename".into()))?;
-        let parent = open_absolute_directory(parent_path, false)?;
-        let fd = openat(
-            &parent,
-            Path::new(leaf),
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-            Mode::empty(),
-        )
-        .map_err(std::io::Error::from)?;
-        let file = File::from(fd);
-        let snapshot = FileSnapshot::new(&file.metadata()?)?;
+        let parent = SecureDir::open(parent_path, false, AccessPolicy::Private)?;
+        let file = parent.open_regular(leaf)?;
+        let snapshot = bounded_snapshot(&file)?;
         Ok(Self {
             path: absolute,
             file,
@@ -598,66 +505,21 @@ impl Source {
     }
 
     fn verify(&self) -> Result<()> {
-        self.snapshot.verify(&self.file.metadata()?)?;
+        self.snapshot.verify(&self.file)?;
         let reopened = Source::open(&self.path)
             .map_err(|_| AppError::Conflict("The source path changed while reading".into()))?;
-        self.snapshot.verify(&reopened.file.metadata()?)
+        self.snapshot.verify(&reopened.file)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
-}
-
-impl FileIdentity {
-    fn from_metadata(metadata: &Metadata) -> Self {
-        use std::os::unix::fs::MetadataExt;
-        Self {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        }
+fn bounded_snapshot(file: &File) -> Result<FileSnapshot> {
+    let snapshot = secure_fs::snapshot(file)?;
+    if snapshot.size > MAX_FILE_BYTES {
+        return Err(AppError::Unsupported(
+            "The source exceeds the 512 MiB import limit".into(),
+        ));
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FileSnapshot {
-    identity: FileIdentity,
-    size: u64,
-    modified: (i64, i64),
-    changed: (i64, i64),
-}
-
-impl FileSnapshot {
-    fn new(metadata: &Metadata) -> Result<Self> {
-        use std::os::unix::fs::MetadataExt;
-        if !metadata.is_file() {
-            return Err(AppError::InvalidInput(
-                "Only regular files can be stored".into(),
-            ));
-        }
-        if metadata.len() > MAX_FILE_BYTES {
-            return Err(AppError::Unsupported(
-                "The source exceeds the 512 MiB import limit".into(),
-            ));
-        }
-        Ok(Self {
-            identity: FileIdentity::from_metadata(metadata),
-            size: metadata.len(),
-            modified: (metadata.mtime(), metadata.mtime_nsec()),
-            changed: (metadata.ctime(), metadata.ctime_nsec()),
-        })
-    }
-
-    fn verify(&self, metadata: &Metadata) -> Result<()> {
-        if Self::new(metadata)? != *self {
-            return Err(AppError::Conflict(
-                "The file changed while its content was being read".into(),
-            ));
-        }
-        Ok(())
-    }
+    Ok(snapshot)
 }
 
 struct CopiedContent {
@@ -706,9 +568,9 @@ fn digest_reader(reader: &mut File, mut destination: Option<&mut File>) -> Resul
     })
 }
 
-fn verify_target_identity(parent: &OwnedFd, name: &str, expected: &FileSnapshot) -> Result<()> {
+fn verify_target_identity(parent: &SecureDir, name: &str, expected: &FileSnapshot) -> Result<()> {
     let reopened = open_regular_at(parent, name)?;
-    expected.verify(&reopened.metadata()?)
+    expected.verify(&reopened)
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -724,10 +586,16 @@ fn hex_digest(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
 
+    fn temporary_directory() -> Result<tempfile::TempDir> {
+        let system_root = std::env::temp_dir().canonicalize()?;
+        Ok(tempfile::Builder::new().tempdir_in(system_root)?)
+    }
+
     fn fixture() -> Result<(tempfile::TempDir, Storage)> {
-        let temporary = tempfile::tempdir()?;
+        let temporary = temporary_directory()?;
         let storage = Storage::new(&temporary.path().join("library"))?;
         Ok((temporary, storage))
     }
@@ -736,6 +604,62 @@ mod tests {
         let path = temporary.path().join("source.epub");
         fs::write(&path, bytes)?;
         Ok(path)
+    }
+
+    #[test]
+    fn unsafe_relative_paths_are_rejected_before_creation() -> Result<()> {
+        let (_temporary, storage) = fixture()?;
+        for path in [
+            "../outside",
+            "/outside",
+            "books/../outside",
+            "books/./outside",
+            "books//outside",
+            "books\\outside",
+            "books/\0outside",
+        ] {
+            assert!(storage.resolve(path).is_err(), "{path:?}");
+            assert!(storage.write_new(path, b"Bad").is_err(), "{path:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_unpublished_read_only_original_stage_is_removed_on_drop() -> Result<()> {
+        let (_temporary, storage) = fixture()?;
+        let mut stage = Stage::new(storage.parent_for("originals/pending", true)?)?;
+        stage.file_mut().write_all(b"unpublished original")?;
+        secure_fs::make_private(stage.file(), true)?;
+        let stage_path = storage.root().join("originals").join(&stage.name);
+        assert!(stage_path.exists());
+        drop(stage);
+        assert!(!stage_path.exists());
+        assert!(
+            !fs::read_dir(storage.root().join("originals"))?.any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(STAGING_PREFIX)
+            })
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_streams_and_reserved_names_are_rejected_even_for_missing_files() -> Result<()> {
+        let (_temporary, storage) = fixture()?;
+        for path in [
+            "books/file.epub:stream",
+            "books/NUL.epub",
+            "books/file.",
+            "books/file ",
+        ] {
+            assert!(storage.resolve(path).is_err(), "{path:?}");
+            assert!(storage.write_new(path, b"Bad").is_err(), "{path:?}");
+        }
+        Ok(())
     }
 
     #[test]
@@ -753,25 +677,21 @@ mod tests {
             storage.read(&imported.relative_path)?,
             b"Original book bytes"
         );
-        assert_eq!(
-            fs::metadata(storage.resolve(&imported.relative_path)?)?
-                .permissions()
-                .mode()
-                & 0o777,
-            0o400
-        );
+        let original_file = Source::open(&storage.resolve(&imported.relative_path)?)?.file;
+        assert!(secure_fs::is_private_read_only(&original_file)?);
         assert!(
             storage
                 .write_new(&imported.relative_path, b"Replacement")
                 .is_err()
         );
         let immutable = storage.resolve(&imported.relative_path)?;
-        let snapshot = FileSnapshot::new(&fs::metadata(&immutable)?)?;
+        let immutable_file = Source::open(&immutable)?.file;
+        let snapshot = bounded_snapshot(&immutable_file)?;
         assert_eq!(
             storage.import_original(&immutable, BookFormat::Epub)?,
             imported
         );
-        snapshot.verify(&fs::metadata(immutable)?)?;
+        snapshot.verify(&immutable_file)?;
         assert_eq!(Storage::new(storage.root())?.root(), storage.root());
         Ok(())
     }
@@ -808,6 +728,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn unsafe_relative_paths_and_symbolic_links_cannot_escape_the_library() -> Result<()> {
         let (temporary, storage) = fixture()?;
@@ -848,9 +769,10 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn existing_nonempty_directories_are_preserved_without_permission_changes() -> Result<()> {
-        let temporary = tempfile::tempdir()?;
+        let temporary = temporary_directory()?;
         let user_directory = temporary.path().join("user-books");
         fs::create_dir(&user_directory)?;
         fs::set_permissions(&user_directory, fs::Permissions::from_mode(0o755))?;
@@ -900,6 +822,7 @@ mod tests {
         assert!(relative_components(&long_path).is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_changed_source_and_replaced_storage_root_are_refused() -> Result<()> {
         let (temporary, storage) = fixture()?;
@@ -919,6 +842,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn repeated_reads_detect_source_content_changes_of_the_same_size() -> Result<()> {
         let (temporary, _storage) = fixture()?;

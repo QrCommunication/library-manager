@@ -4,7 +4,7 @@
 
 **Votre bibliothèque, partout où vous lisez.** Application autonome pour organiser les livres numériques, lire les EPUB et préparer des fichiers adaptés aux liseuses. Les paquets Linux sont disponibles ; les installateurs Windows et macOS sont en préparation pour la version **0.2.1**.
 
-[English](README.en.md) · [Téléchargements](https://github.com/QrCommunication/library-manager/releases) · [Documentation](docs/BLUEPRINT.md) · [Signaler un problème](https://github.com/QrCommunication/library-manager/issues)
+[English](README.en.md) · [Téléchargements](https://github.com/QrCommunication/library-manager/releases) · [Guide utilisateur](docs/USER_GUIDE.md) · [Architecture](docs/BLUEPRINT.md) · [Signaler un problème](https://github.com/QrCommunication/library-manager/issues)
 
 Library Manager est développé par QR Communication, sous licence **GPL-3.0**. Son moteur Rust, sa base SQLite et son convertisseur MOBI sont embarqués. **Calibre, Node et Python ne sont pas nécessaires pour utiliser les paquets de l’application.**
 

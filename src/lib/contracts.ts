@@ -241,6 +241,16 @@ export interface Operation {
   createdAt: string;
 }
 
+export interface RemoveBookSelection {
+  bookId: string;
+  expectedRevision: number;
+}
+
+export interface RemoveBooksResult {
+  removedBookIds: string[];
+  operations: Operation[];
+}
+
 export interface Provider {
   id: ProviderId;
   name: string;
@@ -378,6 +388,8 @@ export interface IpcContracts {
   book_files: CommandContract<{ id: string }, BookFile[]>;
   import_books: CommandContract<{ paths: string[] }, Job>;
   book_update: CommandContract<{ id: string; patch: BookPatch; expectedRevision: number }, Book>;
+  book_review: CommandContract<{ id: string; jobId: string; patch: BookPatch; expectedRevision: number }, Book>;
+  books_remove: CommandContract<{ requestId: string; books: RemoveBookSelection[] }, RemoveBooksResult>;
   book_enrich: CommandContract<{ id: string }, Job>;
   book_optimize: CommandContract<{ id: string; profileId: string }, Job>;
   book_convert: CommandContract<{ id: string; format: BookFormat }, Job>;

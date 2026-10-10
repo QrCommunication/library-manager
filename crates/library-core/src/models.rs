@@ -409,6 +409,20 @@ pub struct Operation {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoveBookSelection {
+    pub book_id: String,
+    pub expected_revision: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveBooksResult {
+    pub removed_book_ids: Vec<String>,
+    pub operations: Vec<Operation>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Provider {
@@ -661,6 +675,24 @@ pub struct ConversionCapabilities {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn removal_selection_requires_a_revision_and_refuses_extra_filesystem_instructions() {
+        let selection: RemoveBookSelection =
+            serde_json::from_value(json!({"bookId": "selected-book", "expectedRevision": 7}))
+                .unwrap();
+        assert_eq!(selection.book_id, "selected-book");
+        assert_eq!(selection.expected_revision, 7);
+        for invalid in [
+            json!({"bookId": "selected-book"}),
+            json!({"bookId": "selected-book", "expectedRevision": -1}),
+            json!({"bookId": "selected-book", "expectedRevision": 7.5}),
+            json!({"bookId": "selected-book", "expectedRevision": 7, "path": "/outside/library"}),
+            json!({"bookId": "selected-book", "expectedRevision": 7, "deleteOriginal": true}),
+        ] {
+            assert!(serde_json::from_value::<RemoveBookSelection>(invalid).is_err());
+        }
+    }
 
     #[test]
     fn nullable_patch_distinguishes_absence_clear_and_replacement() {

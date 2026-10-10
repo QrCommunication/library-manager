@@ -1,6 +1,6 @@
 [package]
 name = "library-manager"
-description = "Standalone ebook library manager for Linux desktops and connected ereaders"
+description = "Standalone ebook library manager for Linux, Windows and macOS with connected ereaders"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -41,7 +41,17 @@ pub fn read_inventory_metadata(path: &Path) -> Result<BookMetadata> {
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("Untitled");
-    let mut archive = ZipArchive::new(BufReader::new(File::open(path)?))?;
+    read_inventory_metadata_file(File::open(path)?, fallback)
+}
+
+/// Reads only bounded catalogue metadata from an already-opened source.
+/// Callers retain responsibility for no-follow opening and post-read identity
+/// checks; this function never reopens the source by its original pathname.
+pub fn read_inventory_metadata_file(file: File, fallback: &str) -> Result<BookMetadata> {
+    if !file.metadata()?.file_type().is_file() {
+        return Err(invalid("EPUB source must be a regular file"));
+    }
+    let mut archive = ZipArchive::new(BufReader::new(file))?;
     if archive.len() > MAX_ENTRIES {
         return Err(invalid("EPUB archive has too many entries"));
     }
@@ -1916,6 +1926,10 @@ mod tests {
         );
         write_zip(File::create(&path).unwrap(), &entries, 6).unwrap();
         let metadata = read_inventory_metadata(&path).unwrap();
+        assert_eq!(
+            read_inventory_metadata_file(File::open(&path).unwrap(), "inventory").unwrap(),
+            metadata
+        );
         assert_eq!(metadata, EpubDocument::open(&path).unwrap().metadata);
         assert_eq!(metadata.title, "Catalogue");
         assert_eq!(metadata.authors, ["Auteur"]);
@@ -1932,7 +1946,10 @@ mod tests {
         let mut bytes = fs::read(&path).unwrap();
         bytes[offset] ^= 0xff;
         fs::write(&path, bytes).unwrap();
-        assert_eq!(read_inventory_metadata(&path).unwrap(), metadata);
+        assert_eq!(
+            read_inventory_metadata_file(File::open(&path).unwrap(), "inventory").unwrap(),
+            metadata
+        );
         assert!(inspect_for_import(&path).is_err());
 
         let mut oversized = entries;
@@ -1941,8 +1958,52 @@ mod tests {
             vec![b'x'; MAX_ENTRY_BYTES as usize + 1],
         );
         write_zip(File::create(&path).unwrap(), &oversized, 9).unwrap();
-        assert_eq!(read_inventory_metadata(&path).unwrap(), metadata);
+        assert_eq!(
+            read_inventory_metadata_file(File::open(&path).unwrap(), "inventory").unwrap(),
+            metadata
+        );
         assert!(inspect_for_import(&path).is_err());
+    }
+
+    #[test]
+    fn inventory_open_file_uses_caller_fallback_and_refuses_nonregular_sources() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("original filename.epub");
+        let entries = fixture("3.0", "<d:language>fr</d:language>");
+        write_zip(File::create(&path).unwrap(), &entries, 6).unwrap();
+        assert_eq!(
+            read_inventory_metadata(&path).unwrap().title,
+            "original filename"
+        );
+        assert_eq!(
+            read_inventory_metadata_file(File::open(&path).unwrap(), "Titre fourni — 日本語")
+                .unwrap()
+                .title,
+            "Titre fourni — 日本語"
+        );
+        #[cfg(unix)]
+        assert!(
+            read_inventory_metadata_file(File::open(directory.path()).unwrap(), "directory")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn inventory_open_file_never_reopens_a_replaced_path() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("inventory.epub");
+        let entries = fixture("3.0", "<d:title>Opened edition</d:title>");
+        write_zip(File::create(&path).unwrap(), &entries, 6).unwrap();
+        let file = File::open(&path).unwrap();
+        fs::rename(&path, directory.path().join("retained.epub")).unwrap();
+        fs::write(&path, b"replacement is not a ZIP").unwrap();
+        assert_eq!(
+            read_inventory_metadata_file(file, "inventory")
+                .unwrap()
+                .title,
+            "Opened edition"
+        );
+        assert!(read_inventory_metadata(&path).is_err());
     }
 
     #[test]
@@ -1963,7 +2024,7 @@ mod tests {
             let mut entries = fixture("3.0", "<d:title>Book</d:title>");
             entries.insert("OPS/book.opf".into(), package.as_bytes().to_vec());
             write_zip(File::create(&path).unwrap(), &entries, 6).unwrap();
-            assert!(read_inventory_metadata(&path).is_err());
+            assert!(read_inventory_metadata_file(File::open(&path).unwrap(), "inventory").is_err());
         }
         let mut entries = fixture("3.0", "<d:title>Book</d:title>");
         entries.insert(
@@ -1971,7 +2032,7 @@ mod tests {
             vec![b'x'; MAX_INVENTORY_XML_BYTES as usize + 1],
         );
         write_zip(File::create(&path).unwrap(), &entries, 9).unwrap();
-        assert!(read_inventory_metadata(&path).is_err());
+        assert!(read_inventory_metadata_file(File::open(&path).unwrap(), "inventory").is_err());
     }
 
     #[test]
@@ -1982,7 +2043,7 @@ mod tests {
             let mut entries = fixture("3.0", "<d:title>Book</d:title>");
             entries.insert(unsafe_name.into(), vec![1, 2, 3]);
             write_zip(File::create(&path).unwrap(), &entries, 6).unwrap();
-            assert!(read_inventory_metadata(&path).is_err());
+            assert!(read_inventory_metadata_file(File::open(&path).unwrap(), "inventory").is_err());
         }
         let entries = fixture("3.0", "<d:title>Book</d:title>");
         write_zip(File::create(&path).unwrap(), &entries, 6).unwrap();
@@ -1996,7 +2057,7 @@ mod tests {
         let mut bytes = fs::read(&path).unwrap();
         bytes[offset] ^= 0xff;
         fs::write(&path, bytes).unwrap();
-        assert!(read_inventory_metadata(&path).is_err());
+        assert!(read_inventory_metadata_file(File::open(&path).unwrap(), "inventory").is_err());
     }
 
     #[test]

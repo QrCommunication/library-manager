@@ -570,7 +570,7 @@ impl CalibreService {
                 last_seen_at: Utc::now().to_rfc3339(),
                 warnings: Vec::new(),
             };
-            insert_presence(&self.database.connect()?, &record)?;
+            insert_presence(&*self.database.connect()?, &record)?;
             self.remove_intention(&intention.id)?;
             existing.push(metadata);
             report.warnings.extend(prepared.warnings.iter().cloned());

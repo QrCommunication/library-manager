@@ -13,10 +13,13 @@
   import SettingsView from './lib/components/SettingsView.svelte';
   import ReaderView from './lib/components/ReaderView.svelte';
   import ActivityView from './lib/components/ActivityView.svelte';
+  import DeviceTransferDialog from './lib/components/DeviceTransferDialog.svelte';
+  import RemoveBooksDialog from './lib/components/RemoveBooksDialog.svelte';
   import { chooseBooks, isNative, isPreview, normalizePublicError, request, subscribe } from './lib/api';
   import { defaultQuery } from './lib/contracts';
-  import type { AppBootstrap, AppError, Book, BookQuery, Device, Job, Settings } from './lib/contracts';
+  import type { AppBootstrap, AppError, Book, BookQuery, Device, Job, OptimizationProfile, Provider, RemoveBooksResult, Settings } from './lib/contracts';
   import { setLanguage, t } from './lib/i18n';
+  import { isMetadataReady, metadataDisabledReason as getMetadataDisabledReason, MAX_SELECTED_BOOKS } from './lib/selection-capabilities';
 
   type View = 'library' | 'devices' | 'chat' | 'activity' | 'settings';
   type NavigationKey = View | 'authors' | 'series' | 'genres' | 'reading' | 'favorites';
@@ -37,6 +40,11 @@
   let bootstrap = $state<AppBootstrap | null>(null);
   let devices = $state<Device[]>([]);
   let jobs = $state<Job[]>([]);
+  let providers = $state<Provider[]>([]);
+  let profiles = $state<OptimizationProfile[]>([]);
+  let capabilitiesGeneration = 0;
+  let transferRequest = $state<{ bookIds: string[]; initialDeviceId: string | null } | null>(null);
+  let removeBookIds = $state<string[] | null>(null);
   let startupBusy = $state(true);
   let importing = $state(false);
   let choosingBooks = $state(false);
@@ -62,6 +70,9 @@
   const unlisteners: UnlistenFn[] = [];
 
   const connectedDevice = $derived(devices.find((device) => device.connected) ?? null);
+  const transferReady = $derived(devices.some((device) => device.connected && device.writable));
+  const metadataReady = $derived(isMetadataReady(bootstrap?.settings, providers));
+  const metadataDisabledReason = $derived(getMetadataDisabledReason(bootstrap?.settings, providers));
   const activeJobCount = $derived(jobs.filter((job) => job.status === 'queued' || job.status === 'running').length);
   const preview = isPreview();
 
@@ -85,6 +96,26 @@
     if (bootstrap) bootstrap.settings = settings;
     applySettings(settings);
     refreshVersion += 1;
+    void refreshCapabilities();
+  }
+
+  async function refreshCapabilities(): Promise<void> {
+    const generation = ++capabilitiesGeneration;
+    providers = [];
+    const results = await Promise.allSettled([
+      request('providers_list', undefined), request('optimization_profiles', undefined),
+    ]);
+    if (destroyed || generation !== capabilitiesGeneration) return;
+    const [providerResult, profileResult] = results;
+    if (providerResult.status === 'fulfilled') providers = providerResult.value;
+    else reportError(providerResult.reason);
+    if (profileResult.status === 'fulfilled') profiles = profileResult.value;
+    else { profiles = []; reportError(profileResult.reason); }
+  }
+
+  function notifySettings(message: string): void {
+    notify(message);
+    void refreshCapabilities();
   }
 
   function navigate(key: NavigationKey): void {
@@ -115,9 +146,34 @@
   }
 
   function verifySelectedBooks(): void {
+    if (preview || !metadataReady || selectedBookIds.length === 0 || selectedBookIds.length > MAX_SELECTED_BOOKS) return;
     selectedBookIds = [...selectedBookIds];
     verifyRequested = true;
     openAssistant();
+  }
+
+  function transferSelectedBooks(initialDeviceId?: string): void {
+    if (preview || transferRequest !== null || removeBookIds !== null || !transferReady || selectedBookIds.length === 0 || selectedBookIds.length > MAX_SELECTED_BOOKS) return;
+    if (initialDeviceId && !devices.some((device) => device.id === initialDeviceId && device.connected && device.writable)) return;
+    detailBook = null;
+    transferRequest = { bookIds: [...new Set(selectedBookIds)], initialDeviceId: initialDeviceId ?? null };
+  }
+
+  function removeSelectedBooks(): void {
+    if (destroyed || preview || removeBookIds !== null || transferRequest !== null) return;
+    const ids = [...new Set(selectedBookIds)];
+    if (ids.length === 0 || ids.length > MAX_SELECTED_BOOKS || ids.some((id) => !id.trim())) return;
+    removeBookIds = ids;
+  }
+
+  function acceptRemoval(result: RemoveBooksResult): void {
+    if (destroyed) return;
+    const removed = new Set(result.removedBookIds);
+    selectedBookIds = selectedBookIds.filter((id) => !removed.has(id));
+    if (detailBook && removed.has(detailBook.id)) detailBook = null;
+    if (readingBook && removed.has(readingBook.id)) readingBook = null;
+    removeBookIds = null;
+    refreshVersion += 1;
   }
 
   function chooseAssistantBooks(): void {
@@ -143,6 +199,7 @@
       devices = result.devices;
       jobs = result.pendingJobs;
       applySettings(result.settings);
+      await refreshCapabilities();
     } catch (cause: unknown) {
       reportError(cause);
     } finally {
@@ -241,6 +298,7 @@
   onDestroy(() => {
     destroyed = true;
     importGeneration += 1;
+    capabilitiesGeneration += 1;
     if (toastTimer) clearTimeout(toastTimer);
     if (typeof document !== 'undefined') document.removeEventListener('keydown', focusSearch);
     void Promise.allSettled(unlisteners.map((unlisten) => Promise.resolve().then(unlisten)));
@@ -341,23 +399,33 @@
           onSelectionChange={(ids: string[]) => { selectedBookIds = ids; }}
           onOpenBook={(book: Book) => { detailBook = book; }}
           onOpenAssistant={openAssistant} onVerifySelected={verifySelectedBooks}
+          {metadataReady} {metadataDisabledReason} {transferReady}
+          onTransferSelected={transferSelectedBooks} onOpenSettings={() => navigate('settings')}
+          onRemoveSelected={removeSelectedBooks}
           onReadBook={openReader} onImport={importBooks} onNotify={notify} onError={reportError}
         />
       {:else if activeView === 'devices'}
         <DevicesView
           {devices} {selectedBookIds} {refreshVersion}
+          {metadataReady} {metadataDisabledReason} {transferReady}
+          onOpenAssistant={openAssistant} onVerifySelected={verifySelectedBooks}
+          onTransferSelected={transferSelectedBooks} onOpenSettings={() => navigate('settings')}
+          onRemoveSelected={removeSelectedBooks} onClearSelection={() => { selectedBookIds = []; }}
           onDevicesChange={(next: Device[]) => { devices = next; }} onNotify={notify} onError={reportError}
         />
       {:else if activeView === 'chat'}
         <ChatView
           {selectedBookIds} {refreshVersion} {verifyRequested}
+          {metadataReady} {metadataDisabledReason} {transferReady}
+          onTransferSelected={transferSelectedBooks} onOpenSettings={() => navigate('settings')}
+          onRemoveSelected={removeSelectedBooks} onClearSelection={() => { selectedBookIds = []; }}
           onVerifyStarted={() => { verifyRequested = false; }} onChooseBooks={chooseAssistantBooks}
           onOpenBook={(book: Book) => { detailBook = book; }} onNotify={notify} onError={reportError}
         />
       {:else if activeView === 'activity'}
         <ActivityView {refreshVersion} onNotify={notify} onError={reportError} />
       {:else if activeView === 'settings'}
-        <SettingsView settings={bootstrap.settings} onSettingsChange={changeSettings} onNotify={notify} onError={reportError} />
+        <SettingsView settings={bootstrap.settings} onSettingsChange={changeSettings} onNotify={notifySettings} onError={reportError} />
       {/if}
     </main>
   </div>
@@ -366,8 +434,20 @@
 {#if detailBook}
   <BookPanel
     book={detailBook} {refreshVersion} onClose={() => { detailBook = null; }} onReadBook={openReader}
+    {metadataReady} {metadataDisabledReason} onOpenSettings={() => navigate('settings')}
     onUpdated={(book: Book) => { detailBook = book; refreshVersion += 1; }} onNotify={notify} onError={reportError}
   />
+{/if}
+
+{#if transferRequest}
+  <DeviceTransferDialog bookIds={transferRequest.bookIds} {devices} {profiles}
+    initialDeviceId={transferRequest.initialDeviceId} onClose={() => { transferRequest = null; }}
+    onQueued={updateJob} onNotify={notify} />
+{/if}
+
+{#if removeBookIds}
+  <RemoveBooksDialog bookIds={removeBookIds} onClose={() => { removeBookIds = null; }}
+    onRemoved={acceptRemoval} onNotify={notify} />
 {/if}
 
 {#if dragging}
