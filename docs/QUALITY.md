@@ -2,25 +2,46 @@
 
 ## Version 0.2.0 — assistant et revue des métadonnées
 
-État au 10 octobre 2026, avant validation de la livraison. Cette version rassemble les corrections du chargement de la bibliothèque et des fiches pendant l’inventaire, la normalisation commune des valeurs et preuves de métadonnées, les diagnostics du fournisseur et les outils d’inspection et de modification autorisée de l’assistant. Les actions de sélection et les accès à la revue sont maintenant visibles depuis la bibliothèque. Une proposition déjà appliquée ne reste pas présentée comme un changement à faire. Le détail du parcours et de ses garanties figure dans [ASSISTANT_METADATA_PLAN.md](ASSISTANT_METADATA_PLAN.md) et [CHANGELOG.md](../CHANGELOG.md).
+État au 10 octobre 2026 : CI, parcours natifs, publication et téléchargements publics validés. Les sources testées sont figées dans [fbcd2f7](https://github.com/QrCommunication/library-manager/commit/fbcd2f7c5828be6e83a9982a66bc85fa0bf7bbcc). Cette version rassemble les corrections du chargement de la bibliothèque et des fiches pendant l’inventaire, la normalisation commune des valeurs et preuves de métadonnées, les diagnostics du fournisseur et les outils d’inspection et de modification autorisée de l’assistant. Les actions de sélection et les accès à la revue sont maintenant visibles depuis la bibliothèque. Une proposition déjà appliquée ne reste pas présentée comme un changement à faire. Le détail du parcours et de ses garanties figure dans [ASSISTANT_METADATA_PLAN.md](ASSISTANT_METADATA_PLAN.md) et [CHANGELOG.md](../CHANGELOG.md).
 
 L’accès **Examiner** repose sur une analyse terminée contenant une proposition valide et sur le livre concerné. Le statut `needsReview` seul ne prouve pas qu’une proposition existe. La sélection d’actions est limitée à 200 livres ; les modifications de l’assistant exigent une autorisation pour la demande envoyée et restent limitées aux livres sélectionnés. L’inspection lit les fichiers gérés, vérifie leur intégrité et transmet des extraits bornés, avec priorité aux pages de titre et de copyright. Ces extraits ne constituent pas une lecture intégrale du livre.
 
-### Vérifications locales confirmées
+### Tests et construction sur le commit de livraison
 
 | Périmètre | Résultat et provenance |
 | --- | --- |
-| Interface frontend | 41 tests réussis pour les sources locales |
-| TypeScript/Svelte | Zéro erreur et zéro avertissement au contrôle local |
-| Format Rust | `cargo fmt --all -- --check` réussi localement |
-| Moteur Rust `library-core` | Base validée du paquet local `.5` : 240 tests réussis, un test réseau volontairement ignoré, aucun échec |
-| Coque Tauri | Base validée du paquet local `.5` : huit tests réussis |
+| Moteur Rust `library-core` | 240 tests réussis, un test réseau volontairement ignoré, aucun échec |
+| Coque Tauri | Huit tests réussis |
+| Interface frontend | 41 tests réussis |
+| TypeScript/Svelte | Zéro erreur et zéro avertissement |
+| Format et analyse Rust | `cargo fmt --all -- --check` et Clippy avec `-D warnings` réussis |
+| Notices tierces | Sept autotests réussis |
+| [CI Linux](https://github.com/QrCommunication/library-manager/actions/runs/38014777810) | Réussie sur `fbcd2f7c5828be6e83a9982a66bc85fa0bf7bbcc` ; construction des trois paquets Linux terminée |
+| [CodeQL](https://github.com/QrCommunication/library-manager/actions/runs/38014777024) | Exécution réussie sur le commit de livraison ; ce statut ne ferme pas les alertes historiques documentées plus bas |
 
-Les résultats moteur et Tauri ci-dessus proviennent de la phase locale `.5`, documentée dans le plan assistant. Depuis cette phase, les sources Rust sont inchangées hors déclaration de version ; les changements du parcours 0.2.0 portent sur l’interface et sa documentation. Cette continuité ne remplace pas les tests et constructions de la CI sur le commit exact de livraison.
+Ces résultats portent maintenant sur la CI du commit exact de livraison. Les preuves locales antérieures du paquet `.5`, documentées dans le plan assistant, restent un historique distinct.
 
-### Livraison et preuves encore en cours
+### Parcours natifs du binaire produit par la CI
 
-La CI sur le commit exact, les paquets Linux DEB/RPM/AppImage, leurs parcours natifs et la publication de 0.2.0 sont encore en cours de préparation ou de validation. Aucun de ces résultats n’est déclaré réussi dans cette section. Les liens de rapports, empreintes des artefacts, résultats du parcours partant de zéro sélection et contrôles de téléchargement public seront consignés après vérification. Les preuves historiques `.5`, 0.1.1 et 0.1.0 restent distinctes ; aucune nouvelle compatibilité matérielle ou multiplateforme n’est déduite des tests locaux.
+Trois rapports conservés dans `target/release-artifacts-v0.2.0/` indiquent `status: passed` et la même empreinte SHA-256 du binaire exécuté : `b331925c2cb1a41a54c4b73d2ba7c12dbefb3d42731a36887c0d90c27b173049`.
+
+| Rapport public de la version v0.2.0 | Résultat natif contrôlé |
+| --- | --- |
+| [native-general-report.json](https://github.com/QrCommunication/library-manager/releases/download/v0.2.0/native-general-report.json) | Dix contrôles généraux réussis, version 0.2.0, deux cartes de livres rendues dans le DOM |
+| [native-assistant-report.json](https://github.com/QrCommunication/library-manager/releases/download/v0.2.0/native-assistant-report.json) | Dix contrôles réussis : entrée à zéro sélection, choix de livres, conservation du filtre/tri et du brouillon pendant les actualisations, 33 analyses sans doublons et permission consommée pour une seule demande |
+| [native-review-report.json](https://github.com/QrCommunication/library-manager/releases/download/v0.2.0/native-review-report.json) | Quatre contrôles réussis sur une copie privée : proposition persistée accessible, revue avant le formulaire, application manuelle puis disparition de la proposition appliquée, conservation des originaux et annulation officielle |
+
+Les trois rapports indiquent zéro appel API payant et zéro écriture sur appareil physique. Une capture facultative du parcours général a rencontré un timeout WebKit. Le parcours a été relancé avec un profil neuf sans capture : les dix contrôles passent et le DOM contient deux cartes ; `screenshotSaved` vaut `false`. Aucun succès de capture n’est revendiqué.
+
+### Publication et vérification publique
+
+La [version v0.2.0](https://github.com/QrCommunication/library-manager/releases/tag/v0.2.0) a été publiée le 10 octobre 2026 à 02:04:06 UTC comme version stable et dernière version disponible au moment du contrôle. Elle distribue les paquets Linux [DEB](https://github.com/QrCommunication/library-manager/releases/download/v0.2.0/library-manager_0.2.0_amd64.deb), [RPM](https://github.com/QrCommunication/library-manager/releases/download/v0.2.0/library-manager-0.2.0-1.x86_64.rpm) et [AppImage](https://github.com/QrCommunication/library-manager/releases/download/v0.2.0/library-manager_0.2.0_amd64.AppImage), les sources du commit testé, les licences et les rapports de validation.
+
+Les onze fichiers initiaux ont été téléchargés sans authentification avec HTTP 200 et correspondent aux artefacts publiés, comme le consigne [public-verification.json](https://github.com/QrCommunication/library-manager/releases/download/v0.2.0/public-verification.json). Les dix entrées du [SHA256SUMS](https://github.com/QrCommunication/library-manager/releases/download/v0.2.0/SHA256SUMS) téléchargé sont conformes. Le rapport de vérification a ensuite été ajouté comme douzième fichier et téléchargé à son tour avec HTTP 200 ; son SHA-256 contrôlé séparément est `4a531d87d41c9cbc578d8fe05a44be17f445fb9ac4db4e075681c4e4f2a1ea23`. L’empreinte du DEB public est `fa241b3b127bcbdaffbeb6ebf18184aebc9d0fecd04a04798d32ef3c19525586`. Les trois rapports natifs liés ci-dessus font partie des fichiers publics téléchargés et vérifiés.
+
+La fenêtre réelle du binaire CI 0.2.0 a également été contrôlée sur le profil de l’utilisateur : 134 livres et le bouton **Examiner les propositions** sont visibles. Le processus observé est `720055`. Sa capture reste privée parce qu’elle contient la bibliothèque de l’utilisateur. Ce contrôle lance le binaire extrait du paquet CI ; le système conserve encore le paquet local `.5`, et aucune installation administrateur de 0.2.0 n’est revendiquée.
+
+La construction DEB/RPM/AppImage et ces parcours ne prouvent ni le montage FUSE de l’AppImage, ni un nouveau parcours GUI du RPM, ni une nouvelle compatibilité matérielle. Les preuves historiques `.5`, 0.1.1 et 0.1.0 restent distinctes.
 
 ## Version 0.1.1 — inventaire USB et import depuis la liseuse
 
