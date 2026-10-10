@@ -1,0 +1,438 @@
+name: Native Windows and macOS packages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**'
+      - '!docs/**'
+      - 'docs/THIRD_PARTY_NOTICES.md'
+      - '!README*.md'
+      - '!CHANGELOG.md'
+      - '!CONTRIBUTING.md'
+      - '!SECURITY.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    name: ${{ matrix.platform }} ${{ matrix.arch }} native packages
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            platform: windows
+            arch: x64
+            target: x86_64-pc-windows-msvc
+            bundles: msi,nsis
+          - runner: macos-26
+            platform: macos
+            arch: arm64
+            target: aarch64-apple-darwin
+            bundles: app,dmg
+          - runner: macos-26-intel
+            platform: macos
+            arch: x64
+            target: x86_64-apple-darwin
+            bundles: app,dmg
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TERM_COLOR: always
+      PYTHONUTF8: '1'
+      PACKAGE_PLATFORM: ${{ matrix.platform }}
+      PACKAGE_ARCH: ${{ matrix.arch }}
+      PACKAGE_TARGET: ${{ matrix.target }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout the exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1
+        with:
+          version: 10.33.0
+          run_install: false
+
+      - name: Install Node.js build runtime
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1
+        with:
+          node-version: 26.11.1
+          cache: pnpm
+
+      - name: Install the native Rust toolchain
+        uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # Rust 1.99
+        with:
+          toolchain: 1.99.0
+          components: rustfmt, clippy
+
+      - name: Cache Rust build dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: '. -> target'
+          key: ${{ matrix.target }}
+
+      - name: Install the isolated Windows sidecar toolchain
+        if: runner.os == 'Windows'
+        id: msys2
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
+        with:
+          msystem: UCRT64
+          path-type: minimal
+          update: true
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-zlib
+
+      - name: Select the actual MSYS2 installation
+        if: runner.os == 'Windows'
+        env:
+          MSYS2_INSTALLATION: ${{ steps.msys2.outputs.msys2-location }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          root = Path(os.environ['MSYS2_INSTALLATION'])
+          if not root.is_absolute() or not (root / 'usr/bin/bash.exe').is_file():
+              raise SystemExit('The MSYS2 action did not provide a usable absolute installation path')
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as stream:
+              stream.write(f'LIBRARY_MANAGER_MSYS2_ROOT={root}\n')
+          PY
+
+      - name: Enable the native MSI prerequisite
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $capabilities = @(Get-WindowsCapability -Online | Where-Object Name -Like 'VBSCRIPT*')
+          if ($capabilities.Count -eq 0) { throw 'Windows VBScript capability is required by the MSI toolchain' }
+          foreach ($capability in $capabilities) {
+            if ($capability.State -ne 'Installed') {
+              Add-WindowsCapability -Online -Name $capability.Name | Out-Null
+            }
+          }
+
+      - name: Check version, checkout and native architecture
+        run: |
+          python - <<'PY'
+          import json, os, re, subprocess, tomllib
+          from pathlib import Path
+          version = json.loads(Path('package.json').read_text())['version']
+          desktop = json.loads(Path('src-tauri/tauri.conf.json').read_text())['version']
+          workspace = tomllib.loads(Path('Cargo.toml').read_text())['workspace']['package']['version']
+          if version != desktop or version != workspace or not re.fullmatch(r'\d+\.\d+\.\d+', version):
+              raise SystemExit('Package, workspace and Tauri release versions must agree')
+          commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          if commit != os.environ['GITHUB_SHA']:
+              raise SystemExit('Checkout does not match the requested workflow commit')
+          host = next(line[6:] for line in subprocess.check_output(['rustc', '-vV'], text=True).splitlines() if line.startswith('host: '))
+          if host != os.environ['PACKAGE_TARGET']:
+              raise SystemExit('A native runner is required; cross-compilation is deliberately refused')
+          epoch = subprocess.check_output(['git', 'log', '-1', '--format=%ct'], text=True).strip()
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as stream:
+              stream.write(f'PACKAGE_VERSION={version}\nSOURCE_DATE_EPOCH={epoch}\n')
+              if os.environ['PACKAGE_PLATFORM'] == 'macos':
+                  stream.write('MACOSX_DEPLOYMENT_TARGET=13.0\n')
+          PY
+
+      - name: Install locked dependencies
+        run: |
+          pnpm install --frozen-lockfile
+          cargo fetch --locked
+
+      - name: Check the interface and native workspace
+        run: |
+          pnpm check
+          pnpm test
+          pnpm build
+          cargo fmt --all -- --check
+          cargo test --workspace --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          python scripts/third-party-notices.py --self-test
+          python scripts/third-party-notices.py --check
+
+      - name: Determine Apple signing readiness
+        if: runner.os == 'macOS'
+        id: signing
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          present = lambda names: all(os.environ.get(name) for name in names)
+          certificate = present(('APPLE_CERTIFICATE', 'APPLE_CERTIFICATE_PASSWORD', 'APPLE_SIGNING_IDENTITY', 'APPLE_TEAM_ID'))
+          api = present(('APPLE_API_ISSUER', 'APPLE_API_KEY', 'APPLE_API_KEY_CONTENT'))
+          apple_id = present(('APPLE_ID', 'APPLE_PASSWORD', 'APPLE_TEAM_ID'))
+          signed = certificate and (api or apple_id)
+          configured = any(os.environ.get(name) for name in ('APPLE_CERTIFICATE', 'APPLE_CERTIFICATE_PASSWORD', 'APPLE_SIGNING_IDENTITY', 'APPLE_TEAM_ID', 'APPLE_API_ISSUER', 'APPLE_API_KEY', 'APPLE_API_KEY_CONTENT', 'APPLE_ID', 'APPLE_PASSWORD'))
+          method = 'apiKey' if signed and api else 'appleId' if signed else 'none'
+          mode = 'signed' if signed else 'incomplete' if configured else 'unsigned'
+          Path('artifacts').mkdir(exist_ok=True)
+          Path('artifacts/signing-readiness.json').write_text(json.dumps({'mode': mode, 'method': method, 'completeCertificate': certificate, 'completeApiCredentials': api, 'completeAppleIdCredentials': apple_id}, indent=2) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as stream:
+              stream.write(f'mode={mode}\nmethod={method}\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as stream:
+              stream.write('Apple Developer ID signing and notarization enabled.\n' if signed else 'Apple signing configuration is incomplete; packaging is blocked.\n' if configured else 'UNSIGNED macOS build: no Apple credentials are configured; no Developer ID or notarization claim.\n')
+          if configured and not signed:
+              raise SystemExit('Incomplete Apple signing/notarization configuration; refusing an unsigned fallback')
+          PY
+
+      - name: Install the PKCS12 conversion tool
+        if: runner.os == 'macOS' && steps.signing.outputs.mode == 'signed'
+        run: brew install openssl@3
+
+      - name: Prepare the temporary Apple keychain and API key
+        if: runner.os == 'macOS' && steps.signing.outputs.mode == 'signed'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+          NOTARIZATION_METHOD: ${{ steps.signing.outputs.method }}
+        run: |
+          python - <<'PY'
+          import base64, json, os, secrets, shlex, subprocess, tempfile
+          from pathlib import Path
+          def execute(argv, data=None):
+              result = subprocess.run(argv, input=data, capture_output=True)
+              if result.returncode:
+                  raise SystemExit('Apple signing preparation failed; sensitive command output is withheld')
+              return result.stdout
+          def protected(path, value):
+              fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+              with os.fdopen(fd, 'wb') as stream:
+                  stream.write(value)
+          directory = Path(tempfile.mkdtemp(prefix='library-manager-apple-', dir=os.environ['RUNNER_TEMP']))
+          directory.chmod(0o700)
+          keychain = directory / 'signing.keychain-db'
+          password = secrets.token_hex(32)
+          previous = shlex.split(execute(['security', 'list-keychains', '-d', 'user']).decode())
+          state = directory / 'state.json'
+          protected(state, json.dumps({'directory': str(directory), 'keychain': str(keychain), 'previousKeychains': previous}).encode())
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as stream:
+              stream.write(f'LIBRARY_MANAGER_APPLE_STATE={state}\n')
+          original = directory / 'certificate.p12'
+          protected(original, base64.b64decode(''.join(os.environ['APPLE_CERTIFICATE'].split()), validate=True))
+          openssl = str(Path(execute(['brew', '--prefix', 'openssl@3']).decode().strip()) / 'bin/openssl')
+          # Re-export in memory to the PKCS12 format accepted by Apple's security utility.
+          material = execute([openssl, 'pkcs12', '-legacy', '-in', str(original), '-passin', 'env:APPLE_CERTIFICATE_PASSWORD', '-nodes'])
+          compatible = execute([openssl, 'pkcs12', '-export', '-legacy', '-passout', 'env:APPLE_CERTIFICATE_PASSWORD'], material)
+          del material
+          certificate = directory / 'compatible.p12'
+          protected(certificate, compatible)
+          execute(['security', 'create-keychain', '-p', password, str(keychain)])
+          execute(['security', 'set-keychain-settings', '-lut', '7200', str(keychain)])
+          execute(['security', 'unlock-keychain', '-p', password, str(keychain)])
+          execute(['security', 'import', str(certificate), '-k', str(keychain), '-P', os.environ['APPLE_CERTIFICATE_PASSWORD'], '-T', '/usr/bin/codesign'])
+          execute(['security', 'set-key-partition-list', '-S', 'apple-tool:,apple:,codesign:', '-s', '-k', password, str(keychain)])
+          execute(['security', 'list-keychains', '-d', 'user', '-s', str(keychain), *previous])
+          if os.environ['NOTARIZATION_METHOD'] == 'apiKey':
+              api_key = directory / 'notarization.p8'
+              protected(api_key, os.environ['APPLE_API_KEY_CONTENT'].encode())
+              with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as stream:
+                  stream.write(f'APPLE_API_KEY_PATH={api_key}\n')
+          PY
+
+      - name: Build unsigned Windows installers
+        if: runner.os == 'Windows'
+        run: pnpm tauri build --ci --target "$PACKAGE_TARGET" --bundles msi,nsis -- --locked
+
+      - name: Build unsigned macOS application and DMG
+        if: runner.os == 'macOS' && steps.signing.outputs.mode == 'unsigned'
+        env:
+          APPLE_SIGNING_IDENTITY: '-'
+        run: pnpm tauri build --ci --target "$PACKAGE_TARGET" --bundles app,dmg -- --locked
+
+      - name: Build Developer ID application and DMG
+        if: runner.os == 'macOS' && steps.signing.outputs.mode == 'signed'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_ISSUER: ${{ steps.signing.outputs.method == 'apiKey' && secrets.APPLE_API_ISSUER || '' }}
+          APPLE_API_KEY: ${{ steps.signing.outputs.method == 'apiKey' && secrets.APPLE_API_KEY || '' }}
+          APPLE_ID: ${{ steps.signing.outputs.method == 'appleId' && secrets.APPLE_ID || '' }}
+          APPLE_PASSWORD: ${{ steps.signing.outputs.method == 'appleId' && secrets.APPLE_PASSWORD || '' }}
+        run: pnpm tauri build --ci --target "$PACKAGE_TARGET" --bundles app,dmg -- --locked
+
+      - name: Sign, notarize and verify the macOS disk image
+        if: runner.os == 'macOS' && steps.signing.outputs.mode == 'signed'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          NOTARIZATION_METHOD: ${{ steps.signing.outputs.method }}
+        run: |
+          python - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          def execute(argv):
+              result = subprocess.run(argv, capture_output=True, text=True)
+              if result.returncode:
+                  raise SystemExit('macOS signature, notarization or Gatekeeper verification failed; sensitive output is withheld')
+              return result
+          bundle = Path('target') / os.environ['PACKAGE_TARGET'] / 'release/bundle'
+          apps, dmgs = list(bundle.glob('macos/*.app')), list(bundle.glob('dmg/*.dmg'))
+          if len(apps) != 1 or len(dmgs) != 1:
+              raise SystemExit('Expected exactly one application and one disk image')
+          app, dmg = apps[0], dmgs[0]
+          execute(['codesign', '--verify', '--deep', '--strict', str(app)])
+          identity = execute(['codesign', '-dv', '--verbose=4', str(app)]).stderr
+          if f"TeamIdentifier={os.environ['APPLE_TEAM_ID']}" not in identity:
+              raise SystemExit('Application signature does not match the configured Apple team')
+          sidecar = app / 'Contents/MacOS/library-manager-mobitool'
+          execute(['codesign', '--verify', '--strict', str(sidecar)])
+          sidecar_identity = execute(['codesign', '-dv', '--verbose=4', str(sidecar)]).stderr
+          if f"TeamIdentifier={os.environ['APPLE_TEAM_ID']}" not in sidecar_identity:
+              raise SystemExit('Bundled MOBI sidecar signature does not match the configured Apple team')
+          execute(['xcrun', 'stapler', 'validate', str(app)])
+          execute(['spctl', '--assess', '--type', 'execute', '--verbose=4', str(app)])
+          execute(['codesign', '--force', '--timestamp', '--sign', os.environ['APPLE_SIGNING_IDENTITY'], str(dmg)])
+          execute(['codesign', '--verify', '--strict', str(dmg)])
+          authentication = (['--key', os.environ['APPLE_API_KEY_PATH'], '--key-id', os.environ['APPLE_API_KEY'], '--issuer', os.environ['APPLE_API_ISSUER']]
+                            if os.environ['NOTARIZATION_METHOD'] == 'apiKey'
+                            else ['--apple-id', os.environ['APPLE_ID'], '--password', os.environ['APPLE_PASSWORD'], '--team-id', os.environ['APPLE_TEAM_ID']])
+          submission = execute(['xcrun', 'notarytool', 'submit', str(dmg), *authentication, '--wait', '--output-format', 'json'])
+          response = json.loads(submission.stdout)
+          accepted = response.get('status') == 'Accepted'
+          Path('artifacts/notarization-report.json').write_text(json.dumps({'applicationCodesignVerified': True, 'applicationTeamMatched': True, 'sidecarCodesignVerified': True, 'sidecarTeamMatched': True, 'applicationStaplerValidated': True, 'applicationGatekeeperAccepted': True, 'diskImageCodesignVerified': True, 'diskImageNotarizationStatus': response.get('status'), 'diskImageSubmissionId': response.get('id')}, indent=2) + '\n')
+          if not accepted:
+              raise SystemExit('Apple did not accept disk image notarization')
+          execute(['xcrun', 'stapler', 'staple', str(dmg)])
+          execute(['xcrun', 'stapler', 'validate', str(dmg)])
+          execute(['spctl', '--assess', '--type', 'open', '--context', 'context:primary-signature', '--verbose=4', str(dmg)])
+          report = json.loads(Path('artifacts/notarization-report.json').read_text())
+          report.update({'diskImageStaplerValidated': True, 'diskImageGatekeeperAccepted': True})
+          Path('artifacts/notarization-report.json').write_text(json.dumps(report, indent=2) + '\n')
+          PY
+
+      - name: Collect and verify native packages
+        env:
+          SIGNING_MODE: ${{ steps.signing.outputs.mode || 'unsigned' }}
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, platform, plistlib, shutil, subprocess
+          from pathlib import Path
+          destination = Path('artifacts')
+          destination.mkdir(exist_ok=True)
+          target, version, system, arch, mode = (os.environ[name] for name in ('PACKAGE_TARGET', 'PACKAGE_VERSION', 'PACKAGE_PLATFORM', 'PACKAGE_ARCH', 'SIGNING_MODE'))
+          bundle = Path('target') / target / 'release/bundle'
+          prefix = f'library-manager_{version}_{system}_{arch}_{mode}'
+          assets = []
+          if system == 'windows':
+              for directory, suffix, name in (('msi', 'msi', f'{prefix}.msi'), ('nsis', 'exe', f'{prefix}_setup.exe')):
+                  matches = list(bundle.glob(f'{directory}/*.{suffix}'))
+                  if len(matches) != 1 or version not in matches[0].name:
+                      raise SystemExit(f'Expected exactly one versioned {suffix} installer')
+                  shutil.copy2(matches[0], destination / name)
+                  assets.append(name)
+              sidecar = Path('src-tauri/binaries') / f'library-manager-mobitool-{target}.exe'
+              subprocess.run([str(sidecar.resolve()), '-v'], check=True, capture_output=True)
+              dependency_log = Path('target') / f'libmobi-{target}' / 'dependencies.log'
+              if not dependency_log.is_file():
+                  raise SystemExit('Windows sidecar DLL audit report is missing')
+              shutil.copy2(dependency_log, destination / 'sidecar-dependencies.log')
+          else:
+              apps, dmgs = list(bundle.glob('macos/*.app')), list(bundle.glob('dmg/*.dmg'))
+              if len(apps) != 1 or len(dmgs) != 1 or version not in dmgs[0].name:
+                  raise SystemExit('Expected exactly one versioned DMG and application bundle')
+              app = apps[0]
+              info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
+              if info['CFBundleShortVersionString'] != version:
+                  raise SystemExit('Application bundle version differs from the release version')
+              executable = app / 'Contents/MacOS' / info['CFBundleExecutable']
+              sidecar = app / 'Contents/MacOS/library-manager-mobitool'
+              expected_arch = 'arm64' if arch == 'arm64' else 'x86_64'
+              for binary in (executable, sidecar):
+                  detected = subprocess.check_output(['lipo', '-archs', str(binary)], text=True).split()
+                  if detected != [expected_arch]:
+                      raise SystemExit('Application and bundled sidecar must match the native architecture')
+              for notice in ('libmobi-COPYING', 'Library-Manager-GPL3', 'THIRD_PARTY_NOTICES.md'):
+                  if not (app / 'Contents/Resources/licenses' / notice).is_file():
+                      raise SystemExit('Application bundle is missing a required license notice')
+              subprocess.run([str(sidecar.resolve()), '-v'], check=True, capture_output=True)
+              dmg_name, app_name = f'{prefix}.dmg', f'{prefix}.app.zip'
+              shutil.copy2(dmgs[0], destination / dmg_name)
+              subprocess.run(['ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(app), str(destination / app_name)], check=True)
+              assets.extend((dmg_name, app_name))
+          shutil.copy2('LICENSE', destination / 'LICENSE')
+          shutil.copy2('docs/THIRD_PARTY_NOTICES.md', destination / 'THIRD_PARTY_NOTICES.md')
+          report = {'commit': os.environ['GITHUB_SHA'], 'version': version, 'platform': system, 'architecture': arch, 'target': target, 'runnerOs': platform.platform(), 'signingMode': mode, 'nativeSidecarExecuted': True, 'nativeGuiTested': False, 'windows11Tested': False, 'assets': assets}
+          (destination / 'package-report.json').write_text(json.dumps(report, indent=2) + '\n')
+          lines = []
+          for file in sorted(destination.iterdir()):
+              if file.is_file() and file.name != 'SHA256SUMS':
+                  with file.open('rb') as stream:
+                      digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+                  lines.append(f'{digest}  {file.name}')
+          (destination / 'SHA256SUMS').write_text('\n'.join(lines) + '\n')
+          for line in lines:
+              digest, name = line.split('  ', 1)
+              with (destination / name).open('rb') as stream:
+                  if hashlib.file_digest(stream, 'sha256').hexdigest() != digest:
+                      raise SystemExit('Package checksum verification failed')
+          PY
+
+      - name: Upload reviewable native packages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: library-manager-${{ matrix.platform }}-${{ matrix.arch }}-${{ steps.signing.outputs.mode || 'unsigned' }}-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Remove Apple credentials and temporary keychain
+        if: always() && runner.os == 'macOS'
+        run: |
+          python - <<'PY'
+          import json, os, shutil, subprocess
+          from pathlib import Path
+          state_path = os.environ.get('LIBRARY_MANAGER_APPLE_STATE')
+          if state_path:
+              path = Path(state_path)
+              if path.is_file():
+                  state = json.loads(path.read_text())
+                  failures = []
+                  keychain = Path(state['keychain'])
+                  if keychain.exists():
+                      for argv in (['security', 'list-keychains', '-d', 'user', '-s', *state['previousKeychains']], ['security', 'delete-keychain', str(keychain)]):
+                          if subprocess.run(argv, capture_output=True).returncode:
+                              failures.append(True)
+                  shutil.rmtree(state['directory'])
+                  if failures:
+                      raise SystemExit('Temporary Apple keychain cleanup failed; credentials were removed')
+          PY
+
+      - name: Upload safe diagnostic reports after failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: library-manager-diagnostics-${{ matrix.platform }}-${{ matrix.arch }}-${{ github.sha }}
+          path: |
+            artifacts/*-report.json
+            artifacts/signing-readiness.json
+            artifacts/sidecar-dependencies.log
+          if-no-files-found: ignore
+          retention-days: 14

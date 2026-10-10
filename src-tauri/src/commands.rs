@@ -21,7 +21,10 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 type IpcResult<T> = std::result::Result<T, PublicError>;
 
+#[cfg(not(windows))]
 const MOBITOOL_NAME: &str = "library-manager-mobitool";
+#[cfg(windows)]
+const MOBITOOL_NAME: &str = "library-manager-mobitool.exe";
 const EVENT_NAMES: &[&str] = &[
     "library:changed",
     "devices:changed",

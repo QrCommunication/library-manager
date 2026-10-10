@@ -744,8 +744,8 @@ mod tests {
     }
 
     #[test]
-    fn xml_literal_text_is_preserved_and_storage_symlinks_are_refused() {
-        let (directory, reader) = fixture(
+    fn xml_literal_text_is_preserved() {
+        let (_directory, reader) = fixture(
             "<html><body><pre><![CDATA[literal <!ENTITY example> & symbols]]></pre><p>co<em>de</em>base</p></body></html>",
         );
         let section = reader.section("book", 0).unwrap();
@@ -755,6 +755,12 @@ mod tests {
                 .contains("literal &lt;!ENTITY example&gt; &amp; symbols")
         );
         assert!(section.html.contains("co<em>de</em>base"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_symlinks_are_refused() {
+        let (directory, reader) = fixture("<html><body><p>Safe text.</p></body></html>");
         let file = reader.repository.files("book").unwrap().remove(0);
         let path = reader.storage.resolve(&file.relative_path).unwrap();
         fs::rename(&path, directory.path().join("kept.epub")).unwrap();

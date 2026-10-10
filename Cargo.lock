@@ -2348,7 +2348,7 @@ dependencies = [
 
 [[package]]
 name = "library-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ammonia",
  "base64 0.23.1",
@@ -2378,11 +2378,12 @@ dependencies = [
 
 [[package]]
 name = "library-manager"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "library-core",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
