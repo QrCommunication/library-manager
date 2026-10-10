@@ -367,7 +367,10 @@ fn source_fingerprint(
             input.extend_from_slice(value.as_encoded_bytes());
         }
     }
-    Ok(format!("{:x}", Sha256::digest(&input)))
+    Ok(Sha256::digest(&input)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn collect_source_files(directory: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
@@ -412,7 +415,11 @@ fn hash_file(file: &Path) -> io::Result<String> {
         }
         digest.update(&buffer[..length]);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn run_logged(command: &mut Command, directory: &Path, step: &str) -> io::Result<()> {
