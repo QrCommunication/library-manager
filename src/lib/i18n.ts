@@ -15,6 +15,15 @@ export type Translator = (key: string, params?: TranslationParams) => string;
 
 const FALLBACK_LOCALE = 'en';
 const SIZE_UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'] as const;
+const PROVIDER_DIAGNOSTIC_KEYS = new Set([
+  'providerDiagnostics.authenticationRejected',
+  'providerDiagnostics.requestRejected',
+  'providerDiagnostics.requestFailed',
+  'providerDiagnostics.responseIncomplete',
+  'providerDiagnostics.responseMalformed',
+  'providerDiagnostics.noFinalAnswer',
+  'providerDiagnostics.metadataInvalid',
+]);
 const modules = import.meta.glob<unknown>('./locales/*.json', {
   eager: true,
   import: 'default',
@@ -111,6 +120,16 @@ function createTranslator(language: string): Translator {
 }
 
 export const t = derived(locale, ($locale) => createTranslator(normalizeLocale($locale)));
+
+export function formatProviderDiagnostic(
+  code: string,
+  detail: string | null,
+  language = get(locale),
+): string | null {
+  if (code !== 'providerError' || detail === null || !PROVIDER_DIAGNOSTIC_KEYS.has(detail)) return null;
+  const translated = createTranslator(normalizeLocale(language))(detail);
+  return translated === detail || translated.trim() === '' ? null : translated;
+}
 
 export function formatSize(bytes: number, language = get(locale)): string {
   if (!Number.isFinite(bytes) || bytes < 0) return '—';

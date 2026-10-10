@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path};
 use std::str::FromStr;
 
@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::database::Database;
 use crate::error::{AppError, Result};
 use crate::models::{
-    Book, BookFile, BookMetadata, BookPage, BookQuery, BookSort, Facet, LibraryFacets,
+    Book, BookFile, BookMetadata, BookPage, BookQuery, BookSort, Facet, FileVariant, LibraryFacets,
     MetadataStatus, Operation, OperationStatus, ReadStatus,
 };
 
@@ -212,6 +212,98 @@ impl BookRepository {
         Ok(updated)
     }
 
+    /// Audit path changes while preserving every stored file identity and the original assets.
+    pub fn relocate_files_audited(
+        &self,
+        book: &Book,
+        expected_revision: u64,
+        files: &[StoredFile],
+    ) -> Result<Book> {
+        validate_book(book)?;
+        let mut connection = self.database.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let before = audit_snapshot(&transaction, &book.id)?;
+        if before.book.revision != expected_revision || book.revision != expected_revision {
+            return Err(AppError::RevisionConflict);
+        }
+        if book != &before.book || files.len() != before.files.len() {
+            return Err(AppError::InvalidInput(
+                "Organization can only relocate the existing book files".into(),
+            ));
+        }
+        let existing: BTreeMap<_, _> = before
+            .files
+            .iter()
+            .map(|file| (file.file.id.as_str(), file))
+            .collect();
+        let mut seen_ids = HashSet::new();
+        let mut seen_paths = HashSet::new();
+        let mut changed = false;
+        for file in files {
+            validate_file(file)?;
+            if !seen_ids.insert(file.file.id.as_str())
+                || !seen_paths.insert(file.relative_path.as_str())
+            {
+                return Err(AppError::InvalidInput(
+                    "Organization contains duplicate files or paths".into(),
+                ));
+            }
+            let current = existing.get(file.file.id.as_str()).ok_or_else(|| {
+                AppError::InvalidInput("Organization contains an unknown file".into())
+            })?;
+            if current.file != file.file {
+                return Err(AppError::InvalidInput(
+                    "Organization cannot change file identity".into(),
+                ));
+            }
+            if current.relative_path == file.relative_path {
+                continue;
+            }
+            if file.file.variant == FileVariant::Original {
+                return Err(AppError::InvalidInput(
+                    "Original files cannot be relocated".into(),
+                ));
+            }
+            if !file.relative_path.starts_with("books/") {
+                return Err(AppError::InvalidInput(
+                    "Organized variants must remain in managed book storage".into(),
+                ));
+            }
+            let occupied: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM book_files WHERE relative_path=? AND id<>?)",
+                params![file.relative_path, file.file.id],
+                |row| row.get(0),
+            )?;
+            if occupied {
+                return Err(AppError::Conflict(
+                    "The organized path belongs to another file".into(),
+                ));
+            }
+            changed = true;
+        }
+        if !changed {
+            transaction.commit()?;
+            return Ok(before.book);
+        }
+        let updated = persist_book(&transaction, book, expected_revision)?;
+        for file in files {
+            let current = existing[file.file.id.as_str()];
+            if current.relative_path == file.relative_path {
+                continue;
+            }
+            if transaction.execute(
+                "UPDATE book_files SET relative_path=? WHERE id=? AND book_id=? AND relative_path=?",
+                params![file.relative_path, file.file.id, book.id, current.relative_path],
+            )? != 1 {
+                return Err(AppError::Conflict("The managed file changed during organization".into()));
+            }
+        }
+        let after = audit_snapshot(&transaction, &book.id)?;
+        insert_operation(&transaction, "organization", Some(&before), &after)?;
+        transaction.commit()?;
+        Ok(updated)
+    }
+
     pub fn insert_audited(
         &self,
         id: &str,
@@ -286,6 +378,22 @@ impl BookRepository {
                 "The book or its variants changed after this operation".into(),
             ));
         }
+        for file in &before.files {
+            validate_file(file)?;
+            let after_file = after
+                .files
+                .iter()
+                .find(|after| after.file.id == file.file.id)
+                .ok_or_else(|| AppError::Conflict("An original file snapshot is missing".into()))?;
+            if file.file != after_file.file
+                || (file.file.variant == FileVariant::Original
+                    && file.relative_path != after_file.relative_path)
+            {
+                return Err(AppError::Conflict(
+                    "Operation file identity is inconsistent".into(),
+                ));
+            }
+        }
         persist_book(&transaction, &before.book, current.book.revision)?;
         let before_ids: std::collections::HashSet<_> = before
             .files
@@ -298,6 +406,32 @@ impl BookRepository {
                     "DELETE FROM book_files WHERE id=? AND book_id=?",
                     params![file.file.id, after.book.id],
                 )?;
+            }
+        }
+        for file in &before.files {
+            let after_file = after
+                .files
+                .iter()
+                .find(|after| after.file.id == file.file.id)
+                .ok_or_else(|| AppError::Conflict("Operation file snapshot is missing".into()))?;
+            if file.relative_path == after_file.relative_path {
+                continue;
+            }
+            let occupied: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM book_files WHERE relative_path=? AND id<>?)",
+                params![file.relative_path, file.file.id],
+                |row| row.get(0),
+            )?;
+            if occupied {
+                return Err(AppError::Conflict(
+                    "The previous path belongs to another file".into(),
+                ));
+            }
+            if transaction.execute(
+                "UPDATE book_files SET relative_path=? WHERE id=? AND book_id=? AND relative_path=?",
+                params![file.relative_path, file.file.id, before.book.id, after_file.relative_path],
+            )? != 1 {
+                return Err(AppError::Conflict("The managed file changed during undo".into()));
             }
         }
         let mut reverted = record;
@@ -1314,6 +1448,294 @@ mod tests {
             },
             relative_path: format!("books/{id}.{}", format.as_str()),
         }
+    }
+
+    #[test]
+    fn relocation_audits_only_paths_and_undo_restores_them_idempotently() -> Result<()> {
+        let (_temporary, _database, repository) = fixture()?;
+        let book = repository.insert(
+            "book",
+            metadata("Title", &["Author"], None, &[], "en"),
+            &[
+                file(
+                    "source",
+                    "book",
+                    'a',
+                    BookFormat::Epub,
+                    FileVariant::Original,
+                    100,
+                ),
+                file(
+                    "variant",
+                    "book",
+                    'b',
+                    BookFormat::Mobi,
+                    FileVariant::Converted,
+                    120,
+                ),
+            ],
+            None,
+        )?;
+        let before = repository.files(&book.id)?;
+        let mut relocated = before.clone();
+        relocated
+            .iter_mut()
+            .find(|file| file.file.id == "variant")
+            .unwrap()
+            .relative_path = "books/Author/_Standalone/Title - variant.mobi".into();
+        let updated = repository.relocate_files_audited(&book, book.revision, &relocated)?;
+        assert_eq!(updated.revision, book.revision + 1);
+        assert_eq!(updated.title, book.title);
+        assert_eq!(updated.notes, book.notes);
+        assert_eq!(repository.files(&book.id)?, relocated);
+        assert_eq!(
+            repository
+                .find_file_by_hash(&"b".repeat(64))?
+                .unwrap()
+                .file
+                .id,
+            "variant"
+        );
+        assert_eq!(repository.operations()?.len(), 1);
+        assert_eq!(
+            repository.relocate_files_audited(&updated, updated.revision, &relocated)?,
+            updated
+        );
+        assert_eq!(repository.operations()?.len(), 1);
+        let operation = repository.operations()?.remove(0);
+        assert_eq!(operation.kind, "organization");
+        assert_eq!(
+            repository.undo_audited(&operation.id)?.status,
+            OperationStatus::Reverted
+        );
+        assert_eq!(repository.files(&book.id)?, before);
+        let restored = repository.get(&book.id, &[])?;
+        assert_eq!(
+            repository.undo_audited(&operation.id)?.status,
+            OperationStatus::Reverted
+        );
+        assert_eq!(repository.get(&book.id, &[])?, restored);
+        Ok(())
+    }
+
+    #[test]
+    fn relocation_rejects_changed_identity_book_or_file_set_without_mutating_records() -> Result<()>
+    {
+        let (_temporary, _database, repository) = fixture()?;
+        let book = repository.insert(
+            "book",
+            metadata("Title", &["Author"], None, &[], "en"),
+            &[
+                file(
+                    "source",
+                    "book",
+                    'a',
+                    BookFormat::Epub,
+                    FileVariant::Original,
+                    100,
+                ),
+                file(
+                    "variant",
+                    "book",
+                    'b',
+                    BookFormat::Mobi,
+                    FileVariant::Converted,
+                    120,
+                ),
+            ],
+            None,
+        )?;
+        let before = repository.files(&book.id)?;
+        assert!(matches!(
+            repository.relocate_files_audited(&book, book.revision + 1, &before),
+            Err(AppError::RevisionConflict)
+        ));
+        let mut edited = book.clone();
+        edited.title = "Must not change".into();
+        assert!(matches!(
+            repository.relocate_files_audited(&edited, book.revision, &before),
+            Err(AppError::InvalidInput(_))
+        ));
+        let variant = before
+            .iter()
+            .find(|file| file.file.id == "variant")
+            .unwrap();
+        let original = before.iter().find(|file| file.file.id == "source").unwrap();
+        let changes: [fn(&mut StoredFile); 8] = [
+            |file| file.file.id = "unknown".into(),
+            |file| file.file.book_id = "foreign-book".into(),
+            |file| file.file.sha256 = "c".repeat(64),
+            |file| file.file.size_bytes += 1,
+            |file| file.file.variant = FileVariant::Normalized,
+            |file| file.file.format = BookFormat::Epub,
+            |file| file.file.profile = Some("other-profile".into()),
+            |file| file.file.created_at = "2026-01-01T00:00:00Z".into(),
+        ];
+        for change in changes {
+            let mut altered = variant.clone();
+            altered.relative_path = "books/Author/new.mobi".into();
+            change(&mut altered);
+            assert!(matches!(
+                repository.relocate_files_audited(
+                    &book,
+                    book.revision,
+                    &[original.clone(), altered]
+                ),
+                Err(AppError::InvalidInput(_))
+            ));
+        }
+        assert!(matches!(
+            repository.relocate_files_audited(&book, book.revision, std::slice::from_ref(variant)),
+            Err(AppError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            repository.relocate_files_audited(
+                &book,
+                book.revision,
+                &[variant.clone(), variant.clone()]
+            ),
+            Err(AppError::InvalidInput(_))
+        ));
+        assert_eq!(repository.get(&book.id, &[])?, book);
+        assert_eq!(repository.files(&book.id)?, before);
+        assert!(repository.operations()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn relocation_refuses_original_moves_unsafe_paths_and_collisions_atomically() -> Result<()> {
+        let (_temporary, _database, repository) = fixture()?;
+        let book = repository.insert(
+            "book",
+            metadata("Title", &["Author"], None, &[], "en"),
+            &[
+                file(
+                    "source",
+                    "book",
+                    'a',
+                    BookFormat::Epub,
+                    FileVariant::Original,
+                    100,
+                ),
+                file(
+                    "variant",
+                    "book",
+                    'b',
+                    BookFormat::Mobi,
+                    FileVariant::Converted,
+                    120,
+                ),
+            ],
+            None,
+        )?;
+        repository.insert(
+            "foreign",
+            metadata("Other", &[], None, &[], "en"),
+            &[file(
+                "occupied",
+                "foreign",
+                'c',
+                BookFormat::Mobi,
+                FileVariant::Converted,
+                130,
+            )],
+            None,
+        )?;
+        let before = repository.files(&book.id)?;
+        let mut original_move = before.clone();
+        original_move
+            .iter_mut()
+            .find(|file| file.file.id == "source")
+            .unwrap()
+            .relative_path = "books/Author/source.epub".into();
+        assert!(matches!(
+            repository.relocate_files_audited(&book, book.revision, &original_move),
+            Err(AppError::InvalidInput(_))
+        ));
+        for path in [
+            "/outside.mobi",
+            "../outside.mobi",
+            "books/../outside.mobi",
+            "originals/new.mobi",
+            "covers/new.mobi",
+            "books/Author\\new.mobi",
+            "books/Author/new\0.mobi",
+        ] {
+            let mut altered = before.clone();
+            altered
+                .iter_mut()
+                .find(|file| file.file.id == "variant")
+                .unwrap()
+                .relative_path = path.into();
+            assert!(matches!(
+                repository.relocate_files_audited(&book, book.revision, &altered),
+                Err(AppError::InvalidInput(_))
+            ));
+        }
+        let mut collision = before.clone();
+        collision
+            .iter_mut()
+            .find(|file| file.file.id == "variant")
+            .unwrap()
+            .relative_path = "books/occupied.mobi".into();
+        assert!(matches!(
+            repository.relocate_files_audited(&book, book.revision, &collision),
+            Err(AppError::Conflict(_))
+        ));
+        assert_eq!(repository.get(&book.id, &[])?, book);
+        assert_eq!(repository.files(&book.id)?, before);
+        assert!(repository.operations()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn relocation_undo_collision_rolls_back_book_paths_and_operation_status() -> Result<()> {
+        let (_temporary, _database, repository) = fixture()?;
+        let book = repository.insert(
+            "book",
+            metadata("Title", &["Author"], None, &[], "en"),
+            &[file(
+                "variant",
+                "book",
+                'b',
+                BookFormat::Mobi,
+                FileVariant::Converted,
+                120,
+            )],
+            None,
+        )?;
+        let mut files = repository.files(&book.id)?;
+        files[0].relative_path = "books/Author/new.mobi".into();
+        let updated = repository.relocate_files_audited(&book, book.revision, &files)?;
+        let operation = repository.operations()?.remove(0);
+        let mut occupying = file(
+            "occupying",
+            "foreign",
+            'c',
+            BookFormat::Mobi,
+            FileVariant::Converted,
+            130,
+        );
+        occupying.relative_path = "books/variant.mobi".into();
+        repository.insert(
+            "foreign",
+            metadata("Other", &[], None, &[], "en"),
+            &[occupying.clone()],
+            None,
+        )?;
+        let occupying_before = repository.file_by_id("occupying")?;
+        assert!(matches!(
+            repository.undo_audited(&operation.id),
+            Err(AppError::Conflict(_))
+        ));
+        assert_eq!(repository.get(&book.id, &[])?, updated);
+        assert_eq!(repository.files(&book.id)?, files);
+        assert_eq!(repository.file_by_id("occupying")?, occupying_before);
+        assert_eq!(
+            repository.operations()?.remove(0).status,
+            OperationStatus::Applied
+        );
+        Ok(())
     }
 
     #[test]

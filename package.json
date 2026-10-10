@@ -1,6 +1,6 @@
 {
   "name": "library-manager",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Standalone desktop ebook library manager with AI metadata, reader optimization, and USB or wireless transfers.",
   "license": "GPL-3.0-only",
   "private": true,

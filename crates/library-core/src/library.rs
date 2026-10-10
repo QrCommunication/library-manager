@@ -64,7 +64,7 @@ impl LibraryService {
         self
     }
 
-    fn check_cancelled(&self) -> Result<()> {
+    pub(crate) fn check_cancelled(&self) -> Result<()> {
         if self
             .cancellation
             .as_ref()
@@ -239,7 +239,59 @@ impl LibraryService {
     }
 
     pub fn update(&self, id: &str, patch: &BookPatch, expected_revision: u64) -> Result<Book> {
-        self.update_internal(id, patch, expected_revision, None)
+        self.update_internal(id, patch, expected_revision, None, None, None)
+    }
+
+    /// Apply a reviewed patch only while the inspected immutable original still matches.
+    pub fn update_inspected(
+        &self,
+        id: &str,
+        patch: &BookPatch,
+        expected_revision: u64,
+        original_sha256: &str,
+    ) -> Result<Book> {
+        if original_sha256.len() != 64
+            || !original_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(invalid(
+                "Inspected original hash must contain 64 hexadecimal characters",
+            ));
+        }
+        self.update_internal(
+            id,
+            patch,
+            expected_revision,
+            None,
+            Some(original_sha256),
+            None,
+        )
+    }
+
+    /// Bind a reviewed EPUB inspection and its immutable source separately before changing metadata.
+    pub fn update_from_inspection(
+        &self,
+        id: &str,
+        patch: &BookPatch,
+        expected_revision: u64,
+        original_sha256: &str,
+        inspected_file_id: &str,
+        inspected_sha256: &str,
+    ) -> Result<Book> {
+        for hash in [original_sha256, inspected_sha256] {
+            if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(invalid(
+                    "Inspection hashes must contain 64 hexadecimal characters",
+                ));
+            }
+        }
+        self.update_internal(
+            id,
+            patch,
+            expected_revision,
+            None,
+            Some(original_sha256),
+            Some((inspected_file_id, inspected_sha256)),
+        )
     }
 
     pub fn apply_enrichment(
@@ -265,7 +317,14 @@ impl LibraryService {
         {
             return Err(invalid("Enrichment cannot change personal reading fields"));
         }
-        self.update_internal(id, patch, expected_revision, Some((status, confidence)))
+        self.update_internal(
+            id,
+            patch,
+            expected_revision,
+            Some((status, confidence)),
+            None,
+            None,
+        )
     }
 
     fn update_internal(
@@ -274,6 +333,8 @@ impl LibraryService {
         patch: &BookPatch,
         expected_revision: u64,
         enrichment: Option<(MetadataStatus, f64)>,
+        original_sha256: Option<&str>,
+        inspected_file: Option<(&str, &str)>,
     ) -> Result<Book> {
         let _guard = self
             .gate
@@ -283,6 +344,34 @@ impl LibraryService {
         let before = self.repository.get(id, &[])?;
         if before.revision != expected_revision {
             return Err(AppError::RevisionConflict);
+        }
+        if let Some(expected) = original_sha256 {
+            let original = self
+                .repository
+                .files(id)?
+                .into_iter()
+                .find(|file| file.file.variant == FileVariant::Original)
+                .ok_or_else(|| AppError::NotFound("Book original".into()))?;
+            if !original.file.sha256.eq_ignore_ascii_case(expected) {
+                return Err(AppError::Conflict("Inspected original changed".into()));
+            }
+            // Storage reads through its anchored directory descriptors and enforces the read limit.
+            let bytes = self.read_verified_file(&original)?;
+            if bytes.len() as u64 != original.file.size_bytes
+                || !hex_digest(&bytes).eq_ignore_ascii_case(expected)
+            {
+                return Err(AppError::Conflict("Inspected original changed".into()));
+            }
+        }
+        if let Some((file_id, expected)) = inspected_file {
+            let file = self.repository.file_by_id(file_id)?;
+            if file.file.book_id != id
+                || file.file.format != BookFormat::Epub
+                || !file.file.sha256.eq_ignore_ascii_case(expected)
+            {
+                return Err(AppError::Conflict("Inspected EPUB changed".into()));
+            }
+            self.read_verified_file(&file)?;
         }
         let before_metadata = book_metadata(&before);
         let mut updated = apply_patch(before.clone(), patch)?;
@@ -302,7 +391,7 @@ impl LibraryService {
         let file = if metadata_changed {
             match self
                 .source_epub(id)
-                .and_then(|file| self.storage.read(&file.relative_path))
+                .and_then(|file| self.read_verified_file(&file))
             {
                 Ok(bytes) => {
                     match self.normalized_variant(id, &book_metadata(&updated), &bytes, &work) {
@@ -333,6 +422,18 @@ impl LibraryService {
             file,
             kind,
         )?))
+    }
+
+    fn read_verified_file(&self, file: &StoredFile) -> Result<Vec<u8>> {
+        let bytes = self.storage.read(&file.relative_path)?;
+        if bytes.len() as u64 != file.file.size_bytes
+            || !hex_digest(&bytes).eq_ignore_ascii_case(&file.file.sha256)
+        {
+            return Err(AppError::Conflict(
+                "The registered book file changed".into(),
+            ));
+        }
+        Ok(bytes)
     }
 
     pub fn optimize(&self, id: &str, profile_id: &str) -> Result<OptimizationReport> {
@@ -422,6 +523,79 @@ impl LibraryService {
     pub fn operations(&self) -> Result<Vec<Operation>> {
         self.repository.operations()
     }
+
+    /// Relocate managed variants to their metadata-derived paths without touching originals.
+    pub fn organize(&self, id: &str, expected_revision: u64) -> Result<Book> {
+        let _guard = self
+            .gate
+            .lock()
+            .map_err(|_| invalid("Library operation is unavailable"))?;
+        self.check_cancelled()?;
+        let book = self.repository.get(id, &[])?;
+        if book.revision != expected_revision {
+            return Err(AppError::RevisionConflict);
+        }
+        let mut files = self.repository.files(id)?;
+        if !files
+            .iter()
+            .any(|file| file.file.variant != FileVariant::Original)
+        {
+            return Err(AppError::Unsupported(
+                "Organization requires a managed variant; original files remain immutable".into(),
+            ));
+        }
+        let metadata = book_metadata(&book);
+        let mut changed = false;
+        for file in &mut files {
+            if file.file.variant == FileVariant::Original {
+                continue;
+            }
+            self.check_cancelled()?;
+            let base = self
+                .storage
+                .managed_book_path(id, &metadata, file.file.format);
+            let stem = base
+                .strip_suffix(&format!(".{}", file.file.format.as_str()))
+                .ok_or_else(|| invalid("Managed variant name is invalid"))?;
+            let file_id = Uuid::parse_str(&file.file.id)
+                .map_err(|_| invalid("Managed file identifier is invalid"))?;
+            let profile = file
+                .file
+                .profile
+                .as_deref()
+                .map(|profile| format!("-{}", &hex_digest(profile.as_bytes())[..12]))
+                .unwrap_or_default();
+            let path = format!(
+                "{stem} - {}{profile}-{file_id}.{}",
+                file.file.variant.as_str(),
+                file.file.format.as_str()
+            );
+            let source = self.storage.resolve(&file.relative_path)?;
+            if Storage::hash_file(&source)? != file.file.sha256 {
+                return Err(AppError::Conflict("Managed variant changed".into()));
+            }
+            if path == file.relative_path {
+                continue;
+            }
+            // Immutable copies retain the old physical asset for undo; only audited paths change.
+            let artifact = self.storage.publish_file(&path, &source)?;
+            if artifact.sha256 != file.file.sha256 || artifact.size_bytes != file.file.size_bytes {
+                return Err(AppError::Conflict("Managed variant changed".into()));
+            }
+            file.relative_path = artifact.relative_path;
+            changed = true;
+        }
+        self.check_cancelled()?;
+        if !changed {
+            return Ok(self.decorate(book));
+        }
+        Ok(self.decorate(self.repository.relocate_files_audited(
+            &book,
+            expected_revision,
+            &files,
+        )?))
+    }
+
     pub fn undo(&self, operation_id: &str) -> Result<Operation> {
         let _guard = self
             .gate
@@ -1200,6 +1374,401 @@ mod tests {
         assert_eq!(
             normalized_isbn("ISBN 0-306-40615-2"),
             Some("0306406152".into())
+        );
+    }
+
+    #[test]
+    fn inspected_update_checks_original_hash_and_revision_before_applying_a_patch() {
+        let (directory, service) = fixture();
+        let source = write_epub(&directory, false);
+        let book = service.import(&source).unwrap().book;
+        let original = service
+            .repository
+            .files(&book.id)
+            .unwrap()
+            .into_iter()
+            .find(|file| file.file.variant == FileVariant::Original)
+            .unwrap();
+        let patch = BookPatch {
+            title: Some("Titre relu".into()),
+            ..BookPatch::default()
+        };
+        let operation_count = service.operations().unwrap().len();
+        for malformed in ["", "123", &"x".repeat(64)] {
+            assert!(matches!(
+                service.update_inspected(&book.id, &patch, book.revision, malformed),
+                Err(AppError::InvalidInput(_))
+            ));
+        }
+        assert!(matches!(
+            service.update_inspected(&book.id, &patch, book.revision, &"0".repeat(64)),
+            Err(AppError::Conflict(_))
+        ));
+        assert!(matches!(
+            service.update_inspected(&book.id, &patch, book.revision + 1, &original.file.sha256),
+            Err(AppError::RevisionConflict)
+        ));
+        assert_eq!(service.operations().unwrap().len(), operation_count);
+        assert_eq!(service.get(&book.id, &[]).unwrap(), book);
+        let updated = service
+            .update_inspected(
+                &book.id,
+                &patch,
+                book.revision,
+                &original.file.sha256.to_uppercase(),
+            )
+            .unwrap();
+        assert_eq!(updated.title, "Titre relu");
+        assert_eq!(updated.revision, book.revision + 1);
+        assert_eq!(
+            service.storage.read(&original.relative_path).unwrap(),
+            fs::read(source).unwrap()
+        );
+        assert_eq!(
+            service
+                .repository
+                .files(&book.id)
+                .unwrap()
+                .into_iter()
+                .find(|file| file.file.variant == FileVariant::Original)
+                .unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn inspected_update_rejects_corrupted_original_bytes_even_if_catalog_hash_matches() {
+        use std::os::unix::fs::PermissionsExt;
+        let (directory, service) = fixture();
+        let book = service.import(&write_epub(&directory, false)).unwrap().book;
+        let original = service
+            .repository
+            .files(&book.id)
+            .unwrap()
+            .into_iter()
+            .find(|file| file.file.variant == FileVariant::Original)
+            .unwrap();
+        let path = service.storage.resolve(&original.relative_path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&path, b"Unexpected original bytes").unwrap();
+        let operation_count = service.operations().unwrap().len();
+        assert!(matches!(
+            service.update_inspected(
+                &book.id,
+                &BookPatch {
+                    notes: Some("Must not apply".into()),
+                    ..BookPatch::default()
+                },
+                book.revision,
+                &original.file.sha256
+            ),
+            Err(AppError::Conflict(_))
+        ));
+        assert_eq!(service.get(&book.id, &[]).unwrap(), book);
+        assert_eq!(service.operations().unwrap().len(), operation_count);
+    }
+
+    fn derived_inspection_fixture(
+        directory: &TempDir,
+        service: &LibraryService,
+    ) -> (Book, StoredFile) {
+        let txt = directory.path().join("Immutable original.txt");
+        fs::write(&txt, "Immutable original edition text").unwrap();
+        let book = service.import(&txt).unwrap().book;
+        let epub = write_epub(directory, false);
+        let artifact = service
+            .storage
+            .import_original(&epub, BookFormat::Epub)
+            .unwrap();
+        let converted = stored_file(
+            &book.id,
+            FileVariant::Converted,
+            BookFormat::Epub,
+            None,
+            artifact,
+        );
+        service.repository.add_file(converted.clone()).unwrap();
+        (service.get(&book.id, &[]).unwrap(), converted)
+    }
+
+    #[test]
+    fn inspected_derived_epub_update_checks_both_tokens_and_preserves_immutable_txt() {
+        let (directory, service) = fixture();
+        let (book, converted) = derived_inspection_fixture(&directory, &service);
+        let original = service
+            .repository
+            .files(&book.id)
+            .unwrap()
+            .into_iter()
+            .find(|file| file.file.variant == FileVariant::Original)
+            .unwrap();
+        let original_bytes = service.storage.read(&original.relative_path).unwrap();
+        let converted_bytes = service.storage.read(&converted.relative_path).unwrap();
+        let patch = BookPatch {
+            title: Some("Reviewed converted edition".into()),
+            ..BookPatch::default()
+        };
+        for (original_hash, inspected_hash) in [
+            (&"0".repeat(64), &converted.file.sha256),
+            (&original.file.sha256, &"0".repeat(64)),
+        ] {
+            assert!(matches!(
+                service.update_from_inspection(
+                    &book.id,
+                    &patch,
+                    book.revision,
+                    original_hash,
+                    &converted.file.id,
+                    inspected_hash
+                ),
+                Err(AppError::Conflict(_))
+            ));
+        }
+        let updated = service
+            .update_from_inspection(
+                &book.id,
+                &patch,
+                book.revision,
+                &original.file.sha256,
+                &converted.file.id,
+                &converted.file.sha256,
+            )
+            .unwrap();
+        assert_eq!(updated.title, "Reviewed converted edition");
+        assert_eq!(updated.revision, book.revision + 1);
+        assert_eq!(
+            service.storage.read(&original.relative_path).unwrap(),
+            original_bytes
+        );
+        assert_eq!(
+            service.storage.read(&converted.relative_path).unwrap(),
+            converted_bytes
+        );
+        assert_eq!(
+            service.repository.file_by_id(&original.file.id).unwrap(),
+            original
+        );
+        let normalized = service.source_epub(&book.id).unwrap();
+        assert_eq!(normalized.file.variant, FileVariant::Normalized);
+        let document = EpubDocument::from_bytes(
+            &service.storage.read(&normalized.relative_path).unwrap(),
+            "fallback",
+        )
+        .unwrap();
+        assert_eq!(document.metadata.title, updated.title);
+    }
+
+    #[test]
+    fn corrupt_inspected_derived_epub_is_rejected_before_metadata_or_history_changes() {
+        use std::os::unix::fs::PermissionsExt;
+        let (directory, service) = fixture();
+        let (book, converted) = derived_inspection_fixture(&directory, &service);
+        let original = service
+            .repository
+            .files(&book.id)
+            .unwrap()
+            .into_iter()
+            .find(|file| file.file.variant == FileVariant::Original)
+            .unwrap();
+        let original_bytes = service.storage.read(&original.relative_path).unwrap();
+        let mut corrupt = service.storage.read(&converted.relative_path).unwrap();
+        corrupt[0] ^= 1;
+        let path = service.storage.resolve(&converted.relative_path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(path, corrupt).unwrap();
+        let operations = service.operations().unwrap();
+        let files = service.repository.files(&book.id).unwrap();
+        assert!(matches!(
+            service.update_from_inspection(
+                &book.id,
+                &BookPatch {
+                    title: Some("Must not apply".into()),
+                    ..BookPatch::default()
+                },
+                book.revision,
+                &original.file.sha256,
+                &converted.file.id,
+                &converted.file.sha256
+            ),
+            Err(AppError::Conflict(_))
+        ));
+        assert_eq!(service.get(&book.id, &[]).unwrap(), book);
+        assert_eq!(service.operations().unwrap(), operations);
+        assert_eq!(service.repository.files(&book.id).unwrap(), files);
+        assert_eq!(
+            service.storage.read(&original.relative_path).unwrap(),
+            original_bytes
+        );
+    }
+
+    #[test]
+    fn corrupt_active_normalized_epub_cannot_be_used_after_valid_original_inspection() {
+        use std::os::unix::fs::PermissionsExt;
+        let (directory, service) = fixture();
+        let book = service.import(&write_epub(&directory, false)).unwrap().book;
+        let files = service.repository.files(&book.id).unwrap();
+        let original = files
+            .iter()
+            .find(|file| file.file.variant == FileVariant::Original)
+            .unwrap();
+        let normalized = files
+            .iter()
+            .find(|file| file.file.variant == FileVariant::Normalized)
+            .unwrap();
+        let original_bytes = service.storage.read(&original.relative_path).unwrap();
+        let mut corrupt = service.storage.read(&normalized.relative_path).unwrap();
+        corrupt[0] ^= 1;
+        let path = service.storage.resolve(&normalized.relative_path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(path, corrupt).unwrap();
+        let operations = service.operations().unwrap();
+        let patch = BookPatch {
+            title: Some("Must not publish changed reading text".into()),
+            ..BookPatch::default()
+        };
+        assert!(matches!(
+            service.update_from_inspection(
+                &book.id,
+                &patch,
+                book.revision,
+                &original.file.sha256,
+                &original.file.id,
+                &original.file.sha256
+            ),
+            Err(AppError::Conflict(_))
+        ));
+        assert!(matches!(
+            service.update(&book.id, &patch, book.revision),
+            Err(AppError::Conflict(_))
+        ));
+        assert_eq!(service.get(&book.id, &[]).unwrap(), book);
+        assert_eq!(service.operations().unwrap(), operations);
+        assert_eq!(service.repository.files(&book.id).unwrap(), files);
+        assert_eq!(
+            service.storage.read(&original.relative_path).unwrap(),
+            original_bytes
+        );
+    }
+
+    #[test]
+    fn organization_preserves_originals_file_identity_and_bytes_and_is_audited_and_idempotent() {
+        let (directory, service) = fixture();
+        let source = write_epub(&directory, false);
+        let source_bytes = fs::read(&source).unwrap();
+        let book = service.import(&source).unwrap().book;
+        let before = service.repository.files(&book.id).unwrap();
+        assert!(
+            before
+                .iter()
+                .any(|file| file.file.variant != FileVariant::Original)
+        );
+        let operation_count = service.operations().unwrap().len();
+        assert!(matches!(
+            service.organize(&book.id, book.revision + 1),
+            Err(AppError::RevisionConflict)
+        ));
+        let organized = service.organize(&book.id, book.revision).unwrap();
+        let after = service.repository.files(&book.id).unwrap();
+        assert_eq!(organized.revision, book.revision + 1);
+        assert_eq!(book_metadata(&organized), book_metadata(&book));
+        assert_eq!(after.len(), before.len());
+        for old in &before {
+            let current = after
+                .iter()
+                .find(|file| file.file.id == old.file.id)
+                .unwrap();
+            assert_eq!(current.file, old.file);
+            assert_eq!(
+                service.storage.read(&current.relative_path).unwrap(),
+                service.storage.read(&old.relative_path).unwrap()
+            );
+            if old.file.variant == FileVariant::Original {
+                assert_eq!(current.relative_path, old.relative_path);
+            } else {
+                assert_ne!(current.relative_path, old.relative_path);
+                assert!(
+                    current
+                        .relative_path
+                        .starts_with("books/Auteur/Saga/T000 - Étoiles")
+                );
+            }
+        }
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert_eq!(service.operations().unwrap().len(), operation_count + 1);
+        assert_eq!(
+            service.organize(&book.id, organized.revision).unwrap(),
+            organized
+        );
+        assert_eq!(service.operations().unwrap().len(), operation_count + 1);
+        let operation = service
+            .operations()
+            .unwrap()
+            .into_iter()
+            .find(|operation| operation.kind == "organization")
+            .unwrap();
+        assert_eq!(
+            service.undo(&operation.id).unwrap().status,
+            OperationStatus::Reverted
+        );
+        assert_eq!(service.repository.files(&book.id).unwrap(), before);
+        for file in &after {
+            assert!(
+                service
+                    .storage
+                    .resolve(&file.relative_path)
+                    .unwrap()
+                    .is_file()
+            );
+        }
+        let restored = service.get(&book.id, &[]).unwrap();
+        service.organize(&book.id, restored.revision).unwrap();
+        assert_eq!(service.repository.files(&book.id).unwrap(), after);
+    }
+
+    #[test]
+    fn organization_requires_a_managed_variant_and_never_relocates_an_original() {
+        let (directory, service) = fixture();
+        let source = directory.path().join("source.txt");
+        fs::write(&source, "Original text").unwrap();
+        let book = service.import(&source).unwrap().book;
+        let before = service.repository.files(&book.id).unwrap();
+        let operation_count = service.operations().unwrap().len();
+        assert!(matches!(
+            service.organize(&book.id, book.revision),
+            Err(AppError::Unsupported(_))
+        ));
+        assert_eq!(service.repository.files(&book.id).unwrap(), before);
+        assert_eq!(service.get(&book.id, &[]).unwrap(), book);
+        assert_eq!(service.operations().unwrap().len(), operation_count);
+        assert_eq!(fs::read(source).unwrap(), b"Original text");
+    }
+
+    #[test]
+    fn organization_rejects_corrupted_variant_before_publishing_and_recovers_after_restore() {
+        use std::os::unix::fs::PermissionsExt;
+        let (directory, service) = fixture();
+        let book = service.import(&write_epub(&directory, false)).unwrap().book;
+        let before = service.repository.files(&book.id).unwrap();
+        let variant = before
+            .iter()
+            .find(|file| file.file.variant != FileVariant::Original)
+            .unwrap();
+        let bytes = service.storage.read(&variant.relative_path).unwrap();
+        let path = service.storage.resolve(&variant.relative_path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&path, b"Unexpected managed bytes").unwrap();
+        let operation_count = service.operations().unwrap().len();
+        assert!(matches!(
+            service.organize(&book.id, book.revision),
+            Err(AppError::Conflict(_))
+        ));
+        assert_eq!(service.repository.files(&book.id).unwrap(), before);
+        assert_eq!(service.get(&book.id, &[]).unwrap(), book);
+        assert_eq!(service.operations().unwrap().len(), operation_count);
+        fs::write(path, bytes).unwrap();
+        assert_eq!(
+            service.organize(&book.id, book.revision).unwrap().revision,
+            book.revision + 1
         );
     }
 

@@ -2,24 +2,32 @@
   import { onDestroy, onMount, tick, untrack } from 'svelte';
   import { ExternalLink, MessageCircle, Plus, RefreshCw, Send, Sparkles, UserRound, X } from '@lucide/svelte';
   import { isPreview, normalizePublicError, openExternal, request, subscribe } from '../api';
-  import type { AppError, ChatDeltaEvent, ChatMessage, Conversation, Job, Provider, Settings, WebSource } from '../contracts';
-  import { formatDate, locale, t } from '../i18n';
+  import type { AppError, Book, ChatDeltaEvent, ChatMessage, Conversation, Job, Provider, Settings, WebSource } from '../contracts';
+  import { formatDate, formatProviderDiagnostic, locale, t } from '../i18n';
+  import { createRequestScheduler } from '../request-scheduler';
 
   interface Props {
     selectedBookIds: string[];
     refreshVersion: number;
+    onOpenBook?(book: Book): void;
+    onChooseBooks?(): void;
+    verifyRequested?: boolean;
+    onVerifyStarted?(): void;
     onNotify(message: string): void;
     onError(error: unknown): void;
   }
-  let { selectedBookIds, refreshVersion, onNotify, onError }: Props = $props();
+  let { selectedBookIds, refreshVersion, onOpenBook, onChooseBooks, verifyRequested = false, onVerifyStarted, onNotify, onError }: Props = $props();
   const MAX_TEXT_LENGTH = 8000;
   const MAX_CONTEXT_BOOKS = 32;
+  const MAX_SELECTED_BOOKS = 200;
+  const BOOK_LOAD_CONCURRENCY = 4;
   const demo = isPreview();
   let disposed = false;
   let configGeneration = 0;
   let historyGeneration = 0;
   let messageGeneration = 0;
   let viewVersion = 0;
+  let selectedGeneration = 0;
   const unlisteners: Array<() => void> = [];
   let conversations = $state<Conversation[]>([]);
   let messages = $state<ChatMessage[]>([]);
@@ -36,15 +44,116 @@
   let sending = $state(false);
   let cancelling = $state(false);
   let loadingMessages = $state(false);
+  let allowChanges = $state(false);
+  let enriching = $state(false);
+  let enrichmentJobs = $state<Job[]>([]);
+  let enrichmentSummary = $state<{ queued: number; skipped: number; failed: number } | null>(null);
+  let selectedBooks = $state<Book[]>([]);
+  let loadingSelectedBooks = $state(false);
+  let openingBookId = $state<string | null>(null);
   let failure = $state<AppError | null>(null);
   let chatScroll = $state<HTMLDivElement>();
   const currentProvider = $derived(providers.find((provider) => provider.id === settings?.providerId));
   const configured = $derived(Boolean(settings?.modelId && currentProvider?.configured && currentProvider.status === 'ready'));
   const jobPending = $derived(activeJob !== null && !['completed', 'failed', 'cancelled'].includes(activeJob.status));
   const contextBookIds = $derived([...new Set(selectedBookIds)]);
-  const contextTooLarge = $derived(contextBookIds.length > MAX_CONTEXT_BOOKS);
+  const contextKey = $derived(contextBookIds.join('\u0000'));
+  const contextTooLarge = $derived(contextBookIds.length > MAX_SELECTED_BOOKS);
+  const reviewBooks = $derived(selectedBooks.filter((book) => contextBookIds.includes(book.id)
+    && book.metadataStatus === 'needsReview'
+    && enrichmentJobs.some((job) => completedProposalForBook(job, book.id))));
   const canSend = $derived(!demo && configured && !sending && !jobPending && !contextTooLarge && draft.trim().length > 0 && draft.length <= MAX_TEXT_LENGTH);
   const number = $derived(new Intl.NumberFormat($locale));
+  const failureDetail = $derived(failure?.code === 'providerError'
+    ? formatProviderDiagnostic(failure.code, failure.detail, $locale) : failure?.detail);
+
+  function mergeEnrichmentJobs(incoming: Job[]): void {
+    const known = new Map(enrichmentJobs.map((job) => [job.id, job]));
+    for (const job of incoming) {
+      if (job.kind !== 'enrich') continue;
+      const previous = known.get(job.id);
+      if (!previous || job.updatedAt >= previous.updatedAt) known.set(job.id, job);
+    }
+    enrichmentJobs = [...known.values()];
+  }
+
+  function enrichmentPending(id: string): boolean {
+    return enrichmentJobs.some((job) => job.bookIds.includes(id)
+      && !['completed', 'failed', 'cancelled'].includes(job.status));
+  }
+
+  async function loadSelectedBooks(ids: string[]): Promise<Book[]> {
+    const generation = selectedGeneration;
+    const loaded: Book[] = [];
+    for (let start = 0; start < ids.length && !disposed && generation === selectedGeneration; start += BOOK_LOAD_CONCURRENCY) {
+      const results = await Promise.allSettled(ids.slice(start, start + BOOK_LOAD_CONCURRENCY)
+        .map((id) => request('book_get', { id })));
+      for (const result of results) if (result.status === 'fulfilled') loaded.push(result.value);
+    }
+    return loaded;
+  }
+
+  const selectedBooksScheduler = createRequestScheduler<string[], Book[]>({
+    load: loadSelectedBooks,
+    onStart: () => { loadingSelectedBooks = true; },
+    onSuccess: (books) => { selectedBooks = books; },
+    onError: report,
+    onSettled: () => { loadingSelectedBooks = false; },
+  });
+
+  const backgroundScheduler = createRequestScheduler<string, void>({
+    load: async () => { await Promise.allSettled([loadConfiguration(), loadHistory(), recoverJob()]); },
+    onStart: () => undefined,
+    onSuccess: () => undefined,
+    onError: report,
+    onSettled: () => undefined,
+    queryDelayMs: 0,
+  });
+
+  async function verifySelected(): Promise<void> {
+    if (disposed || demo || enriching || !contextBookIds.length || contextTooLarge) return;
+    const ids = [...contextBookIds];
+    enriching = true;
+    enrichmentSummary = { queued: 0, skipped: 0, failed: 0 };
+    failure = null;
+    try {
+      // Refresh eligibility before enqueueing; live job events keep it current during the batch.
+      mergeEnrichmentJobs(await request('jobs_list', undefined));
+      for (const id of ids) {
+        if (disposed) break;
+        if (enrichmentPending(id)) {
+          enrichmentSummary.skipped += 1;
+          continue;
+        }
+        try {
+          const job = await request('book_enrich', { id });
+          if (disposed) break;
+          mergeEnrichmentJobs([job]);
+          enrichmentSummary.queued += 1;
+        } catch (error) {
+          if (disposed) break;
+          enrichmentSummary.failed += 1;
+          report(error);
+        }
+      }
+      if (!disposed) onNotify($t('chat.enrichmentQueued', { count: enrichmentSummary.queued }));
+    } catch (error) {
+      if (!disposed) {
+        enrichmentSummary.failed = ids.length;
+        report(error);
+      }
+    } finally { if (!disposed) enriching = false; }
+  }
+
+  async function openSelected(id: string): Promise<void> {
+    if (!onOpenBook || openingBookId !== null) return;
+    openingBookId = id;
+    try {
+      const current = await request('book_get', { id });
+      if (!disposed) onOpenBook(current);
+    } catch (error) { if (!disposed) report(error); }
+    finally { if (!disposed) openingBookId = null; }
+  }
 
   function report(error: unknown): void {
     failure = normalizePublicError(error);
@@ -52,6 +161,12 @@
   }
   function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
+  }
+  function completedProposalForBook(job: Job, bookId: string): boolean {
+    if (job.kind !== 'enrich' || job.status !== 'completed' || !job.bookIds.includes(bookId) || !isRecord(job.result)) return false;
+    const proposal = 'proposal' in job.result ? job.result.proposal : job.result;
+    return isRecord(proposal) && proposal.bookId === bookId
+      && isRecord(proposal.patch) && Object.keys(proposal.patch).length > 0;
   }
   function isWebSource(value: unknown): value is WebSource {
     return isRecord(value) && typeof value.url === 'string' && typeof value.title === 'string'
@@ -125,6 +240,7 @@
   }
   function selectConversation(id: string | null): void {
     if (sending) return;
+    allowChanges = false;
     viewVersion += 1;
     followJob = false;
     activeConversationId = id;
@@ -187,6 +303,7 @@
     try {
       const jobs = await request('jobs_list', undefined);
       if (disposed || activeJob?.id !== id) return;
+      mergeEnrichmentJobs(jobs);
       const updated = id ? jobs.find((job) => job.id === id) : jobs.filter((job) => job.kind === 'chat'
         && !['completed', 'failed', 'cancelled'].includes(job.status))
         .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
@@ -195,7 +312,17 @@
   }
   async function connectEvents(): Promise<void> {
     const results = await Promise.allSettled([
-      subscribe('job:updated', ({ job }) => { if (!disposed && job.id === activeJob?.id) trackJob(job); }),
+      subscribe('job:updated', ({ job }) => {
+        if (disposed) return;
+        const previous = enrichmentJobs.find((item) => item.id === job.id);
+        const selectedEnrichmentFinished = job.kind === 'enrich'
+          && job.bookIds.some((id) => contextBookIds.includes(id))
+          && ['completed', 'failed', 'cancelled'].includes(job.status)
+          && (!previous || previous.status !== job.status || job.updatedAt > previous.updatedAt);
+        mergeEnrichmentJobs([job]);
+        if (selectedEnrichmentFinished) selectedBooksScheduler.refresh();
+        if (job.id === activeJob?.id) trackJob(job);
+      }),
       subscribe('chat:delta', (payload) => { if (!disposed) receiveDelta(payload); }),
     ]);
     for (const result of results) {
@@ -207,14 +334,34 @@
   }
   $effect(() => {
     void refreshVersion;
-    untrack(() => { void loadConfiguration(); void loadHistory(); void recoverJob(); });
+    untrack(() => backgroundScheduler.refresh());
   });
-  onMount(() => { void connectEvents(); });
+  $effect(() => {
+    void contextKey;
+    untrack(() => {
+      allowChanges = false;
+      selectedGeneration += 1;
+      selectedBooks = selectedBooks.filter((book) => contextBookIds.includes(book.id));
+      selectedBooksScheduler.setQuery([...contextBookIds]);
+    });
+  });
+  $effect(() => {
+    if (!verifyRequested) return;
+    untrack(() => {
+      // Consume the navigation request before starting asynchronous batch work.
+      onVerifyStarted?.();
+      void verifySelected();
+    });
+  });
+  onMount(() => { backgroundScheduler.setQuery('chat'); void connectEvents(); });
   onDestroy(() => {
     disposed = true;
     configGeneration += 1;
     historyGeneration += 1;
     messageGeneration += 1;
+    selectedGeneration += 1;
+    selectedBooksScheduler.dispose();
+    backgroundScheduler.dispose();
     void Promise.allSettled(unlisteners.map((unsubscribe) => Promise.resolve().then(unsubscribe)));
   });
 
@@ -223,11 +370,13 @@
     const text = draft.trim();
     const previousConversation = activeConversationId;
     const sentViewVersion = viewVersion;
+    const sentAllowChanges = allowChanges;
     sending = true;
     failure = null;
     try {
-      const job = await request('chat_send', { conversationId: previousConversation, text, bookIds: [...contextBookIds] });
+      const job = await request('chat_send', { conversationId: previousConversation, text, bookIds: [...contextBookIds], allowChanges: sentAllowChanges });
       if (disposed) return;
+      allowChanges = false;
       submittedText = text;
       draft = '';
       streamedText = '';
@@ -255,7 +404,9 @@
   }
   async function refresh(): Promise<void> {
     failure = null;
-    await Promise.allSettled([loadConfiguration(), loadHistory(), recoverJob(), activeConversationId ? loadMessages(activeConversationId) : Promise.resolve()]);
+    backgroundScheduler.refresh();
+    selectedBooksScheduler.refresh();
+    if (activeConversationId) await loadMessages(activeConversationId);
   }
   function handleKey(event: KeyboardEvent): void {
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
@@ -267,7 +418,7 @@
 
 <section class="page">
   <div class="page-header"><div><p class="eyebrow">Library Manager</p><h1 class="page-title">{$t('chat.title')}</h1><p class="page-subtitle">{$t('providers.internetByApp')}</p></div><button class="button secondary" type="button" onclick={refresh}><RefreshCw size={17} />{$t('actions.refresh')}</button></div>
-  {#if failure}<div class="error-banner" role="alert"><div class="grow"><strong>{$t(`errors.${failure.code}`)}</strong>{#if failure.detail}<p>{failure.detail}</p>{/if}</div><button class="icon-button" type="button" onclick={() => { failure = null; }} aria-label={$t('actions.close')}><X size={16} /></button></div>{/if}
+  {#if failure}<div class="error-banner" role="alert"><div class="grow"><strong>{$t(`errors.${failure.code}`)}</strong>{#if failureDetail}<p>{failureDetail}</p>{/if}</div><button class="icon-button" type="button" onclick={() => { failure = null; }} aria-label={$t('actions.close')}><X size={16} /></button></div>{/if}
   <div class="panel chat-layout">
     <aside class="chat-history" aria-label={$t('chat.conversations')}>
       <button class="button primary" type="button" disabled={sending} onclick={() => selectConversation(null)}><Plus size={16} />{$t('chat.newConversation')}</button>
@@ -278,6 +429,14 @@
       <div class="chat-toolbar"><span class="badge" class:success={configured}>{$t('chat.provider')}: {currentProvider?.name ?? $t('common.none')}</span><span class="badge">{$t('chat.model')}: {settings?.modelId ?? $t('common.none')}</span><span class="badge" class:success={settings?.webEnabled === true} class:warning={settings?.webEnabled !== true}>{$t(settings?.webEnabled ? 'chat.internetEnabled' : 'chat.internetDisabled')}</span></div>
       {#if !configured}<p class="configuration-hint">{$t('chat.noModel')}</p>{/if}
       {#if demo}<p class="configuration-hint">{$t('app.previewDescription')}</p>{/if}
+        <section class="selected-books stack" aria-label={$t('chat.selectedBooks', { count: contextBookIds.length })}>
+          <div class="spread"><p class="small">{$t('chat.selectedBooks', { count: contextBookIds.length })}</p><div class="row wrap"><button class="button ghost" type="button" disabled={!onChooseBooks} onclick={() => onChooseBooks?.()}>{$t('chat.chooseBooks')}</button><button class="button secondary" type="button" disabled={demo || enriching || !contextBookIds.length || contextTooLarge} onclick={() => void verifySelected()}><Sparkles size={16} />{$t(enriching ? 'chat.verifyingSelected' : 'chat.verifySelected')}</button></div></div>
+          {#if !contextBookIds.length}<p class="field-hint">{$t('chat.noSelectedBooks')}</p>{/if}
+          {#if contextTooLarge}<p class="field-hint context-overflow" role="status">{$t('chat.selectionTooLarge', { count: MAX_SELECTED_BOOKS })}</p>{/if}
+          <div class="selected-book-list row wrap">{#each contextBookIds as id (id)}{@const selected = selectedBooks.find((item) => item.id === id)}<button class="source-chip" type="button" disabled={!onOpenBook || openingBookId !== null} onclick={() => void openSelected(id)} title={$t('chat.openSelected')}>{selected?.title ?? $t(loadingSelectedBooks ? 'common.loading' : 'common.unknown')}{#if selected?.metadataStatus === 'needsReview'}<span class="badge warning">{$t('book.needsReview')}</span>{/if}</button>{/each}</div>
+          {#if reviewBooks.length}<div class="stack" aria-label={$t('editor.reviewTitle')}>{#each reviewBooks as book (book.id)}<div class="spread"><span class="small">{book.title}</span><button class="button secondary" type="button" disabled={!onOpenBook || openingBookId !== null} onclick={() => void openSelected(book.id)}>{$t('chat.reviewProposal')}</button></div>{/each}</div>{/if}
+          {#if enrichmentSummary}<div class="row wrap small" role="status"><span>{$t('chat.enrichmentQueued', { count: enrichmentSummary.queued })}</span><span>{$t('chat.enrichmentSkipped', { count: enrichmentSummary.skipped })}</span><span>{$t('chat.enrichmentFailed', { count: enrichmentSummary.failed })}</span></div>{/if}
+        </section>
       <div class="chat-scroll" bind:this={chatScroll} aria-label={$t('chat.title')} aria-busy={loadingMessages}>
         {#if loadingMessages && !messages.length}<p class="field-hint">{$t('common.loading')}</p>{/if}
         {#each messages as message (message.id)}
@@ -293,8 +452,11 @@
       </div>
       {#if activeJob}<div class="chat-job" aria-live="polite"><div class="spread"><p class="small"><strong>{$t('jobs.chat')}</strong> · {$t(`jobs.${activeJob.status}`)}</p>{#if jobPending}<button class="button ghost" type="button" disabled={cancelling} onclick={cancelJob}><X size={15} />{$t('actions.cancel')}</button>{/if}</div>{#if jobPending}<progress value={activeJob.progress} max="1" aria-label={$t('common.progress')}></progress>{/if}{#if activeJob.message}<p class="field-hint">{activeJob.message}</p>{/if}</div>{/if}
       <form class="chat-composer" onsubmit={(event) => { event.preventDefault(); void send(); }}>
+        <label class="checkbox-field"><input type="checkbox" bind:checked={allowChanges} disabled={demo || sending || jobPending || !contextBookIds.length} aria-describedby="chat-change-scope" />{$t('chat.allowChanges')}</label>
+        <p id="chat-change-scope" class="field-hint">{$t('chat.allowChangesScope')}</p>
+        {#if contextBookIds.length > MAX_CONTEXT_BOOKS}<p class="field-hint">{$t('chat.contextSample', { sample: MAX_CONTEXT_BOOKS, count: contextBookIds.length })}</p>{/if}
         <label class="sr-only" for="chat-input">{$t('chat.placeholder')}</label><textarea id="chat-input" class="textarea" bind:value={draft} maxlength={MAX_TEXT_LENGTH} placeholder={$t('chat.placeholder')} onkeydown={handleKey} disabled={sending} aria-describedby="chat-context-count chat-text-count"></textarea>
-        <div class="composer-footer"><p id="chat-context-count" class="field-hint" class:context-overflow={contextTooLarge}>{$t('chat.selectedBooks', { count: contextBookIds.length })} / {MAX_CONTEXT_BOOKS}</p><span id="chat-text-count" class="field-hint">{number.format(draft.length)} / {number.format(MAX_TEXT_LENGTH)}</span><button class="button primary" type="submit" disabled={!canSend}><Send size={16} />{$t('chat.send')}</button></div>
+        <div class="composer-footer"><p id="chat-context-count" class="field-hint" class:context-overflow={contextTooLarge}>{$t('chat.selectedBooks', { count: contextBookIds.length })} / {MAX_SELECTED_BOOKS}</p><span id="chat-text-count" class="field-hint">{number.format(draft.length)} / {number.format(MAX_TEXT_LENGTH)}</span><button class="button primary" type="submit" disabled={!canSend}><Send size={16} />{$t('chat.send')}</button></div>
       </form>
     </div>
   </div>
@@ -318,4 +480,7 @@
   .composer-footer { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
   .composer-footer .button { margin-inline-start: auto; }
   .context-overflow { color: var(--danger); font-weight: 650; }
+  .selected-books { padding: 12px 20px; border-bottom: 1px solid var(--border); }
+  .selected-book-list { max-height: 140px; overflow-y: auto; }
+  .selected-book-list .source-chip { overflow-wrap: anywhere; white-space: normal; }
 </style>

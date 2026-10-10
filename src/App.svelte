@@ -50,6 +50,7 @@
   let groupBy = $state<GroupBy>('none');
   let search = $state('');
   let selectedBookIds = $state<string[]>([]);
+  let verifyRequested = $state(false);
   let detailBook = $state<Book | null>(null);
   let readingBook = $state<Book | null>(null);
   let refreshVersion = $state(0);
@@ -87,6 +88,7 @@
   }
 
   function navigate(key: NavigationKey): void {
+    verifyRequested = false;
     navigationKey = key;
     readingBook = null;
     detailBook = null;
@@ -103,6 +105,27 @@
     if (key === 'reading') query.readStatus = 'reading';
     if (key === 'favorites') query.favorite = true;
     initialQuery = query;
+  }
+
+  function openAssistant(): void {
+    navigationKey = 'chat';
+    activeView = 'chat';
+    readingBook = null;
+    detailBook = null;
+  }
+
+  function verifySelectedBooks(): void {
+    selectedBookIds = [...selectedBookIds];
+    verifyRequested = true;
+    openAssistant();
+  }
+
+  function chooseAssistantBooks(): void {
+    verifyRequested = false;
+    navigationKey = 'library';
+    activeView = 'library';
+    readingBook = null;
+    detailBook = null;
   }
 
   function openReader(book: Book): void {
@@ -317,6 +340,7 @@
           initialState={libraryState} onStateChange={(state: LibraryViewState) => { libraryState = state; }}
           onSelectionChange={(ids: string[]) => { selectedBookIds = ids; }}
           onOpenBook={(book: Book) => { detailBook = book; }}
+          onOpenAssistant={openAssistant} onVerifySelected={verifySelectedBooks}
           onReadBook={openReader} onImport={importBooks} onNotify={notify} onError={reportError}
         />
       {:else if activeView === 'devices'}
@@ -325,7 +349,11 @@
           onDevicesChange={(next: Device[]) => { devices = next; }} onNotify={notify} onError={reportError}
         />
       {:else if activeView === 'chat'}
-        <ChatView {selectedBookIds} {refreshVersion} onNotify={notify} onError={reportError} />
+        <ChatView
+          {selectedBookIds} {refreshVersion} {verifyRequested}
+          onVerifyStarted={() => { verifyRequested = false; }} onChooseBooks={chooseAssistantBooks}
+          onOpenBook={(book: Book) => { detailBook = book; }} onNotify={notify} onError={reportError}
+        />
       {:else if activeView === 'activity'}
         <ActivityView {refreshVersion} onNotify={notify} onError={reportError} />
       {:else if activeView === 'settings'}

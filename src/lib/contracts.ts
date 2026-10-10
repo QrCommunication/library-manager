@@ -409,7 +409,7 @@ export interface IpcContracts {
   provider_clear_secret: CommandContract<{ id: ProviderId }, null>;
   conversations_list: CommandContract<undefined, Conversation[]>;
   conversation_messages: CommandContract<{ id: string }, ChatMessage[]>;
-  chat_send: CommandContract<{ conversationId: string | null; text: string; bookIds: string[] }, Job>;
+  chat_send: CommandContract<{ conversationId: string | null; text: string; bookIds: string[]; allowChanges?: boolean }, Job>;
   settings_get: CommandContract<undefined, Settings>;
   settings_save: CommandContract<{ settings: Settings }, Settings>;
   jobs_list: CommandContract<undefined, Job[]>;

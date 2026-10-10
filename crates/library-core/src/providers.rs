@@ -639,6 +639,7 @@ fn status_error(status: StatusCode) -> AppError {
     AppError::Provider(
         match status.as_u16() {
             401 | 403 => "Provider authentication or account permissions were rejected",
+            400 => "Provider rejected the request parameters",
             429 => "Provider rate limit reached; retry later",
             300..=399 => "Provider redirects are refused to protect API keys",
             _ => "Provider request failed",
@@ -690,8 +691,52 @@ pub fn public_provider_error(error: &AppError) -> PublicError {
         code,
         message: message.into(),
         retryable,
-        detail: None,
+        detail: provider_diagnostic(error)
+            .filter(|detail| is_safe_provider_detail(code, detail))
+            .map(str::to_owned),
     }
+}
+
+fn provider_diagnostic(error: &AppError) -> Option<&'static str> {
+    let AppError::Provider(message) = error else {
+        return None;
+    };
+    match message.as_str() {
+        "Provider authentication or account permissions were rejected" => {
+            Some("providerDiagnostics.authenticationRejected")
+        }
+        "Provider rejected the request parameters" => Some("providerDiagnostics.requestRejected"),
+        "Provider request failed"
+        | "Provider retry limit exceeded"
+        | "Provider returned a completion error" => Some("providerDiagnostics.requestFailed"),
+        "Provider response was incomplete"
+        | "Provider response was incomplete or refused"
+        | "Provider returned incomplete reasoning" => {
+            Some("providerDiagnostics.responseIncomplete")
+        }
+        "Provider returned malformed JSON" => Some("providerDiagnostics.responseMalformed"),
+        "Provider returned no assistant response"
+        | "Provider returned no usable final answer"
+        | "Provider returned no usable assistant text" => Some("providerDiagnostics.noFinalAnswer"),
+        "The AI provider returned an invalid metadata response" => {
+            Some("providerDiagnostics.metadataInvalid")
+        }
+        _ => None,
+    }
+}
+
+pub fn is_safe_provider_detail(code: ErrorCode, detail: &str) -> bool {
+    code == ErrorCode::ProviderError
+        && matches!(
+            detail,
+            "providerDiagnostics.authenticationRejected"
+                | "providerDiagnostics.requestRejected"
+                | "providerDiagnostics.requestFailed"
+                | "providerDiagnostics.responseIncomplete"
+                | "providerDiagnostics.responseMalformed"
+                | "providerDiagnostics.noFinalAnswer"
+                | "providerDiagnostics.metadataInvalid"
+        )
 }
 
 fn parse_models(id: ProviderId, response: &Value) -> Result<Vec<Model>> {
@@ -847,7 +892,7 @@ fn completion_payload(id: ProviderId, model: &str, system: &str, user: &str) -> 
             json!({"model":model,"instructions":system,"input":user,"max_output_tokens":OUTPUT_TOKENS,"store":false,"stream":false})
         }
         ProviderId::Minimax => {
-            json!({"model":model,"messages":[{"role":"system","content":system},{"role":"user","content":user}],"max_completion_tokens":OUTPUT_TOKENS,"stream":false})
+            json!({"model":model,"messages":[{"role":"system","content":system},{"role":"user","content":user}],"max_completion_tokens":OUTPUT_TOKENS,"reasoning_split":true,"stream":false})
         }
         _ => {
             json!({"model":model,"messages":[{"role":"system","content":system},{"role":"user","content":user}],"max_tokens":OUTPUT_TOKENS,"stream":false})
@@ -865,7 +910,7 @@ fn completion_text(id: ProviderId, response: &Value) -> Result<String> {
             "Provider returned a completion error".into(),
         ));
     }
-    let text = match id {
+    let mut text = match id {
         ProviderId::Codex => {
             if response
                 .get("status")
@@ -940,6 +985,24 @@ fn completion_text(id: ProviderId, response: &Value) -> Result<String> {
             }
         }
     };
+    // Older MiniMax responses can prepend reasoning to content despite the split request.
+    // Only consume a complete leading block; tags inside the final answer are data.
+    if id == ProviderId::Minimax
+        && let Some(reasoning) = text.trim_start().strip_prefix("<think>")
+    {
+        let (reasoning, answer) = reasoning
+            .split_once("</think>")
+            .ok_or_else(|| AppError::Provider("Provider returned incomplete reasoning".into()))?;
+        if reasoning.contains("<think>")
+            || answer.trim_start().starts_with("<think>")
+            || answer.trim_start().starts_with("</think>")
+        {
+            return Err(AppError::Provider(
+                "Provider returned no usable final answer".into(),
+            ));
+        }
+        text = answer.trim_start().to_owned();
+    }
     if text.trim().is_empty() {
         return Err(AppError::Provider(
             "Provider returned no usable assistant text".into(),
@@ -1185,9 +1248,13 @@ mod tests {
                 }
                 ProviderId::Minimax => {
                     assert_eq!(body["max_completion_tokens"], OUTPUT_TOKENS);
+                    assert_eq!(body["reasoning_split"], true);
                     assert!(body.get("max_tokens").is_none());
                 }
                 _ => assert_eq!(body["messages"][0]["role"], "system"),
+            }
+            if id != ProviderId::Minimax {
+                assert!(body.get("reasoning_split").is_none());
             }
             let response = match id {
                 ProviderId::Codex => {
@@ -1228,6 +1295,52 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn minimax_legacy_reasoning_requires_a_complete_prefix_and_preserves_final_content() {
+        let answer = r#"{"patch":{"description":"literal <think> text"},"confidence":0.9,"evidence":[],"warnings":[]}"#;
+        let response = |content: &str| json!({"choices":[{"finish_reason":"stop","message":{"content":content}}]});
+        assert_eq!(
+            completion_text(ProviderId::Minimax, &response(answer)).unwrap(),
+            answer
+        );
+        assert_eq!(
+            completion_text(
+                ProviderId::Minimax,
+                &response(&format!(" \n<think>Private reasoning</think>\n{answer}"))
+            )
+            .unwrap(),
+            answer
+        );
+        for incomplete in [
+            "<think>Private reasoning",
+            "<think>Private reasoning</think>",
+            "<think>First</think><think>Second</think>Answer",
+        ] {
+            let error = completion_text(ProviderId::Minimax, &response(incomplete)).unwrap_err();
+            assert!(matches!(error, AppError::Provider(_)));
+            assert!(!error.to_string().contains("Private reasoning"));
+        }
+        let original = "<think>Other provider text</think>Answer";
+        assert_eq!(
+            completion_text(ProviderId::Kimi, &response(original)).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn minimax_nested_reasoning_and_stray_closing_blocks_are_rejected() {
+        for content in [
+            "<think>Private outer<think>Private inner</think>Private tail</think>Answer",
+            "<think>Private reasoning</think></think>Answer",
+        ] {
+            let response =
+                json!({"choices":[{"finish_reason":"stop","message":{"content":content}}]});
+            let error = completion_text(ProviderId::Minimax, &response).unwrap_err();
+            assert!(matches!(error, AppError::Provider(_)));
+            assert!(!error.to_string().contains("Private"));
+        }
     }
 
     #[test]
@@ -1306,6 +1419,166 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM settings", [], |row| row.get(0))
             .unwrap();
         assert_eq!(keys, 0);
+    }
+
+    #[test]
+    fn provider_diagnostic_keys_require_exact_whitelist_members_and_provider_error_code() {
+        for key in [
+            "providerDiagnostics.authenticationRejected",
+            "providerDiagnostics.requestRejected",
+            "providerDiagnostics.requestFailed",
+            "providerDiagnostics.responseIncomplete",
+            "providerDiagnostics.responseMalformed",
+            "providerDiagnostics.noFinalAnswer",
+            "providerDiagnostics.metadataInvalid",
+        ] {
+            assert!(is_safe_provider_detail(ErrorCode::ProviderError, key));
+            for code in [
+                ErrorCode::InvalidInput,
+                ErrorCode::NetworkUnavailable,
+                ErrorCode::ProviderNotConfigured,
+                ErrorCode::RateLimited,
+                ErrorCode::SecretStoreUnavailable,
+            ] {
+                assert!(!is_safe_provider_detail(code, key));
+            }
+            for unsafe_key in [
+                format!(" {key}"),
+                format!("{key}\n"),
+                format!("{key}.private-token"),
+            ] {
+                assert!(!is_safe_provider_detail(
+                    ErrorCode::ProviderError,
+                    &unsafe_key
+                ));
+            }
+        }
+        assert!(!is_safe_provider_detail(
+            ErrorCode::ProviderError,
+            "providerDiagnostics.unknown"
+        ));
+        assert!(!is_safe_provider_detail(
+            ErrorCode::ProviderError,
+            "Bearer private-token /private/profile"
+        ));
+    }
+
+    #[test]
+    fn public_provider_diagnostics_classify_only_exact_known_static_messages() {
+        for (message, detail) in [
+            (
+                "Provider authentication or account permissions were rejected",
+                "providerDiagnostics.authenticationRejected",
+            ),
+            (
+                "Provider rejected the request parameters",
+                "providerDiagnostics.requestRejected",
+            ),
+            (
+                "Provider request failed",
+                "providerDiagnostics.requestFailed",
+            ),
+            (
+                "Provider retry limit exceeded",
+                "providerDiagnostics.requestFailed",
+            ),
+            (
+                "Provider returned a completion error",
+                "providerDiagnostics.requestFailed",
+            ),
+            (
+                "Provider response was incomplete",
+                "providerDiagnostics.responseIncomplete",
+            ),
+            (
+                "Provider response was incomplete or refused",
+                "providerDiagnostics.responseIncomplete",
+            ),
+            (
+                "Provider returned incomplete reasoning",
+                "providerDiagnostics.responseIncomplete",
+            ),
+            (
+                "Provider returned malformed JSON",
+                "providerDiagnostics.responseMalformed",
+            ),
+            (
+                "Provider returned no assistant response",
+                "providerDiagnostics.noFinalAnswer",
+            ),
+            (
+                "Provider returned no usable final answer",
+                "providerDiagnostics.noFinalAnswer",
+            ),
+            (
+                "Provider returned no usable assistant text",
+                "providerDiagnostics.noFinalAnswer",
+            ),
+            (
+                "The AI provider returned an invalid metadata response",
+                "providerDiagnostics.metadataInvalid",
+            ),
+        ] {
+            let error = public_provider_error(&AppError::Provider(message.into()));
+            assert_eq!(error.code, ErrorCode::ProviderError);
+            assert_eq!(error.message, "Provider request failed");
+            assert!(!error.retryable);
+            assert_eq!(error.detail.as_deref(), Some(detail));
+            let unknown = public_provider_error(&AppError::Provider(format!(
+                "{message}: private-token /private/profile"
+            )));
+            assert_eq!(unknown.detail, None);
+            assert!(
+                !serde_json::to_string(&unknown)
+                    .unwrap()
+                    .contains("private-token")
+            );
+        }
+    }
+
+    #[test]
+    fn public_provider_diagnostics_preserve_configuration_network_and_rate_limit_routing() {
+        for (error, code, retryable) in [
+            (
+                AppError::Provider("Configure an API key for this provider first".into()),
+                ErrorCode::ProviderNotConfigured,
+                false,
+            ),
+            (vault_error(), ErrorCode::SecretStoreUnavailable, false),
+            (
+                AppError::Network("Provider connection failed: private-token".into()),
+                ErrorCode::NetworkUnavailable,
+                true,
+            ),
+            (
+                status_error(StatusCode::TOO_MANY_REQUESTS),
+                ErrorCode::RateLimited,
+                true,
+            ),
+        ] {
+            let public = public_provider_error(&error);
+            assert_eq!(public.code, code);
+            assert_eq!(public.retryable, retryable);
+            assert_eq!(public.detail, None);
+        }
+        let rejected = public_provider_error(&status_error(StatusCode::BAD_REQUEST));
+        assert_eq!(rejected.code, ErrorCode::ProviderError);
+        assert_eq!(
+            rejected.detail.as_deref(),
+            Some("providerDiagnostics.requestRejected")
+        );
+        let unauthorized = public_provider_error(&status_error(StatusCode::UNAUTHORIZED));
+        assert_eq!(unauthorized.code, ErrorCode::ProviderError);
+        assert_eq!(
+            unauthorized.detail.as_deref(),
+            Some("providerDiagnostics.authenticationRejected")
+        );
+        let unavailable = public_provider_error(&status_error(StatusCode::SERVICE_UNAVAILABLE));
+        assert_eq!(unavailable.code, ErrorCode::ProviderError);
+        assert_eq!(
+            unavailable.detail.as_deref(),
+            Some("providerDiagnostics.requestFailed")
+        );
     }
 
     #[tokio::test]
@@ -1390,6 +1663,7 @@ mod tests {
     #[tokio::test]
     async fn completion_uses_selected_catalogue_and_retries_only_bounded_server_failures() {
         let (_directory, mut service, _vault) = service();
+        let final_json = r#"{"patch":{},"confidence":0.9,"evidence":[],"warnings":[]}"#;
         let server = Server::new().await;
         server.attach(&mut service);
         service
@@ -1405,7 +1679,7 @@ mod tests {
                 Reply::error(429),
                 Reply::error(503),
                 Reply::json(
-                    json!({"choices":[{"finish_reason":"stop","message":{"content":"Metadata"}}]}),
+                    json!({"choices":[{"finish_reason":"stop","message":{"reasoning_content":"Private reasoning must not enter the metadata contract","content":final_json}}]}),
                 ),
             ],
         );
@@ -1414,7 +1688,7 @@ mod tests {
                 .complete(ProviderId::Minimax, "MiniMax-current", "System", "User")
                 .await
                 .unwrap(),
-            "Metadata"
+            final_json
         );
         let requests = server.requests.lock().unwrap().clone();
         assert_eq!(requests.len(), 4);
@@ -1422,6 +1696,7 @@ mod tests {
             serde_json::from_str(requests.last().unwrap().split_once("\r\n\r\n").unwrap().1)
                 .unwrap();
         assert_eq!(body["max_completion_tokens"], OUTPUT_TOKENS);
+        assert_eq!(body["reasoning_split"], true);
         assert!(
             service
                 .complete(ProviderId::Minimax, "embedding-unknown", "System", "User")

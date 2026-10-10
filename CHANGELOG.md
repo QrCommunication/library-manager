@@ -2,6 +2,25 @@
 
 Les notes détaillées sont en français, suivies d’un résumé en anglais.
 
+## 0.2.0 — 2026-10-10
+
+### Français
+
+- Correction de la bibliothèque bloquée à **0 livre** ou en chargement après un import, et des fiches qui clignotaient pendant les mises à jour de l’inventaire. Les actualisations regroupées conservent les résultats disponibles pendant les traitements en arrière-plan.
+- Correction des analyses rejetées lorsque le fournisseur renvoyait un ISBN formaté ou une preuve encodée en JSON. Les valeurs et leurs preuves suivent la même normalisation, avec contrôle de l’ISBN, des types, des sources et de la révision. Les erreurs du fournisseur sont maintenant expliquées en français ou en anglais.
+- L’assistant peut rechercher dans la bibliothèque et sur le Web, inspecter le vrai fichier d’une édition, puis utiliser ses métadonnées incorporées et ses pages de copyright pour étayer ses corrections. L’inspection fournit des **extraits bornés** et signale ses limites ; elle ne constitue pas une lecture intégrale du livre.
+- Actions groupées visibles dans la Bibliothèque et l’Assistant : choisir les livres, ouvrir la sélection dans le chat et vérifier leurs métadonnées, jusqu’à **200 livres**. Les propositions à examiner sont accessibles même sans sélection et indépendamment des filtres courants.
+- Revue explicite des propositions dans la fiche : comparaison des valeurs actuelles et proposées, consultation des preuves et application manuelle avec contrôle de révision. La disponibilité d’une proposition est affichée après la fin de l’analyse.
+- Modification et organisation par l’assistant avec une autorisation limitée à **une demande et aux livres cochés**. Les fichiers réellement inspectés sont vérifiés avant correction ; les originaux sont conservés, les variantes sont distinctes et les opérations applicables peuvent être annulées.
+- Cycle d’outils limité à huit étapes par réponse, avec une seule tentative supplémentaire pour corriger une réponse au format invalide. Les résultats exécutés sont journalisés ; une reprise réutilise les reçus de mutations terminées et refuse de réexécuter automatiquement une action interrompue au résultat incertain.
+- Annulation et fermeture attendent la fin des opérations locales engagées. Une nouvelle analyse reste possible après un échec ; les demandes identiques déjà actives sont dédupliquées.
+
+### English summary
+
+Fixed the library remaining at zero books after imports and flickering book details during background inventory updates. Metadata validation now handles formatted ISBNs and JSON-encoded evidence consistently while preserving type, checksum, source and revision checks.
+
+The assistant can inspect actual edition files, use embedded metadata and copyright excerpts, and perform authorized metadata updates or organization. Inspection is bounded and does not imply reading the entire book. Visible bulk actions support selections of up to 200 books, with explicit proposal review. Write permission applies to one request and its selected books; originals, separate variants and undo remain available. Tool cycles and format repair are bounded, durable receipts prevent repeated writes, and cancellation waits for local cleanup.
+
 ## 0.1.1 — 2026-10-09
 
 ### Français

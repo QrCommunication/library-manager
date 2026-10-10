@@ -2,8 +2,8 @@
   import { onDestroy, tick, untrack } from 'svelte';
   import { Activity, ArrowDownUp, Check, CircleAlert, Clock, ExternalLink, History, RefreshCw, RotateCcw, X } from '@lucide/svelte';
   import { isPreview, normalizePublicError, openExternal, PublicError, request } from '../api';
-  import type { Job, JobKind, JobStatus, Operation } from '../contracts';
-  import { formatDate, formatSize, locale, t } from '../i18n';
+  import type { AppError, Job, JobKind, JobStatus, Operation } from '../contracts';
+  import { formatDate, formatProviderDiagnostic, formatSize, locale, t } from '../i18n';
 
   interface Props { refreshVersion: number; onNotify(message: string): void; onError(error: unknown): void }
   interface Metric { label: string; value: string }
@@ -36,6 +36,8 @@
   let undoing = $state(false);
   let undoDialog: HTMLDialogElement | undefined;
   const number = $derived(new Intl.NumberFormat($locale));
+  const failureDetail = $derived(failure ? errorDetail(failure) : null);
+  const undoFailureDetail = $derived(undoFailure ? errorDetail(undoFailure) : null);
   const percent = $derived(new Intl.NumberFormat($locale, { style: 'percent', maximumFractionDigits: 0 }));
   const pendingCount = $derived(jobs.filter((job) => !terminalStatuses.has(job.status)).length);
   const completedCount = $derived(jobs.filter((job) => job.status === 'completed').length);
@@ -45,6 +47,9 @@
   const visibleOperations = $derived(operations.filter((operation) => operationFilter === 'all' || operation.status === operationFilter)
     .sort((a, b) => sortOrder === 'oldest' ? timestamp(a.createdAt) - timestamp(b.createdAt) : timestamp(b.createdAt) - timestamp(a.createdAt)));
 
+  function errorDetail(error: AppError): string | null {
+    return error.code === 'providerError' ? formatProviderDiagnostic(error.code, error.detail, $locale) : error.detail;
+  }
   function timestamp(value: string): number { const parsed = Date.parse(value); return Number.isFinite(parsed) ? parsed : 0; }
   function progressValue(job: Job): number | undefined {
     return Number.isFinite(job.progress) && job.progress >= 0 && job.progress <= 1 ? job.progress : undefined;
@@ -210,7 +215,7 @@
     <div class="panel stat"><Check size={21} /><span>{$t('jobs.completed')}</span><strong>{number.format(completedCount)}</strong></div>
     <div class="panel stat"><CircleAlert size={21} /><span>{$t('jobs.failed')}</span><strong>{number.format(failedCount)}</strong></div>
   </div>
-  {#if failure}<div class="error-banner" role="alert"><CircleAlert size={18} /><div>{$t(`errors.${failure.code}`)}{#if failure.detail}<p class="small">{failure.detail}</p>{/if}</div><button class="button ghost" onclick={() => loadActivity()}>{$t('actions.retry')}</button></div>{/if}
+  {#if failure}<div class="error-banner" role="alert"><CircleAlert size={18} /><div>{$t(`errors.${failure.code}`)}{#if failureDetail}<p class="small">{failureDetail}</p>{/if}</div><button class="button ghost" onclick={() => loadActivity()}>{$t('actions.retry')}</button></div>{/if}
   <div class="toolbar wrap">
     <label class="field"><span>{$t('jobs.tasks')}</span><select class="select" bind:value={kindFilter}><option value="all">{$t('filters.all')}</option>{#each kinds as kind}<option value={kind}>{$t(`jobs.${kind}`)}</option>{/each}</select></label>
     <label class="field"><span>{$t('jobs.status')}</span><select class="select" bind:value={statusFilter}><option value="all">{$t('filters.all')}</option>{#each statuses as status}<option value={status}>{$t(`jobs.${status}`)}</option>{/each}</select></label>
@@ -224,12 +229,14 @@
         {@const result = resultSummary(job)}
         {@const jobProgress = progressValue(job)}
         {@const actionError = actionErrors[job.id]}
+        {@const jobErrorDetail = job.error ? errorDetail(job.error) : null}
+        {@const actionErrorDetail = actionError ? errorDetail(actionError) : null}
         <article class="panel activity-job">
           <div class="row spread wrap"><div class="row"><span class="activity-icon"><Activity size={20} /></span><div><h2 class="job-title">{$t(`jobs.${job.kind}`)}</h2><p class="small muted">{formatDate(job.createdAt, $locale)} · {$t('jobs.bookCount', { count: job.bookIds.length })}</p></div></div><span class={`badge ${badge(job.status)}`}>{$t(`jobs.${job.status}`)}</span></div>
           <div class="row progress-row"><progress max="1" value={jobProgress} aria-label={$t('common.progress')}></progress><span class="small numeric">{jobProgress === undefined ? $t('common.unknown') : percent.format(jobProgress)}</span></div>
           {#if job.message}<p class="small muted job-message">{localize(job.message)}</p>{/if}
-          {#if job.error}<div class="error-banner" role="alert"><CircleAlert size={17} /><div>{$t(`errors.${job.error.code}`)}{#if job.error.detail}<p class="small">{job.error.detail}</p>{/if}<span class="small muted">{job.error.code}</span></div></div>{/if}
-          {#if actionError}<div class="error-banner" role="alert">{$t(`errors.${actionError.code}`)}{#if actionError.detail}<p class="small">{actionError.detail}</p>{/if}</div>{/if}
+          {#if job.error}<div class="error-banner" role="alert"><CircleAlert size={17} /><div>{$t(`errors.${job.error.code}`)}{#if jobErrorDetail}<p class="small">{jobErrorDetail}</p>{/if}<span class="small muted">{job.error.code}</span></div></div>{/if}
+          {#if actionError}<div class="error-banner" role="alert">{$t(`errors.${actionError.code}`)}{#if actionErrorDetail}<p class="small">{actionErrorDetail}</p>{/if}</div>{/if}
           {#if result.metrics.length || result.fields.length || result.warnings.length || result.sources.length}
             <details class="job-result"><summary>{$t('jobs.result')}{#if result.warnings.length}<span class="badge warning">{number.format(result.warnings.length)}</span>{/if}</summary>
               {#if result.metrics.length}<dl class="result-metrics">{#each result.metrics as metric}<div><dt>{metric.label}</dt><dd>{metric.value}</dd></div>{/each}</dl>{/if}
@@ -256,7 +263,7 @@
   <form onsubmit={(event) => { event.preventDefault(); void undoOperation(); }} class="stack">
     <div class="row spread"><h2 id="undo-title" class="section-title">{$t('jobs.undoTitle')}</h2><button class="icon-button" type="button" aria-label={$t('actions.close')} onclick={closeUndo} disabled={undoing}><X size={20} /></button></div>
     <p>{$t('jobs.undoDescription')}</p>{#if undoTarget}<p class="panel undo-description">{localize(undoTarget.description)}</p>{/if}
-    {#if undoFailure}<div class="error-banner" role="alert"><CircleAlert size={18} /><div>{$t(undoFailure.code === 'operationConflict' ? 'jobs.undoConflict' : `errors.${undoFailure.code}`)}{#if undoFailure.detail}<p class="small">{undoFailure.detail}</p>{/if}<span class="small muted">{undoFailure.code}</span></div></div>{/if}
+    {#if undoFailure}<div class="error-banner" role="alert"><CircleAlert size={18} /><div>{$t(undoFailure.code === 'operationConflict' ? 'jobs.undoConflict' : `errors.${undoFailure.code}`)}{#if undoFailureDetail}<p class="small">{undoFailureDetail}</p>{/if}<span class="small muted">{undoFailure.code}</span></div></div>{/if}
     <div class="row justify-end"><button class="button secondary" type="button" disabled={undoing} onclick={closeUndo}>{$t('actions.cancel')}</button><button class="button primary" type="submit" disabled={demo || undoing || !undoTarget}><RotateCcw size={16} />{$t('actions.undo')}</button></div>
   </form>
 </dialog>

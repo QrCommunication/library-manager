@@ -461,10 +461,16 @@ pub async fn chat_send(
     conversation_id: Option<String>,
     text: String,
     book_ids: Vec<String>,
+    allow_changes: Option<bool>,
 ) -> IpcResult<Job> {
     state
         .manager()?
-        .chat_send(conversation_id.as_deref(), &text, &book_ids)
+        .chat_send_authorized(
+            conversation_id.as_deref(),
+            &text,
+            &book_ids,
+            allow_changes.unwrap_or(false),
+        )
         .await
         .map_err(|error| public_error(&error))
 }

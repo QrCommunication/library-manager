@@ -3,7 +3,8 @@
   import { BookOpen, Check, ExternalLink, FileText, RefreshCw, Sparkles, X } from '@lucide/svelte';
   import { isPreview, normalizePublicError, openExternal, PublicError, request } from '../api';
   import type { Book, BookFile, BookFormat, BookPatch, ConversionCapabilities, Job, MetadataProposal, OptimizationProfile, ReadStatus } from '../contracts';
-  import { formatDate, formatSize, locale, t } from '../i18n';
+  import { formatDate, formatProviderDiagnostic, formatSize, locale, t } from '../i18n';
+  import { createRequestScheduler } from '../request-scheduler';
 
   interface Props {
     book: Book;
@@ -26,6 +27,8 @@
   let previousFocus: HTMLElement | null = null;
   let disposed = false;
   let generation = 0;
+  let activeBookId: string | null = null;
+  let discardRequested = false;
   let baseline = $state<Book | null>(null);
   let remoteBook = $state<Book | null>(null);
   let draft = $state<Draft>(emptyDraft());
@@ -45,10 +48,16 @@
   const displayedBook = $derived(baseline ?? book);
   const dirty = $derived(baseline !== null && JSON.stringify(draft) !== JSON.stringify(draftFromBook(baseline)));
   const chosenProfile = $derived(profiles.find((profile) => profile.id === selectedProfile));
-  const proposalPatch = $derived(proposal ? bibliographicPatch(proposal.patch) : {});
+  const proposalPatch = $derived(proposal ? changedProposalPatch(proposal.patch) : {});
   const proposalEntries = $derived(Object.entries(proposalPatch));
   const conversionAvailable = $derived(capabilities?.inputs.includes(displayedBook.format) === true);
   const percent = $derived(new Intl.NumberFormat($locale, { style: 'percent', maximumFractionDigits: 0 }));
+  const failureDetail = $derived(failure ? errorDetail(failure) : null);
+  const latestJobDetail = $derived(latestJob?.error ? errorDetail(latestJob.error) : null);
+
+  function errorDetail(error: { code: string; detail: string | null }): string | null {
+    return error.code === 'providerError' ? formatProviderDiagnostic(error.code, error.detail, $locale) : error.detail;
+  }
 
   function emptyDraft(): Draft {
     return { title: '', authors: '', authorSort: '', series: '', seriesIndex: '', genres: '', tags: '', language: '', description: '', isbn: '', publisher: '', published: '', notes: '', readStatus: 'unread', favorite: false, rating: '' };
@@ -77,32 +86,27 @@
     onError(failure);
   }
 
-  async function loadData(id: string, discardDraft = false): Promise<void> {
-    const currentGeneration = ++generation;
-    if (baseline !== null && baseline.id !== id) {
-      baseline = null;
-      remoteBook = null;
-      draft = emptyDraft();
-      files = [];
-      proposal = null;
-      warnings = [];
-      latestJob = null;
-      failure = null;
-      busy = false;
-      conflict = false;
-    }
-    loading = true;
+  async function loadData(id: string) {
+    const discardDraft = discardRequested;
+    discardRequested = false;
     const results = await Promise.allSettled([
       request('book_get', { id }), request('book_files', { id }), request('jobs_list', undefined),
       request('optimization_profiles', undefined), request('conversion_capabilities', undefined),
     ] as const);
-    if (disposed || currentGeneration !== generation || book.id !== id) return;
+    return { results, discardDraft };
+  }
+
+  function applyData({ results, discardDraft }: Awaited<ReturnType<typeof loadData>>, id: string): void {
+    if (disposed || book.id !== id) return;
     const [bookResult, filesResult, jobsResult, profilesResult, capabilitiesResult] = results;
     if (bookResult.status === 'fulfilled') {
-      if (discardDraft || baseline?.id !== id || !dirty) acceptBook(bookResult.value);
-      else if (bookResult.value.revision !== baseline.revision) {
-        remoteBook = bookResult.value;
-        conflict = true;
+      // A refresh started before a successful save must not restore an older revision.
+      if (baseline?.id !== id || bookResult.value.revision >= baseline.revision) {
+        if (discardDraft || baseline?.id !== id || !dirty) acceptBook(bookResult.value);
+        else if (bookResult.value.revision !== baseline.revision) {
+          remoteBook = bookResult.value;
+          conflict = true;
+        }
       }
     } else showFailure(bookResult.reason);
     if (filesResult.status === 'fulfilled') files = filesResult.value;
@@ -124,13 +128,42 @@
         .map((job) => proposalFromResult(job.result, id)).find((value) => value !== null) ?? null;
       warnings = [...new Set([...bookJobs.flatMap((job) => resultWarnings(job.result)), ...(proposal?.warnings ?? [])])];
     } else showFailure(jobsResult.reason);
-    loading = false;
   }
+
+  const scheduler = createRequestScheduler<string, Awaited<ReturnType<typeof loadData>>>({
+    load: loadData,
+    onStart: () => { loading = baseline === null || discardRequested; },
+    onSuccess: applyData,
+    onError: showFailure,
+    onSettled: () => { loading = false; },
+    queryDelayMs: 0,
+  });
 
   $effect(() => {
     const id = book.id;
+    untrack(() => {
+      if (activeBookId === id) return;
+      activeBookId = id;
+      generation += 1;
+      discardRequested = false;
+      baseline = null;
+      remoteBook = null;
+      draft = emptyDraft();
+      files = [];
+      proposal = null;
+      warnings = [];
+      latestJob = null;
+      failure = null;
+      busy = false;
+      conflict = false;
+      loading = true;
+      scheduler.setQuery(id);
+    });
+  });
+
+  $effect(() => {
     void refreshVersion;
-    untrack(() => { void loadData(id); });
+    untrack(() => scheduler.refresh());
   });
 
   onMount(() => {
@@ -140,6 +173,7 @@
   onDestroy(() => {
     disposed = true;
     generation += 1;
+    scheduler.dispose();
     dialog?.close();
     if (previousFocus?.isConnected) previousFocus.focus();
   });
@@ -193,6 +227,34 @@
     const { notes: _notes, favorite: _favorite, rating: _rating, readStatus: _status, ...metadata } = value;
     return metadata;
   }
+  function normalizedProposalValue(field: string, value: unknown, authors: string[] = displayedBook.authors): unknown {
+    const text = (input: string): string => input.replace(/\r\n?/gu, '\n').normalize('NFC').trim();
+    const name = (input: string): string => text(input).replace(/\s+/gu, ' ');
+    if (Array.isArray(value)) {
+      const seen = new Set<string>();
+      return value.filter((item): item is string => typeof item === 'string').map(name).filter((item) => {
+        const key = item.toLowerCase();
+        if (!item || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    }
+    if (typeof value !== 'string') return value;
+    if (field === 'description') return text(value);
+    if (field === 'language') return text(value).replaceAll('_', '-').toLowerCase() || 'und';
+    if (field === 'isbn') return text(value).replace(/^(?:urn:isbn:|isbn-1[03]:|isbn[\s:-]*)/iu, '').replace(/[\s-]/gu, '').toUpperCase() || null;
+    if (field === 'published') {
+      const cleaned = text(value);
+      return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/iu.test(cleaned) && Number.isFinite(Date.parse(cleaned)) ? cleaned.slice(0, 10) : cleaned || null;
+    }
+    const cleaned = name(value);
+    if (field === 'authorSort') return cleaned || name(authors[0] ?? '');
+    return ['series', 'publisher'].includes(field) ? cleaned || null : cleaned;
+  }
+  function changedProposalPatch(value: BookPatch): BookPatch {
+    return Object.fromEntries(Object.entries(bibliographicPatch(value)).filter(([field, proposed]) =>
+      JSON.stringify(normalizedProposalValue(field, proposed, value.authors ?? displayedBook.authors)) !== JSON.stringify(normalizedProposalValue(field, currentValue(field)))));
+  }
   function nullable(value: string): string | null { return value.trim() || null; }
   function values(value: string, separator: RegExp): string[] {
     return [...new Set(value.split(separator).map((part) => part.trim()).filter(Boolean))];
@@ -235,39 +297,43 @@
     if (!baseline || busy || conflict || demo || !Object.keys(patch).length) return;
     const id = baseline.id;
     const expectedRevision = baseline.revision;
+    const currentGeneration = generation;
     busy = true;
     failure = null;
     try {
       const updated = await request('book_update', { id, patch, expectedRevision });
-      if (disposed || book.id !== id) return;
+      if (disposed || book.id !== id || currentGeneration !== generation) return;
       acceptBook(updated);
       onUpdated(updated);
       onNotify(`${$t('actions.save')} · ${updated.title}`);
     } catch (error) {
-      if (disposed || book.id !== id) return;
+      if (disposed || book.id !== id || currentGeneration !== generation) return;
       const publicError = normalizePublicError(error);
       showFailure(publicError);
       if (publicError.code === 'revisionConflict') {
         conflict = true;
         try {
           const current = await request('book_get', { id });
-          if (!disposed && book.id === id) remoteBook = current;
-        } catch (reloadError) { if (!disposed && book.id === id) showFailure(reloadError); }
+          if (!disposed && book.id === id && currentGeneration === generation) remoteBook = current;
+        } catch (reloadError) { if (!disposed && book.id === id && currentGeneration === generation) showFailure(reloadError); }
       }
-    } finally { if (!disposed && book.id === id) busy = false; }
+    } finally { if (!disposed && book.id === id && currentGeneration === generation) busy = false; }
   }
   async function save(): Promise<void> {
     if (!baseline) return;
     try { await persist(createPatch(baseline)); } catch (error) { showFailure(error); }
   }
-  async function reload(): Promise<void> {
+  function reload(): void {
     failure = null;
     if (remoteBook) acceptBook(remoteBook);
-    await loadData(book.id, true);
+    discardRequested = true;
+    loading = true;
+    scheduler.setQuery(book.id);
   }
   async function startJob(kind: 'enrich' | 'optimize' | 'convert'): Promise<void> {
     if (busy || demo || !baseline) return;
     const id = baseline.id;
+    const currentGeneration = generation;
     busy = true;
     failure = null;
     try {
@@ -280,11 +346,11 @@
         if (!selectedFormat || !capabilities?.outputs.includes(selectedFormat)) invalidInput();
         job = await request('book_convert', { id, format: selectedFormat });
       }
-      if (disposed || book.id !== id) return;
+      if (disposed || book.id !== id || currentGeneration !== generation) return;
       latestJob = job;
       onNotify(`${$t(`jobs.${job.kind}`)} · ${$t(`jobs.${job.status}`)}`);
-    } catch (error) { if (!disposed && book.id === id) showFailure(error); }
-    finally { if (!disposed && book.id === id) busy = false; }
+    } catch (error) { if (!disposed && book.id === id && currentGeneration === generation) showFailure(error); }
+    finally { if (!disposed && book.id === id && currentGeneration === generation) busy = false; }
   }
   function profileLabel(profile: OptimizationProfile): string {
     const key = `optimization.${profile.id}`;
@@ -317,7 +383,7 @@
     <button class="icon-button" type="button" onclick={onClose} aria-label={$t('actions.close')}><X size={20} /></button>
   </div>
   <div class="drawer-body stack" aria-busy={loading}>
-    {#if failure}<div class="error-banner" role="alert"><div class="grow"><strong>{$t(`errors.${failure.code}`)}</strong>{#if failure.detail}<p>{failure.detail}</p>{/if}</div></div>{/if}
+    {#if failure}<div class="error-banner" role="alert"><div class="grow"><strong>{$t(`errors.${failure.code}`)}</strong>{#if failureDetail}<p>{failureDetail}</p>{/if}</div></div>{/if}
     {#if conflict}<div class="metadata-review stack" role="alert"><p>{$t('editor.revisionConflict')}</p><button class="button secondary" type="button" disabled={busy || loading} onclick={reload}><RefreshCw size={16} />{$t('actions.refresh')}</button></div>{/if}
     {#if demo}<p class="field-hint">{$t('app.previewDescription')}</p>{/if}
     <div class="row book-summary">
@@ -332,6 +398,21 @@
       </div>
     </div>
     <div class="row wrap small muted"><span>{$t('sort.added')}: {formatDate(displayedBook.addedAt, $locale)}</span><span>{$t('reader.progress', { progress: percent.format(displayedBook.readingProgress) })}</span></div>
+
+    {#if proposal && proposalEntries.length > 0}
+      <section class="metadata-review stack" aria-labelledby="metadata-proposal-title">
+        <div class="spread"><h3 id="metadata-proposal-title">{$t('editor.reviewTitle')}</h3><span class="badge">{$t('book.confidence', { progress: percent.format(proposal.confidence) })}</span></div>
+        <p class="field-hint">{$t('editor.reviewPending')}</p>
+        {#if dirty || conflict}<p class="field-hint">{$t('editor.reviewDraftBlocked')}</p>{/if}
+        <p class="small muted">{proposal.providerId} · {proposal.modelId}</p>
+        {#each proposalEntries as [field, value] (field)}<div class="proposal-field"><strong>{fieldLabel(field)}</strong><p class="small muted">{$t('editor.currentValue')}: {displayValue(currentValue(field))}</p><p>{$t('editor.proposedValue')}: {displayValue(value)}</p></div>{/each}
+        <h4>{$t('book.sources')}</h4>
+        {#each proposal.evidence as evidence, index (index)}<div class="stack evidence"><p class="small"><strong>{fieldLabel(evidence.field)}</strong> · {percent.format(evidence.confidence)}</p><p class="small">{evidence.value}</p><div class="row wrap">{#each [...new Set(evidence.sourceUrls)] as url (url)}<button type="button" class="source-chip" onclick={() => visitSource(url)} title={url}><ExternalLink size={14} />{new URL(url).hostname}</button>{/each}</div></div>{/each}
+        <button class="button primary" type="button" disabled={demo || busy || loading || dirty || conflict || !proposalEntries.length} onclick={() => persist(proposalPatch)}><Check size={16} />{$t('editor.applyProposal')}</button>
+      </section>
+    {/if}
+
+    {#if warnings.length}<section class="stack"><h3>{$t('common.warning')}</h3><ul>{#each warnings as warning (warning)}<li class="small">{warning}</li>{/each}</ul></section>{/if}
 
     <form id="book-metadata-form" class="stack" onsubmit={(event) => { event.preventDefault(); void save(); }}>
       <h3>{$t('editor.title')}</h3>
@@ -362,17 +443,6 @@
       <p class="field-hint">{$t('editor.preserveOriginal')}</p>
     </form>
 
-    {#if proposal}
-      <section class="metadata-review stack" aria-labelledby="metadata-proposal-title">
-        <div class="spread"><h3 id="metadata-proposal-title">{$t('editor.reviewTitle')}</h3><span class="badge">{$t('book.confidence', { progress: percent.format(proposal.confidence) })}</span></div>
-        <p class="small muted">{proposal.providerId} · {proposal.modelId}</p>
-        {#each proposalEntries as [field, value] (field)}<div class="proposal-field"><strong>{fieldLabel(field)}</strong><p class="small muted">{$t('editor.currentValue')}: {displayValue(currentValue(field))}</p><p>{$t('editor.proposedValue')}: {displayValue(value)}</p></div>{/each}
-        <h4>{$t('book.sources')}</h4>
-        {#each proposal.evidence as evidence, index (index)}<div class="stack evidence"><p class="small"><strong>{fieldLabel(evidence.field)}</strong> · {percent.format(evidence.confidence)}</p><p class="small">{evidence.value}</p><div class="row wrap">{#each [...new Set(evidence.sourceUrls)] as url (url)}<button type="button" class="source-chip" onclick={() => visitSource(url)} title={url}><ExternalLink size={14} />{new URL(url).hostname}</button>{/each}</div></div>{/each}
-        <button class="button primary" type="button" disabled={demo || busy || loading || dirty || conflict || !proposalEntries.length} onclick={() => persist(proposalPatch)}><Check size={16} />{$t('editor.applyProposal')}</button>
-      </section>
-    {/if}
-    {#if warnings.length}<section class="stack"><h3>{$t('common.warning')}</h3><ul>{#each warnings as warning (warning)}<li class="small">{warning}</li>{/each}</ul></section>{/if}
     <section class="stack" aria-labelledby="book-files-title">
       <h3 id="book-files-title">{$t('book.files')}</h3>
       {#each files as file (file.id)}<div class="file-variant"><div class="stack variant-description"><div class="row wrap"><FileText size={16} /><strong>{file.format.toUpperCase()}</strong><span class="badge">{$t(`book.${file.variant}`)}</span>{#if file.variant === 'original'}<span class="badge">{$t('devices.readOnly')}</span>{/if}</div>{#if file.profile}<p class="small muted">{profiles.find((profile) => profile.id === file.profile)?.name ?? file.profile}</p>{/if}<p class="small muted">{formatDate(file.createdAt, $locale)}</p></div><span>{formatSize(file.sizeBytes, $locale)}</span></div>{:else}<p class="field-hint">{$t('common.none')}</p>{/each}
@@ -386,7 +456,7 @@
       <div class="field"><label for="book-convert-format">{$t('book.format')}</label><select id="book-convert-format" class="select" bind:value={selectedFormat} disabled={!conversionAvailable || busy}>{#each capabilities?.outputs ?? [] as format (format)}<option value={format}>{format.toUpperCase()}</option>{/each}</select></div>
       {#each capabilities?.warnings ?? [] as warning (warning)}<p class="field-hint">{warning === 'previewConversionUnavailable' ? $t('app.previewConversionUnavailable') : warning}</p>{/each}
       <button class="button secondary" type="button" disabled={demo || busy || loading || baseline === null || !conversionAvailable || !selectedFormat || dirty || conflict} onclick={() => startJob('convert')}>{$t('actions.convert')}</button>
-      {#if latestJob}<div class="job-status stack" aria-live="polite"><p class="small"><strong>{$t(`jobs.${latestJob.kind}`)}</strong> · {$t(`jobs.${latestJob.status}`)}</p><progress value={latestJob.progress} max="1" aria-label={$t('common.progress')}></progress>{#if latestJob.message}<p class="field-hint">{latestJob.message}</p>{/if}{#if latestJob.error}<p class="field-hint">{$t(`errors.${latestJob.error.code}`)}</p>{/if}</div>{/if}
+      {#if latestJob}<div class="job-status stack" aria-live="polite"><p class="small"><strong>{$t(`jobs.${latestJob.kind}`)}</strong> · {$t(`jobs.${latestJob.status}`)}</p><progress value={latestJob.progress} max="1" aria-label={$t('common.progress')}></progress>{#if latestJob.message}<p class="field-hint">{latestJob.message}</p>{/if}{#if latestJob.error}<p class="field-hint">{$t(`errors.${latestJob.error.code}`)}</p>{#if latestJobDetail}<p class="field-hint">{latestJobDetail}</p>{/if}{/if}</div>{/if}
     </section>
   </div>
   <div class="drawer-footer"><button class="button primary" type="submit" form="book-metadata-form" disabled={demo || busy || loading || !dirty || conflict}><Check size={16} />{$t('actions.save')}</button><button class="button secondary" type="button" disabled={busy} onclick={onClose}>{$t('actions.close')}</button></div>

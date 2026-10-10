@@ -3,7 +3,7 @@
   import { Check, Globe, KeyRound, Palette, RefreshCw, Settings2, ShieldCheck, Sparkles, X } from '@lucide/svelte';
   import { isPreview, normalizePublicError, PublicError, request } from '../api';
   import type { AppError, ModelCatalog, OptimizationProfile, Provider, ProviderId, Settings } from '../contracts';
-  import { availableLanguages, formatDate, locale, t } from '../i18n';
+  import { availableLanguages, formatDate, formatProviderDiagnostic, locale, t } from '../i18n';
   import { version as appVersion } from '../../../package.json';
 
   interface Props {
@@ -31,6 +31,9 @@
   let secret = $state('');
   let persistSecret = $state(false);
   let failure = $state<AppError | null>(null);
+  const failureDetail = $derived(failure?.code === 'providerError'
+    ? formatProviderDiagnostic(failure.code, failure.detail, $locale)
+    : failure?.detail ?? null);
   const dirty = $derived(draft !== null && baseline !== null && JSON.stringify(draft) !== JSON.stringify(baseline));
   const selectedProvider = $derived(providers.find((provider) => provider.id === draft?.providerId));
   const currentCatalog = $derived(draft?.providerId ? catalogs[draft.providerId] : undefined);
@@ -208,7 +211,7 @@
 
 <section class="page">
   <div class="page-header"><div><p class="eyebrow">Library Manager</p><h1 class="page-title">{$t('settings.title')}</h1><p class="page-subtitle">{$t('app.tagline')}</p></div><div class="toolbar"><button class="button secondary" type="button" disabled={blocked || !dirty} onclick={reset}>{$t('actions.cancel')}</button><button class="button primary" type="submit" form="settings-form" disabled={blocked || !dirty || !validCombination}><Check size={17} />{$t('actions.save')}</button></div></div>
-  {#if failure}<div class="error-banner" role="alert"><div class="grow"><strong>{$t(`errors.${failure.code}`)}</strong>{#if failure.code === 'secretStoreUnavailable'}<p>{$t('settings.noKeyring')}</p>{/if}{#if failure.detail}<p>{failure.detail}</p>{/if}</div><button class="icon-button" type="button" onclick={() => { failure = null; }} aria-label={$t('actions.close')}><X size={16} /></button></div>{/if}
+  {#if failure}<div class="error-banner" role="alert"><div class="grow"><strong>{$t(`errors.${failure.code}`)}</strong>{#if failure.code === 'secretStoreUnavailable'}<p>{$t('settings.noKeyring')}</p>{/if}{#if failureDetail}<p>{failureDetail}</p>{/if}</div><button class="icon-button" type="button" onclick={() => { failure = null; }} aria-label={$t('actions.close')}><X size={16} /></button></div>{/if}
   {#if demo}<p class="field-hint demo-hint">{$t('app.previewDescription')}</p>{/if}
   {#if draft}
     <div class="settings-layout">

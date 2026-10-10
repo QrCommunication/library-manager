@@ -26,7 +26,8 @@ use crate::{
     DeviceTransport, EnrichmentService, ErrorCode, FileVariant, IndexedDeviceBook, Job, JobKind,
     JobService, JobStatus, LibraryFacets, LibraryService, MetadataStatus, Operation, PreparedChat,
     ProviderId, ProviderService, ProviderStatus, PublicError, ReaderService, Result, Settings,
-    SettingsService, Storage, TransferService, WebClient, providers::public_provider_error,
+    SettingsService, Storage, TransferService, WebClient, chat::ChatProgress,
+    providers::public_provider_error,
 };
 
 pub type ManagerEventSink = Arc<dyn Fn(&str, Value) + Send + Sync>;
@@ -95,6 +96,7 @@ impl LibraryManager {
         let jobs = JobService::new(database.clone()).with_event_callback(Arc::new(move |job| {
             callback("job:updated", json!({"job":job}))
         }));
+        let chat = chat.with_tools(library.clone(), storage.clone(), jobs.clone());
         let devices = DeviceService::new(database.clone());
         let transfers = TransferService::new(
             database.clone(),
@@ -288,14 +290,26 @@ impl LibraryManager {
         text: &str,
         book_ids: &[String],
     ) -> Result<Job> {
+        self.chat_send_authorized(conversation_id, text, book_ids, false)
+            .await
+    }
+    pub async fn chat_send_authorized(
+        &self,
+        conversation_id: Option<&str>,
+        text: &str,
+        book_ids: &[String],
+        allow_changes: bool,
+    ) -> Result<Job> {
         let service = self.chat.clone();
         let conversation_id = conversation_id.map(str::to_owned);
         let text = text.to_owned();
         let ids = book_ids.to_vec();
-        let prepared =
-            blocking(move || service.prepare(conversation_id.as_deref(), &text, &ids)).await?;
+        let prepared = blocking(move || {
+            service.prepare_authorized(conversation_id.as_deref(), &text, &ids, allow_changes)
+        })
+        .await?;
         self.jobs.enqueue_with_result(JobKind::Chat,
-            json!({"conversationId":prepared.conversation_id,"userMessageId":prepared.user_message_id,"text":prepared.text,"bookIds":prepared.book_ids}),
+            json!({"conversationId":prepared.conversation_id,"userMessageId":prepared.user_message_id,"text":prepared.text,"bookIds":prepared.book_ids,"allowChanges":prepared.allow_changes}),
             json!({"conversationId":prepared.conversation_id}))
     }
     pub fn reader_save_progress(&self, id: &str, location: &str, progress: f64) -> Result<()> {
@@ -470,7 +484,7 @@ impl LibraryManager {
     }
     async fn background(self, shutdown: Arc<AtomicBool>) {
         let mut workers = JoinSet::new();
-        let mut active_jobs = HashSet::new();
+        let mut active_jobs = BTreeMap::new();
         let mut scans = JoinSet::new();
         let mut tick = tokio::time::interval(WORKER_TICK);
         let mut scan_tick = tokio::time::interval(DEVICE_SCAN_INTERVAL);
@@ -484,7 +498,7 @@ impl LibraryManager {
                     if let Ok(settings) = self.settings.get() {
                         while let Ok(Some(claim)) = self.jobs.claim_next(settings.max_concurrent_jobs as usize) {
                             let id = claim.job.id.clone();
-                            active_jobs.insert(id.clone());
+                            active_jobs.insert(id.clone(), claim.cancellation.clone());
                             let manager = self.clone(); workers.spawn(async move { manager.execute_claim(claim).await; id });
                         }
                     }
@@ -498,14 +512,25 @@ impl LibraryManager {
                 _ = scans.join_next(), if !scans.is_empty() => {}
             }
         }
-        // Active workers are tracked independently of the bounded UI job history.
-        for id in active_jobs {
-            let _ = self.job_cancel(&id);
-        }
-        workers.abort_all();
         scans.abort_all();
-        while workers.join_next().await.is_some() {}
+        self.cancel_and_settle_workers(active_jobs, &mut workers)
+            .await;
         while scans.join_next().await.is_some() {}
+    }
+    async fn cancel_and_settle_workers(
+        &self,
+        active_jobs: BTreeMap<String, Arc<AtomicBool>>,
+        workers: &mut JoinSet<String>,
+    ) {
+        // Signal every live claim before notifications; cancellation must survive bounded history.
+        for cancellation in active_jobs.values() {
+            cancellation.store(true, Ordering::Release);
+        }
+        for id in active_jobs.keys() {
+            let _ = self.job_cancel(id);
+        }
+        // A tool may be settling a durable write on a blocking thread. Keep the profile owned.
+        while workers.join_next().await.is_some() {}
     }
     /// Execute one durable job; useful for bounded integration tests and headless hosts.
     pub async fn run_once(&self) -> Result<bool> {
@@ -521,7 +546,9 @@ impl LibraryManager {
         }
     }
     async fn execute_claim(&self, claim: ClaimedJob) {
-        let outcome = if claim.job.kind == JobKind::Transfer {
+        let await_cleanup = claim_needs_cleanup(&claim);
+        // Dropping a spawn_blocking future detaches its thread; cooperative cleanup must finish.
+        let outcome = if await_cleanup {
             self.dispatch(&claim).await
         } else {
             tokio::select! {
@@ -592,14 +619,49 @@ impl LibraryManager {
                     user_message_id: payload.user_message_id,
                     text: payload.text,
                     book_ids: payload.book_ids,
+                    allow_changes: payload.allow_changes,
                 };
-                let result = self.chat.respond(&prepared, &settings).await?;
+                let manager = self.clone();
+                let progress_claim = claim.clone();
+                let conversation_id = prepared.conversation_id.clone();
+                let changed_books = Arc::new(Mutex::new(HashSet::<String>::new()));
+                let progress_books = changed_books.clone();
+                let progress: ChatProgress = Arc::new(move |_, message, ids| {
+                    let _ = manager.jobs.update_progress(&progress_claim, 0.0, message);
+                    if !ids.is_empty() {
+                        if let Ok(mut changed) = progress_books.lock() {
+                            changed.extend(ids.iter().cloned());
+                            let mut changed: Vec<_> = changed.iter().cloned().collect();
+                            changed.sort();
+                            let _ = manager.jobs.update_result(&progress_claim, json!({"conversationId":conversation_id,"actions":{"changedBooks":changed.len(),"changedBookIds":changed}}));
+                        }
+                        manager.library_changed(ids.to_vec(), "assistant");
+                    }
+                });
+                let result = self
+                    .chat
+                    .respond_with_control(
+                        &prepared,
+                        &settings,
+                        claim.cancellation.clone(),
+                        progress,
+                    )
+                    .await?;
                 check_cancelled(claim)?;
                 (self.event_sink)(
                     "chat:delta",
                     json!({"conversationId":result.conversation_id,"messageId":result.id,"text":result.content,"finished":true}),
                 );
-                Ok(serde_json::to_value(result)?)
+                let mut result = serde_json::to_value(result)?;
+                if let Ok(changed) = changed_books.lock()
+                    && !changed.is_empty()
+                {
+                    let mut changed: Vec<_> = changed.iter().cloned().collect();
+                    changed.sort();
+                    result["actions"] =
+                        json!({"changedBooks":changed.len(),"changedBookIds":changed});
+                }
+                Ok(result)
             }
         }
     }
@@ -728,7 +790,10 @@ impl LibraryManager {
     }
     async fn enrich_job(&self, claim: &ClaimedJob) -> Result<Value> {
         let payload: EnrichPayload = decode(&claim.payload)?;
-        if payload.origin != "import" && payload.origin != "manual" {
+        if !matches!(
+            payload.origin.as_str(),
+            "import" | "manual" | "assistantReview"
+        ) {
             return Err(invalid("Invalid enrichment origin"));
         }
         let mut settings = self.settings.get()?;
@@ -736,7 +801,7 @@ impl LibraryManager {
             return Ok(json!({"skipped":"autoEnrichmentDisabled","bookId":payload.id}));
         }
         settings = self.configured_settings()?;
-        if payload.origin == "manual" {
+        if matches!(payload.origin.as_str(), "manual" | "assistantReview") {
             settings.auto_enrich = true;
         }
         let before = self.repository.get(&payload.id, &[])?;
@@ -889,6 +954,16 @@ fn enrichment_may_apply(book: &Book, baseline: u64, origin: &str) -> bool {
     book.revision == baseline
         && (origin == "manual"
             || (origin == "import" && book.metadata_status != MetadataStatus::Verified))
+}
+
+fn claim_needs_cleanup(claim: &ClaimedJob) -> bool {
+    matches!(claim.job.kind, JobKind::Transfer | JobKind::Chat)
+        || (claim.job.kind == JobKind::DeviceIndex
+            && claim
+                .payload
+                .get("deviceId")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.starts_with("calibre-") && !id.starts_with("crosspoint-")))
 }
 
 fn limited_index_result(
@@ -1061,6 +1136,8 @@ struct ChatPayload {
     user_message_id: String,
     text: String,
     book_ids: Vec<String>,
+    #[serde(default)]
+    allow_changes: bool,
 }
 
 fn job_public_error(kind: JobKind, error: &AppError) -> PublicError {
@@ -1353,6 +1430,152 @@ mod tests {
         let manager = create(&directory.path().join("profile"), events).unwrap();
         assert_eq!(manager.jobs.get(&job.id).unwrap().result.unwrap(), initial);
         assert_eq!(manager.chat.messages(&conversation).unwrap().len(), 1);
+        assert_eq!(
+            manager.jobs.payload(&job.id).unwrap()["allowChanges"],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_authorization_is_persisted_and_forged_payload_permissions_are_rejected() {
+        let (directory, manager, events, source) = fixture();
+        let book = manager.library.import(&source).unwrap().book;
+        let job = manager
+            .chat_send_authorized(
+                None,
+                "Corrige ce livre",
+                std::slice::from_ref(&book.id),
+                true,
+            )
+            .await
+            .unwrap();
+        let payload = manager.jobs.payload(&job.id).unwrap();
+        assert_eq!(payload["allowChanges"], true);
+        drop(manager);
+        let manager = create(&directory.path().join("profile"), events).unwrap();
+        assert_eq!(manager.jobs.payload(&job.id).unwrap(), payload);
+        let stored: ChatPayload = decode(&payload).unwrap();
+        let mut forged = PreparedChat {
+            conversation_id: stored.conversation_id,
+            user_message_id: stored.user_message_id,
+            text: stored.text,
+            book_ids: stored.book_ids,
+            allow_changes: false,
+        };
+        assert!(matches!(
+            manager.chat.respond(&forged, &Settings::default()).await,
+            Err(AppError::Conflict(_))
+        ));
+        forged.allow_changes = true;
+        forged.book_ids.clear();
+        assert!(matches!(
+            manager.chat.respond(&forged, &Settings::default()).await,
+            Err(AppError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn legacy_chat_jobs_are_read_only_and_permission_values_require_booleans() {
+        let legacy = json!({"conversationId":"conversation","userMessageId":"message","text":"Question","bookIds":[]});
+        assert!(!decode::<ChatPayload>(&legacy).unwrap().allow_changes);
+        for invalid_permission in [json!(null), json!("true"), json!(1), json!({})] {
+            let mut payload = legacy.clone();
+            payload["allowChanges"] = invalid_permission;
+            assert!(decode::<ChatPayload>(&payload).is_err());
+        }
+        let mut allowed = legacy;
+        allowed["allowChanges"] = json!(true);
+        assert!(decode::<ChatPayload>(&allowed).unwrap().allow_changes);
+    }
+
+    #[test]
+    fn assistant_review_preserves_revision_guard_and_never_applies_automatically() {
+        let (_directory, manager, _events, source) = fixture();
+        let book = manager.library.import(&source).unwrap().book;
+        assert!(enrichment_may_apply(&book, book.revision, "manual"));
+        assert!(!enrichment_may_apply(
+            &book,
+            book.revision,
+            "assistantReview"
+        ));
+        assert!(!enrichment_may_apply(&book, book.revision + 1, "manual"));
+        let job = manager
+            .enqueue_enrichment(&book, "assistantReview")
+            .unwrap();
+        let payload = manager.jobs.payload(&job.id).unwrap();
+        assert_eq!(payload["origin"], "assistantReview");
+        assert_eq!(payload["baselineRevision"], book.revision);
+    }
+
+    #[test]
+    fn cleanup_covers_chat_tools_and_keeps_network_index_cancellation() {
+        let (_directory, manager, _events, _source) = fixture();
+        for (kind, payload, expected) in [
+            (JobKind::Chat, json!({}), true),
+            (JobKind::Transfer, json!({}), true),
+            (JobKind::DeviceIndex, json!({"deviceId":"usb-card"}), true),
+            (
+                JobKind::DeviceIndex,
+                json!({"deviceId":"calibre-host"}),
+                false,
+            ),
+            (
+                JobKind::DeviceIndex,
+                json!({"deviceId":"crosspoint-host"}),
+                false,
+            ),
+            (JobKind::Enrich, json!({}), false),
+        ] {
+            let job = manager.jobs.enqueue(kind, payload).unwrap();
+            let claim = manager.jobs.claim_next(1).unwrap().unwrap();
+            assert_eq!(claim.job.id, job.id);
+            assert_eq!(claim_needs_cleanup(&claim), expected);
+            manager.jobs.cancel(&job.id).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_signals_chat_and_waits_for_blocking_tool_cleanup() {
+        let (_directory, manager, _events, _source) = fixture();
+        let job = manager.jobs.enqueue(JobKind::Chat, json!({})).unwrap();
+        let claim = manager.jobs.claim_next(1).unwrap().unwrap();
+        let cancellation = claim.cancellation.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let worker_barrier = barrier.clone();
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let mut workers = JoinSet::new();
+        let id = job.id.clone();
+        workers.spawn(async move {
+            blocking(move || {
+                started.send(()).unwrap();
+                worker_barrier.wait();
+                Ok(())
+            })
+            .await
+            .unwrap();
+            id
+        });
+        entered.await.unwrap();
+        let active = BTreeMap::from([(job.id.clone(), cancellation.clone())]);
+        let shutting_down = manager.clone();
+        let mut shutdown = tokio::spawn(async move {
+            shutting_down
+                .cancel_and_settle_workers(active, &mut workers)
+                .await;
+        });
+        let early = tokio::time::timeout(Duration::from_millis(150), &mut shutdown).await;
+        let cleanup_waited = early.is_err();
+        barrier.wait();
+        match early {
+            Ok(result) => result.unwrap(),
+            Err(_) => shutdown.await.unwrap(),
+        }
+        assert!(cleanup_waited, "Shutdown detached a blocking tool write");
+        assert!(cancellation.load(Ordering::Acquire));
+        assert_eq!(
+            manager.jobs.get(&job.id).unwrap().status,
+            JobStatus::Cancelled
+        );
     }
 
     #[test]
@@ -1644,6 +1867,58 @@ mod tests {
         assert!(manager.run_once().await.unwrap());
         assert_eq!(
             manager.jobs.get(&cancelled.id).unwrap().status,
+            JobStatus::Cancelled
+        );
+        assert_eq!(manager.devices.inventory(&id).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_device_index_worker_waits_for_staged_inventory_cleanup() {
+        let (_directory, mut manager, _events, _card, _mountinfo, id) = device_fixture(2);
+        manager.devices.index(&id).unwrap();
+        let original_jobs = manager.jobs.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let worker_barrier = barrier.clone();
+        let (cancelled_sender, cancelled_receiver) = tokio::sync::oneshot::channel();
+        let cancelled_sender = Mutex::new(Some(cancelled_sender));
+        manager.jobs = manager
+            .jobs
+            .clone()
+            .with_event_callback(Arc::new(move |job| {
+                if job.kind == JobKind::DeviceIndex
+                    && job
+                        .result
+                        .as_ref()
+                        .and_then(|result| result["indexProgress"]["processedBooks"].as_u64())
+                        .is_some_and(|count| count > 0)
+                {
+                    let sender = cancelled_sender.lock().unwrap().take();
+                    if let Some(sender) = sender {
+                        original_jobs.cancel(&job.id).unwrap();
+                        sender.send(()).unwrap();
+                        worker_barrier.wait();
+                    }
+                }
+            }));
+        let job = manager.device_index(&id).unwrap();
+        let worker_manager = manager.clone();
+        let mut worker = tokio::spawn(async move { worker_manager.run_once().await });
+        cancelled_receiver.await.unwrap();
+        let early_result = tokio::time::timeout(Duration::from_millis(150), &mut worker).await;
+        let waited_for_cleanup = early_result.is_err();
+        // Release even on failure so the old implementation cannot strand its blocking thread.
+        barrier.wait();
+        let finished = match early_result {
+            Ok(result) => result,
+            Err(_) => worker.await,
+        };
+        assert!(finished.unwrap().unwrap());
+        assert!(
+            waited_for_cleanup,
+            "Cancelled worker returned before cleanup"
+        );
+        assert_eq!(
+            manager.jobs.get(&job.id).unwrap().status,
             JobStatus::Cancelled
         );
         assert_eq!(manager.devices.inventory(&id).unwrap().len(), 2);

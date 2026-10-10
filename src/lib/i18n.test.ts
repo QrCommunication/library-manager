@@ -2,7 +2,7 @@ import { get } from 'svelte/store';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fr from './locales/fr.json';
 import en from './locales/en.json';
-import { availableLanguages, formatDate, formatSize, locale, normalizeLocale, setLanguage, t } from './i18n';
+import { availableLanguages, formatDate, formatProviderDiagnostic, formatSize, locale, normalizeLocale, setLanguage, t } from './i18n';
 
 const localeDocuments = import.meta.glob<unknown>('./locales/*.json', { eager: true, import: 'default' });
 
@@ -106,5 +106,77 @@ describe('language selection and fallback', () => {
     expect(formatDate('invalid')).toBe('—');
     expect(formatDate('2026-10-09T10:00:00Z', 'fr')).toContain('2026');
     expect(formatDate('2026-10-09T10:00:00Z', 'en')).not.toBe(formatDate('2026-10-09T10:00:00Z', 'fr'));
+  });
+});
+
+describe('public provider diagnostics', () => {
+  const diagnostics = [
+    ['authenticationRejected', 'Le fournisseur a refusé la clé API ou les permissions du compte.', 'The provider rejected the API key or account permissions.'],
+    ['requestRejected', 'Le fournisseur a refusé les paramètres de la requête.', 'The provider rejected the request parameters.'],
+    ['requestFailed', 'La requête adressée au fournisseur IA a échoué.', 'The request to the AI provider failed.'],
+    ['responseIncomplete', 'Le fournisseur a renvoyé une réponse incomplète ou l’a refusée. Réessayez ou choisissez un autre modèle.', 'The provider response was incomplete or refused.'],
+    ['responseMalformed', 'Le fournisseur a renvoyé une réponse JSON invalide.', 'The provider returned invalid JSON.'],
+    ['noFinalAnswer', 'Le fournisseur n’a renvoyé aucun texte final exploitable.', 'The provider did not return a usable final answer.'],
+    ['metadataInvalid', 'La réponse du fournisseur ne respecte pas le format requis pour les métadonnées.', 'The metadata response does not match the required format.'],
+  ] as const;
+
+  it.each(diagnostics)('renders the %s diagnosis as a readable French or English message', (name, french, english) => {
+    const detail = `providerDiagnostics.${name}`;
+    expect(formatProviderDiagnostic('providerError', detail, 'fr')).toBe(french);
+    expect(formatProviderDiagnostic('providerError', detail, 'en')).toBe(english);
+    for (const language of ['fr', 'en']) {
+      const rendered = formatProviderDiagnostic('providerError', detail, language);
+      expect(rendered).not.toBe(detail);
+      expect(rendered).not.toContain('providerDiagnostics.');
+    }
+  });
+
+  it('hides raw provider responses, secrets, paths and unrecognized or malformed diagnostic keys', () => {
+    for (const detail of [
+      null,
+      '',
+      'providerDiagnostics.unknown',
+      'ProviderDiagnostics.metadataInvalid',
+      ' providerDiagnostics.metadataInvalid',
+      'providerDiagnostics.metadataInvalid ',
+      'providerDiagnostics.metadataInvalid\n',
+      'providerDiagnostics.metadataInvalid\0',
+      'providerDiagnostics.metadataInvalid\u200b',
+      'Authorization: Bearer PRIVATE_TOKEN',
+      '/home/private/library/book.epub',
+      '{"content":"PRIVATE_RESPONSE"}',
+      '<think>PRIVATE_REASONING</think>Answer',
+    ]) {
+      for (const language of ['fr', 'en']) {
+        expect(formatProviderDiagnostic('providerError', detail, language), `${language}:${detail}`).toBeNull();
+      }
+    }
+    for (const code of ['invalidInput', 'networkUnavailable', 'rateLimited', 'providerNotConfigured', 'provider_error', 'ProviderError', '']) {
+      for (const [name] of diagnostics) {
+        expect(formatProviderDiagnostic(code, `providerDiagnostics.${name}`, 'fr'), `${code}:${name}`).toBeNull();
+      }
+    }
+  });
+
+  it('normalizes explicit regional locales and follows the current language without caching an earlier translation', () => {
+    const detail = 'providerDiagnostics.metadataInvalid';
+    const french = 'La réponse du fournisseur ne respecte pas le format requis pour les métadonnées.';
+    const english = 'The metadata response does not match the required format.';
+    expect(formatProviderDiagnostic('providerError', detail, 'fr_FR.UTF-8')).toBe(french);
+    expect(formatProviderDiagnostic('providerError', detail, 'en_US.UTF-8')).toBe(english);
+    const rendered: Array<string | null> = [];
+    const unsubscribe = locale.subscribe((language) => {
+      rendered.push(formatProviderDiagnostic('providerError', detail, language));
+    });
+    try {
+      expect(formatProviderDiagnostic('providerError', detail)).toBe(english);
+      setLanguage('fr');
+      expect(formatProviderDiagnostic('providerError', detail)).toBe(french);
+      setLanguage('en');
+      expect(formatProviderDiagnostic('providerError', detail)).toBe(english);
+      expect(rendered).toEqual([english, french, english]);
+    } finally {
+      unsubscribe();
+    }
   });
 });

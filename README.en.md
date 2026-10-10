@@ -4,7 +4,7 @@
 
 **Your library, wherever you read.** A standalone Linux desktop application for organizing ebooks, reading EPUBs, and preparing files for ereaders.
 
-[Français](README.md) · [Downloads](https://github.com/QrCommunication/library-manager/releases/tag/v0.1.1) · [Architecture](docs/BLUEPRINT.md) · [Issues](https://github.com/QrCommunication/library-manager/issues)
+[Français](README.md) · [Downloads](https://github.com/QrCommunication/library-manager/releases/tag/v0.2.0) · [Architecture](docs/BLUEPRINT.md) · [Issues](https://github.com/QrCommunication/library-manager/issues)
 
 Developed by QR Communication under **GPL-3.0**. The Rust engine, SQLite database, and MOBI converter are bundled. **Calibre, Node, Rust, and Python are not required to run release packages.**
 
@@ -24,6 +24,10 @@ Imports automatically queue metadata work when automatic enrichment is enabled. 
 Choose **Z.ai, Kimi, MiniMax, Codex through the OpenAI API, Claude, or Mistral**. Model catalogs are retrieved on demand from provider APIs or official catalogs, with source and retrieval date. Z.ai uses its public official catalog where a model-list API is unavailable.
 
 Library Manager provides common Internet research tools for every provider. Bibliographic sources accompany metadata proposals; uncertain corrections remain available for review. Models cannot execute shell commands or delete files. Personal notes and reading progress are protected from metadata enrichment.
+
+In the **Library**, check the books you want to work on. The selection bar offers **Verify metadata** to queue their analyses, or **Assistant** to work with that selection. The assistant can inspect files and request analyses; permission to edit and organize applies only to the request being sent. Without that permission, it remains read-only. You can select up to 200 books.
+
+Choose **Review proposals**, or **Review** beside a book with an available proposal, to open its review window. Compare current values, proposed changes, and their sources, then apply the proposal. Fields already matching the catalog are not shown as changes. Changes are recorded in history, where reversible operations can be undone. Inspection reads the stored file and verifies its integrity. EPUB excerpts prioritize title, copyright, and edition pages, followed by a chapter. This reading is bounded and does not cover the entire book.
 
 Providers require API credentials and may charge for use. A chat-site subscription does not automatically provide an API key. Keys can be kept in session memory or the Linux secret service. The application never silently falls back to plaintext storage.
 
@@ -63,18 +67,18 @@ The EPUB reader includes a table of contents and saved position. Book HTML is sa
 
 ## Installation
 
-Download the **DEB, RPM, or AppImage** from the [v0.1.1 release](https://github.com/QrCommunication/library-manager/releases/tag/v0.1.1). These packages target **Linux x86_64 (AMD64)** and are built on **Ubuntu 22.04 with glibc 2.35**. They require glibc 2.35 or newer and compatible GTK/WebKit system libraries. See [the validation report](docs/QUALITY.md) for the environments actually tested and the remaining limits.
+Download the **DEB, RPM, or AppImage** from the [v0.2.0 release](https://github.com/QrCommunication/library-manager/releases/tag/v0.2.0). These packages target **Linux x86_64 (AMD64)** and are built on **Ubuntu 22.04 with glibc 2.35**. They require glibc 2.35 or newer and compatible GTK/WebKit system libraries. See [the validation report](docs/QUALITY.md) for the environments actually tested and the remaining limits.
 
 On Debian, Ubuntu, and derivatives, install the downloaded DEB:
 
 ```sh
-sudo apt install ./library-manager_0.1.1_amd64.deb
+sudo apt install ./library-manager_0.2.0_amd64.deb
 ```
 
 On Fedora and compatible RPM distributions:
 
 ```sh
-sudo dnf install ./library-manager-0.1.1-1.x86_64.rpm
+sudo dnf install ./library-manager-0.2.0-1.x86_64.rpm
 ```
 
 The package manager installs required GTK/WebKit system libraries and `ca-certificates` for HTTPS connections. Launch **Library Manager** from the applications menu.
@@ -82,14 +86,14 @@ The package manager installs required GTK/WebKit system libraries and `ca-certif
 For the AppImage, make the downloaded file executable and start it:
 
 ```sh
-chmod +x ./library-manager_0.1.1_amd64.AppImage
-./library-manager_0.1.1_amd64.AppImage
+chmod +x ./library-manager_0.2.0_amd64.AppImage
+./library-manager_0.2.0_amd64.AppImage
 ```
 
 The AppImage uses the host operating system's libraries, services, and trusted certificate store. If FUSE is unavailable, start it in extraction mode:
 
 ```sh
-APPIMAGE_EXTRACT_AND_RUN=1 ./library-manager_0.1.1_amd64.AppImage
+APPIMAGE_EXTRACT_AND_RUN=1 ./library-manager_0.2.0_amd64.AppImage
 ```
 
 It needs no Calibre installation or Node, Rust, or Python runtime. Release assets include SHA-256 checksums.

@@ -13,6 +13,7 @@
   import { defaultQuery } from '../contracts';
   import type { AppError, Book, BookFormat, BookPage, BookQuery, BookSort, Device, Job, LibraryFacets } from '../contracts';
   import { formatDate, formatSize, locale, t } from '../i18n';
+  import { createRequestScheduler } from '../request-scheduler';
   import DeviceOnlyBooks from './DeviceOnlyBooks.svelte';
 
   interface Props {
@@ -32,9 +33,11 @@
     onNotify: (message: string) => void;
     onError: (error: unknown) => void;
     onStateChange?: (state: LibraryViewState) => void;
+    onOpenAssistant?: () => void;
+    onVerifySelected?: () => void;
   }
 
-  let { initialQuery, initialState = null, search, groupBy, refreshVersion, selectedBookIds, importing, devices = [], jobs = [], onSelectionChange, onOpenBook, onReadBook, onImport, onNotify, onError, onStateChange }: Props = $props();
+  let { initialQuery, initialState = null, search, groupBy, refreshVersion, selectedBookIds, importing, devices = [], jobs = [], onSelectionChange, onOpenBook, onReadBook, onImport, onNotify, onError, onStateChange, onOpenAssistant, onVerifySelected }: Props = $props();
   type FacetField = 'authors' | 'series' | 'genres' | 'tags' | 'languages' | 'formats';
   type ScalarFilter = 'deviceId' | 'onDevice' | 'readStatus' | 'favorite' | 'metadataStatus' | 'missingCover' | 'minSizeBytes' | 'maxSizeBytes';
   interface ActiveChip { field: FacetField | ScalarFilter; value: string | null; label: string }
@@ -54,18 +57,19 @@
   let view = $state<'grid' | 'table'>(restoredState?.view ?? 'grid');
   let filtersVisible = $state(restoredState?.filtersVisible ?? false);
   let loading = $state(true);
+  let reviewLoading = $state(false);
+  let disposed = false;
   let failure = $state<AppError | null>(null);
   let failedCoverIds = $state<string[]>([]);
   let retryVersion = $state(0);
   let selectPageInput = $state<HTMLInputElement>();
-  let requestGeneration = 0;
-  let facetGeneration = 0;
-  let disposed = false;
 
   const items = $derived(page?.items ?? []);
   const total = $derived(page?.total ?? 0);
+  const proposalBookIds = $derived.by(() => new Set(jobs.filter((job) => job.kind === 'enrich' && job.status === 'completed').map(completedProposalBookId).filter((id): id is string => id !== null)));
   const allVisibleSelected = $derived(items.length > 0 && items.every((book) => selectedBookIds.includes(book.id)));
   const someVisibleSelected = $derived(items.some((book) => selectedBookIds.includes(book.id)));
+  const selectionActionsDisabled = $derived(isPreview() || selectedBookIds.length === 0 || selectedBookIds.length > 200);
   const titleKey = $derived(groupBy === 'author' ? 'filters.authors' : groupBy === 'series' ? 'filters.series' : groupBy === 'genre' ? 'filters.genres' : query.favorite === true ? 'sidebar.favorites' : query.readStatus === 'reading' ? 'sidebar.reading' : 'library.title');
   const numberFormatter = $derived(new Intl.NumberFormat($locale));
   const percentFormatter = $derived(new Intl.NumberFormat($locale, { style: 'percent', maximumFractionDigits: 0 }));
@@ -184,6 +188,52 @@
     onSelectionChange(allVisibleSelected ? selectedBookIds.filter((id) => !ids.has(id)) : [...new Set([...selectedBookIds, ...ids])]);
   }
 
+  function completedProposalBookId(job: Job): string | null {
+    const record = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
+    const strings = (value: unknown): value is string[] => Array.isArray(value) && value.every((item) => typeof item === 'string');
+    const confidence = (value: unknown): boolean => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
+    const candidate = record(job.result) && 'proposal' in job.result ? job.result.proposal : job.result;
+    if (!record(candidate) || typeof candidate.bookId !== 'string' || !job.bookIds.includes(candidate.bookId)
+      || !record(candidate.patch) || !confidence(candidate.confidence) || !strings(candidate.warnings)
+      || typeof candidate.modelId !== 'string' || !['zai', 'kimi', 'minimax', 'codex', 'claude', 'mistral'].includes(String(candidate.providerId))
+      || !Array.isArray(candidate.evidence)) return null;
+    const entries = Object.entries(candidate.patch);
+    if (!entries.length || !entries.every(([field, value]) => {
+      if (['title', 'authorSort', 'language', 'description'].includes(field)) return typeof value === 'string';
+      if (['series', 'isbn', 'publisher', 'published'].includes(field)) return value === null || typeof value === 'string';
+      if (['authors', 'genres', 'tags'].includes(field)) return strings(value);
+      return field === 'seriesIndex' && (value === null || (typeof value === 'number' && Number.isFinite(value)));
+    })) return null;
+    if (!candidate.evidence.every((evidence) => record(evidence) && typeof evidence.field === 'string'
+      && typeof evidence.value === 'string' && confidence(evidence.confidence) && strings(evidence.sourceUrls)
+      && evidence.sourceUrls.every((value) => {
+        try {
+          const url = new URL(value);
+          return ['https:', 'http:'].includes(url.protocol) && !url.username && !url.password && !/[\u0000-\u001f\u007f]/u.test(value);
+        } catch { return false; }
+      }))) return null;
+    return candidate.bookId;
+  }
+
+  async function openReview(): Promise<void> {
+    if (reviewLoading || disposed) return;
+    reviewLoading = true;
+    try {
+      const visiblePendingIds = new Set(items.filter((book) => book.metadataStatus === 'needsReview').map((book) => book.id));
+      const ids = [...proposalBookIds].sort((left, right) => Number(visiblePendingIds.has(right)) - Number(visiblePendingIds.has(left)));
+      for (const id of ids) {
+        const current = await request('book_get', { id });
+        if (disposed) return;
+        if (current.metadataStatus === 'needsReview') { onOpenBook(current); return; }
+      }
+      if (!disposed) onNotify($t('library.noReviewProposals'));
+    } catch (error) {
+      if (!disposed) onError(error);
+    } finally {
+      if (!disposed) reviewLoading = false;
+    }
+  }
+
   function setSort(sort: BookSort): void {
     if (query.sort === sort) query.descending = !query.descending;
     else { query.sort = sort; query.descending = false; }
@@ -194,26 +244,28 @@
     return query.sort === sort ? query.descending ? 'descending' : 'ascending' : 'none';
   }
 
-  async function loadPage(nextQuery: BookQuery, generation: number): Promise<void> {
-    try {
-      const result = await request('library_list', { query: nextQuery });
-      if (!disposed && generation === requestGeneration) { page = result; failure = null; }
-    } catch (error: unknown) {
-      if (!disposed && generation === requestGeneration) failure = normalizePublicError(error);
-    } finally {
-      if (!disposed && generation === requestGeneration) loading = false;
-    }
+  function loadFacets() {
+    return Promise.allSettled([request('library_facets', undefined), request('devices_scan', undefined)]);
   }
 
-  async function loadFacets(): Promise<void> {
-    const generation = ++facetGeneration;
-    const results = await Promise.allSettled([request('library_facets', undefined), request('devices_scan', undefined)]);
-    if (disposed || generation !== facetGeneration) return;
-    const [facetResult, deviceResult] = results;
-    if (facetResult?.status === 'fulfilled') facets = facetResult.value;
-    else if (facetResult?.status === 'rejected') onError(facetResult.reason);
-    if (deviceResult?.status === 'fulfilled') deviceNames = Object.fromEntries(deviceResult.value.map((device) => [device.id, device.label]));
-  }
+  const pageRequests = createRequestScheduler<BookQuery, BookPage>({
+    load: (nextQuery) => request('library_list', { query: nextQuery }),
+    onStart: () => {},
+    onSuccess: (result) => { page = result; failure = null; },
+    onError: (error) => { failure = normalizePublicError(error); },
+    onSettled: () => { loading = false; },
+  });
+  const facetRequests = createRequestScheduler<undefined, Awaited<ReturnType<typeof loadFacets>>>({
+    load: loadFacets,
+    onStart: () => {},
+    onSuccess: ([facetResult, deviceResult]) => {
+      if (facetResult.status === 'fulfilled') facets = facetResult.value;
+      else onError(facetResult.reason);
+      if (deviceResult.status === 'fulfilled') deviceNames = Object.fromEntries(deviceResult.value.map((device) => [device.id, device.label]));
+    },
+    onError: (error) => onError(error),
+    onSettled: () => {},
+  });
 
   function importBooks(): void { void onImport().catch(onError); }
 
@@ -235,18 +287,19 @@
   });
   $effect(() => {
     const next = copyQuery(query);
-    void refreshVersion;
     void retryVersion;
-    const generation = ++requestGeneration;
-    loading = true;
-    const timeout = setTimeout(() => { void loadPage(next, generation); }, 200);
-    return () => clearTimeout(timeout);
+    untrack(() => { loading = true; failure = null; pageRequests.setQuery(next); });
   });
-  $effect(() => { void refreshVersion; void loadFacets(); });
+  $effect(() => { untrack(() => facetRequests.setQuery(undefined)); });
+  $effect(() => {
+    void refreshVersion;
+    untrack(() => { pageRequests.refresh(); facetRequests.refresh(); });
+  });
   $effect(() => { if (selectPageInput) selectPageInput.indeterminate = someVisibleSelected && !allVisibleSelected; });
   onDestroy(() => {
+    disposed = true;
     onStateChange?.({ query: copyQuery(query), view, filtersVisible });
-    disposed = true; requestGeneration += 1; facetGeneration += 1;
+    pageRequests.dispose(); facetRequests.dispose();
   });
 </script>
 
@@ -259,6 +312,7 @@
   <div class="toolbar">
     <button class="filter-chip" class:active={filtersVisible || chips.length > 0} aria-expanded={filtersVisible} aria-controls="library-facets" onclick={() => { filtersVisible = !filtersVisible; }}><ListFilter size={16} aria-hidden="true" />{$t('filters.title')}{#if chips.length > 0}<span class="badge accent">{chips.length}</span>{/if}</button>
     <label class="checkbox-field"><input bind:this={selectPageInput} type="checkbox" checked={allVisibleSelected} disabled={items.length === 0} onchange={toggleVisibleSelection} />{$t('library.selectAll')}</label>
+    <button class="button secondary" disabled={reviewLoading} aria-busy={reviewLoading} onclick={openReview}><NotebookText size={16} aria-hidden="true" />{$t(reviewLoading ? 'common.loading' : 'library.reviewProposals')}</button>
     <div class="toolbar-spacer"></div>
     <label class="sr-only" for="library-sort">{$t('sort.label')}</label>
     <select id="library-sort" class="select sort-select" bind:value={query.sort} onchange={resetOffset}>{#each sorts as sort}<option value={sort}>{$t(`sort.${sort}`)}</option>{/each}</select>
@@ -287,7 +341,17 @@
   {/if}
 
   {#if chips.length > 0}<div class="active-filters" aria-label={$t('filters.active', { count: chips.length })}>{#each chips as chip (`${chip.field}:${chip.value}`)}<button class="filter-chip active" aria-label={`${$t('actions.remove')} : ${chip.label}`} onclick={() => removeChip(chip)}><span>{chip.label}</span><X size={14} aria-hidden="true" /></button>{/each}<button class="button ghost" onclick={resetFilters}>{$t('filters.clear')}</button></div>{/if}
-  {#if selectedBookIds.length > 0}<div class="selection-bar"><div class="row"><Check size={17} aria-hidden="true" /><strong>{$t('library.selectedCount', { count: selectedBookIds.length })}</strong></div><button class="button ghost" onclick={() => onSelectionChange([])}><X size={16} aria-hidden="true" />{$t('library.clearSelection')}</button></div>{/if}
+  {#if selectedBookIds.length > 0}
+    <div class="selection-bar">
+      <div class="row"><Check size={17} aria-hidden="true" /><strong>{$t('library.selectedCount', { count: selectedBookIds.length })}</strong></div>
+      <div class="selection-actions">
+        <button class="button secondary" disabled={selectionActionsDisabled || !onOpenAssistant} onclick={() => { if (!selectionActionsDisabled) onOpenAssistant?.(); }}><BookOpen size={16} aria-hidden="true" />{$t('sidebar.chat')}</button>
+        <button class="button primary" disabled={selectionActionsDisabled || !onVerifySelected} onclick={() => { if (!selectionActionsDisabled) onVerifySelected?.(); }}><NotebookText size={16} aria-hidden="true" />{$t('library.verifySelected')}</button>
+        <button class="button ghost" onclick={() => onSelectionChange([])}><X size={16} aria-hidden="true" />{$t('library.clearSelection')}</button>
+      </div>
+      {#if selectedBookIds.length > 200}<span class="small">{$t('library.selectionLimit', { count: 200 })}</span>{/if}
+    </div>
+  {/if}
 
   {#if failure}
     <div class="error-banner" role="alert"><span class="grow">{$t(`errors.${failure.code}`)}</span><button class="button ghost" onclick={() => { retryVersion += 1; }}><RefreshCw size={16} aria-hidden="true" />{$t('actions.retry')}</button></div>
@@ -312,6 +376,7 @@
               {#if book.series}<p class="series-line truncate" title={seriesLabel(book)}>{seriesLabel(book)}</p>{/if}
               <div class="book-meta"><span>{book.format.toUpperCase()} · {formatSize(book.sizeBytes)}</span><span class="row flags">{#if book.favorite}<Heart size={13} fill="currentColor" aria-label={$t('sidebar.favorites')} />{/if}{#if book.notes}<NotebookText size={13} aria-label={$t('book.notes')} title={book.notes} />{/if}{#if book.rating !== null}<Star size={12} aria-label={$t('book.rating')} /><span>{numberFormatter.format(book.rating)}</span>{/if}</span></div>
               <div class="book-badges">{#if book.onDeviceIds.length > 0}<span class="badge accent" title={devicesLabel(book)}><Tablet size={12} aria-hidden="true" />{$t('library.onDevice')}</span>{/if}{#if book.metadataStatus === 'needsReview' || book.metadataStatus === 'failed'}<span class="badge" class:warning={book.metadataStatus === 'needsReview'} class:danger={book.metadataStatus === 'failed'}>{$t(`book.${book.metadataStatus}`)}</span>{/if}</div>
+              {#if book.metadataStatus === 'needsReview' && proposalBookIds.has(book.id)}<button class="button secondary review-action" aria-label={`${$t('library.reviewProposal')} : ${book.title}`} onclick={() => onOpenBook(book)}><NotebookText size={15} aria-hidden="true" />{$t('library.reviewProposal')}</button>{/if}
               {#if book.readStatus !== 'unread'}<div class="reading-progress"><progress max="1" value={book.readingProgress} aria-label={$t('reader.progress', { progress: progressLabel(book) })}></progress><span>{progressLabel(book)}</span></div>{/if}
             </article>
           {/each}
@@ -329,7 +394,7 @@
           <th scope="col">{$t('filters.device')}</th><th scope="col"><span class="sr-only">{$t('actions.read')}</span></th>
         </tr></thead><tbody>{#each group.books as book (book.id)}<tr class:on-device={book.onDeviceIds.length > 0}>
           <td><label class="table-check"><input type="checkbox" checked={selectedBookIds.includes(book.id)} aria-label={book.title} onchange={() => toggleSelection(book.id)} /></label></td>
-          <td><button class="table-book" onclick={() => onOpenBook(book)}>{#if coverSource(book)}<img class="table-cover" src={coverSource(book) ?? ''} alt="" loading="lazy" onerror={() => { failedCoverIds = [...failedCoverIds, book.id]; }} />{/if}<span class="table-title">{book.title}{#if book.favorite}<Heart size={12} fill="currentColor" aria-label={$t('sidebar.favorites')} />{/if}</span></button></td>
+          <td><button class="table-book" onclick={() => onOpenBook(book)}>{#if coverSource(book)}<img class="table-cover" src={coverSource(book) ?? ''} alt="" loading="lazy" onerror={() => { failedCoverIds = [...failedCoverIds, book.id]; }} />{/if}<span class="table-title">{book.title}{#if book.favorite}<Heart size={12} fill="currentColor" aria-label={$t('sidebar.favorites')} />{/if}</span></button>{#if book.metadataStatus === 'needsReview' && proposalBookIds.has(book.id)}<button class="button secondary review-action" aria-label={`${$t('library.reviewProposal')} : ${book.title}`} onclick={() => onOpenBook(book)}><NotebookText size={15} aria-hidden="true" />{$t('library.reviewProposal')}</button>{/if}</td>
           <td>{book.authors.join(', ')}</td><td>{seriesLabel(book)}</td><td>{book.genres.map(genreName).join(', ')}</td><td>{book.language.toUpperCase()}</td><td><span class="badge">{book.format.toUpperCase()}</span></td><td>{formatSize(book.sizeBytes)}</td><td>{progressLabel(book)}</td><td>{formatDate(book.addedAt)}</td><td>{#if book.onDeviceIds.length > 0}<span class="badge accent" title={devicesLabel(book)}><Tablet size={12} aria-hidden="true" />{$t('filters.present')}</span>{:else}<span class="muted">—</span>{/if}</td><td><button class="icon-button" aria-label={`${$t('actions.read')} : ${book.title}`} onclick={() => onReadBook(book)}><BookOpen size={18} aria-hidden="true" /></button></td>
         </tr>{/each}</tbody></table></div>
       {/if}
@@ -341,6 +406,9 @@
 
 <style>
   .sort-select { width: auto; min-width: 155px; }
+  .selection-bar { flex-wrap: wrap; gap: 12px; }
+  .selection-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+  .review-action { margin-top: 8px; }
   .facet-field { min-width: 0; margin: 0; padding: 0; border: 0; }
   .facet-field legend { padding: 0; margin-bottom: 10px; color: var(--text-muted); font-size: 12px; font-weight: 650; }
   .facet-list .checkbox-field { min-width: 0; font-size: 12px; }

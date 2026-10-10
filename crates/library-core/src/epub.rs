@@ -11,6 +11,7 @@ use std::{
 use chrono::Utc;
 use roxmltree::{Document, Node, ParsingOptions};
 use sha2::{Digest, Sha256};
+use unicode_normalization::UnicodeNormalization;
 use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 use crate::{AppError, BookMetadata, Result};
@@ -25,6 +26,10 @@ const MAX_COMPRESSION_RATIO: u64 = 1_000;
 const MAX_XML_NODES: u32 = 500_000;
 const MAX_INSPECTION_SAMPLE_CHARACTERS: usize = 12_000;
 const MAX_INVENTORY_XML_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_EDITION_ENTRY_BYTES: usize = 512 * 1024;
+const MAX_EDITION_REFERENCES: usize = 32;
+const EDITION_CANDIDATE_LIMITS: [usize; 3] = [2, 2, 4];
+const EPUB_OPS: &str = "http://www.idpf.org/2007/ops";
 
 /// Catalogue metadata only: resource validation remains the responsibility of import.
 /// Reading three bounded entries avoids transferring chapters and images over slow USB.
@@ -523,6 +528,224 @@ impl EpubDocument {
         })
     }
 
+    /// Sample declared edition pages before narrative content, without changing the archive.
+    /// This operates on an already validated document; archive loading retains its own bounds.
+    pub fn edition_sample(&self, max_chars: usize) -> Result<String> {
+        let limit = max_chars.min(MAX_INSPECTION_SAMPLE_CHARACTERS);
+        if limit == 0 {
+            return Ok(String::new());
+        }
+        let text_paths: HashSet<&str> = self
+            .manifest
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.media_type.as_str(),
+                    "application/xhtml+xml" | "text/html"
+                )
+            })
+            .map(|item| item.href.as_str())
+            .collect();
+        let navigation_paths: HashSet<&str> = self
+            .manifest
+            .iter()
+            .filter(|item| {
+                item.properties
+                    .split_whitespace()
+                    .any(|property| property == "nav")
+            })
+            .map(|item| item.href.as_str())
+            .collect();
+        let mut candidates: [Vec<String>; 3] = Default::default();
+        let opf = entry_text(&self.entries, &self.opf_path)?;
+        if opf.len() as u64 > MAX_INVENTORY_XML_BYTES {
+            return Err(invalid("Edition sample metadata exceeds the safety limit"));
+        }
+        let package = parse_xml(opf)?;
+        if let Some(guide) = child_named(package.root_element(), "guide") {
+            for reference in guide
+                .children()
+                .filter(|node| node.is_element() && node.tag_name().name() == "reference")
+                .take(MAX_EDITION_REFERENCES)
+            {
+                if let Some(role) = reference.attribute("type").and_then(edition_page_role) {
+                    let href = reference
+                        .attribute("href")
+                        .ok_or_else(|| invalid("Edition reference has no path"))?;
+                    let path = resolve_href(&self.opf_path, href)?;
+                    if !text_paths.contains(path.as_str()) {
+                        return Err(invalid("Edition reference is not a manifest text resource"));
+                    }
+                    add_edition_candidate(&mut candidates, role, &path);
+                }
+            }
+        }
+        if let Some(nav_item) = self.manifest.iter().find(|item| {
+            item.properties
+                .split_whitespace()
+                .any(|property| property == "nav")
+        }) {
+            let bytes = self
+                .entries
+                .get(&nav_item.href)
+                .ok_or_else(|| invalid("Edition navigation is missing"))?;
+            if bytes.len() <= MAX_EDITION_ENTRY_BYTES {
+                let source = std::str::from_utf8(bytes)
+                    .map_err(|_| invalid("Edition navigation is not UTF8"))?;
+                validate_content_doctype(source)?;
+                // Malformed optional HTML navigation cannot manufacture a trusted reference.
+                if let Ok(nav) = parse_markup(source) {
+                    for landmark in nav
+                        .descendants()
+                        .filter(|node| {
+                            node.is_element()
+                                && node.tag_name().name() == "nav"
+                                && node.attribute((EPUB_OPS, "type")).is_some_and(|types| {
+                                    types.split_whitespace().any(|kind| kind == "landmarks")
+                                })
+                        })
+                        .take(1)
+                    {
+                        for link in landmark
+                            .descendants()
+                            .filter(|node| node.is_element() && node.tag_name().name() == "a")
+                            .take(MAX_EDITION_REFERENCES)
+                        {
+                            if let Some(role) = link
+                                .attribute((EPUB_OPS, "type"))
+                                .and_then(edition_page_role)
+                            {
+                                let href = link
+                                    .attribute("href")
+                                    .ok_or_else(|| invalid("Edition landmark has no path"))?;
+                                let path = resolve_href(&nav_item.href, href)?;
+                                if !text_paths.contains(path.as_str()) {
+                                    return Err(invalid(
+                                        "Edition landmark is not a manifest text resource",
+                                    ));
+                                }
+                                add_edition_candidate(&mut candidates, role, &path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Filenames rank candidates only; their contents never become inferred metadata.
+        for item in &self.manifest {
+            if text_paths.contains(item.href.as_str()) {
+                let name = item
+                    .href
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                let role = if ["titlepage", "title-page", "title_page"]
+                    .iter()
+                    .any(|hint| name.contains(hint))
+                {
+                    Some(0)
+                } else if ["copyright", "colophon", "imprint", "legal", "rights"]
+                    .iter()
+                    .any(|hint| name.contains(hint))
+                {
+                    Some(1)
+                } else {
+                    None
+                };
+                if let Some(role) = role {
+                    add_edition_candidate(&mut candidates, role, &item.href);
+                }
+            }
+        }
+        for path in &self.spine {
+            if text_paths.contains(path.as_str()) && !navigation_paths.contains(path.as_str()) {
+                add_edition_candidate(&mut candidates, 2, path);
+                if candidates[2].len() == EDITION_CANDIDATE_LIMITS[2] {
+                    break;
+                }
+            }
+        }
+        let mut sections: [String; 3] = Default::default();
+        for (role, paths) in candidates.iter().enumerate() {
+            for path in paths {
+                let bytes = self
+                    .entries
+                    .get(path)
+                    .ok_or_else(|| invalid("Edition sample page is missing"))?;
+                if bytes.len() > MAX_EDITION_ENTRY_BYTES {
+                    continue;
+                }
+                let source = std::str::from_utf8(bytes)
+                    .map_err(|_| invalid("Edition sample page is not UTF8"))?;
+                let (text, _) = text_for_inspection(source)?;
+                let text: String = text
+                    .nfc()
+                    .filter(|character| !character.is_control() || character.is_whitespace())
+                    .collect();
+                let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                if !text.is_empty() {
+                    sections[role] = text;
+                    break;
+                }
+            }
+        }
+        if sections.iter().all(String::is_empty) {
+            return Err(AppError::Unsupported(
+                "No bounded EPUB edition sample is available".into(),
+            ));
+        }
+        let mut quotas = [limit / 4, limit / 4, limit - 2 * (limit / 4)];
+        if limit < 4 {
+            quotas = [0; 3];
+            for (role, _) in sections
+                .iter()
+                .enumerate()
+                .filter(|(_, text)| !text.is_empty())
+                .take(limit)
+            {
+                quotas[role] = 1;
+            }
+        }
+        let mut available = 0;
+        for (section, quota) in sections.iter().zip(quotas.iter_mut()) {
+            if section.is_empty() {
+                available += *quota;
+                *quota = 0;
+            }
+        }
+        let present = sections
+            .iter()
+            .filter(|section| !section.is_empty())
+            .count();
+        let extra = available / present;
+        let mut remainder = available % present;
+        for (section, quota) in sections.iter().zip(quotas.iter_mut()) {
+            if !section.is_empty() {
+                *quota += extra;
+                if remainder > 0 {
+                    *quota += 1;
+                    remainder -= 1;
+                }
+            }
+        }
+        let mut output = String::new();
+        for (section, quota) in sections.iter().zip(quotas) {
+            if quota == 0 || section.is_empty() {
+                continue;
+            }
+            let separator = usize::from(!output.is_empty());
+            if quota <= separator {
+                continue;
+            }
+            if separator != 0 {
+                output.push('\n');
+            }
+            output.extend(section.chars().take(quota - separator));
+        }
+        Ok(output)
+    }
+
     /// Writes a new file only. Staging, replacement and backup belong to storage.
     pub fn write(&self, path: &Path, level: u8) -> Result<()> {
         if level > 9 {
@@ -617,6 +840,24 @@ fn validate_archive_name(name: &str) -> Result<()> {
         return Err(invalid("Unsafe ZIP path"));
     }
     Ok(())
+}
+
+fn edition_page_role(types: &str) -> Option<usize> {
+    types.split_whitespace().find_map(|kind| match kind {
+        "title-page" | "titlepage" => Some(0),
+        "copyright-page" | "copyright" | "colophon" => Some(1),
+        _ => None,
+    })
+}
+
+fn add_edition_candidate(candidates: &mut [Vec<String>; 3], role: usize, path: &str) {
+    if candidates[role].len() < EDITION_CANDIDATE_LIMITS[role]
+        && !candidates
+            .iter()
+            .any(|paths| paths.iter().any(|candidate| candidate == path))
+    {
+        candidates[role].push(path.into());
+    }
 }
 
 fn validate_entries(entries: &BTreeMap<String, Vec<u8>>) -> Result<()> {
@@ -1526,6 +1767,143 @@ mod tests {
             ("OPS/chapter one.xhtml".into(), br#"<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Chapter</title></head><body><h1>One</h1><p>All text &amp; punctuation stays.</p></body></html>"#.to_vec()),
             ("OPS/cover.png".into(), vec![1, 2, 3]),
         ])
+    }
+
+    fn edition_fixture(landmarks: bool) -> EpubDocument {
+        let mut entries = fixture(
+            "3.0",
+            "<d:title>Stored title</d:title><d:language>fr</d:language>",
+        );
+        let extra_manifest = r#"<item id="title" href="Text/front.xhtml" media-type="application/xhtml+xml"/><item id="rights" href="Text/legal%20page.xhtml" media-type="application/xhtml+xml"/><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>"#;
+        let mut opf = entry_text(&entries, "OPS/book.opf")
+            .unwrap()
+            .replace("</manifest>", &format!("{extra_manifest}</manifest>"));
+        if !landmarks {
+            opf = opf.replace("</package>", r#"<guide><reference type="title-page" href="Text/front.xhtml"/><reference type="copyright-page" href="Text/legal%20page.xhtml#rights"/></guide></package>"#);
+        }
+        entries.insert("OPS/book.opf".into(), opf.into_bytes());
+        entries.insert(
+            "OPS/Text/front.xhtml".into(),
+            b"<html><body>TITLE EDITION FRANCAISE</body></html>".to_vec(),
+        );
+        entries.insert(
+            "OPS/Text/legal page.xhtml".into(),
+            b"<html><body>COPYRIGHT 2024 ISBN 9780306406157</body></html>".to_vec(),
+        );
+        entries.insert("OPS/nav.xhtml".into(), br#"<html xmlns:epub="http://www.idpf.org/2007/ops"><body><nav epub:type="landmarks"><a epub:type="titlepage" href="Text/front.xhtml">Title</a><a epub:type="copyright-page" href="Text/legal%20page.xhtml#rights">Rights</a></nav></body></html>"#.to_vec());
+        entries.insert(
+            "OPS/chapter one.xhtml".into(),
+            format!(
+                "<html><body>CHAPTER NARRATIVE {}</body></html>",
+                "long chapter ".repeat(1000)
+            )
+            .into_bytes(),
+        );
+        EpubDocument::from_entries(entries, "Fallback").unwrap()
+    }
+
+    #[test]
+    fn edition_sample_prioritizes_declared_frontmatter_outside_the_spine_and_reserves_a_chapter() {
+        for landmarks in [false, true] {
+            let document = edition_fixture(landmarks);
+            let sample = document.edition_sample(240).unwrap();
+            assert!(sample.contains("TITLE EDITION FRANCAISE"));
+            assert!(sample.contains("COPYRIGHT 2024 ISBN 9780306406157"));
+            assert!(sample.contains("CHAPTER NARRATIVE"));
+            assert!(sample.chars().count() <= 240);
+            assert_eq!(sample, document.edition_sample(240).unwrap());
+            assert_eq!(document.spine, ["OPS/chapter one.xhtml"]);
+        }
+    }
+
+    #[test]
+    fn edition_sample_finds_late_copyright_without_spending_its_budget_on_the_first_chapter() {
+        let mut document = edition_fixture(false);
+        let opf = entry_text(&document.entries, &document.opf_path)
+            .unwrap()
+            .replace(
+                "<itemref idref=\"c\"/>",
+                "<itemref idref=\"c\"/><itemref idref=\"rights\"/>",
+            );
+        document
+            .entries
+            .insert(document.opf_path.clone(), opf.into_bytes());
+        let document = EpubDocument::from_entries(document.entries, "Fallback").unwrap();
+        let sample = document.edition_sample(180).unwrap();
+        assert!(sample.contains("COPYRIGHT 2024 ISBN"));
+        assert!(sample.contains("CHAPTER NARRATIVE"));
+        assert!(sample.chars().count() <= 180);
+    }
+
+    #[test]
+    fn edition_sample_rejects_unsafe_declared_paths_and_invalid_utf8() {
+        for path in [
+            "../../escape.xhtml",
+            "https://example.org/page",
+            "%2fetc/passwd",
+            "Text/missing.xhtml",
+        ] {
+            let mut document = edition_fixture(false);
+            let opf = entry_text(&document.entries, &document.opf_path)
+                .unwrap()
+                .replace("href=\"Text/front.xhtml\"/>", &format!("href=\"{path}\"/>"));
+            document
+                .entries
+                .insert(document.opf_path.clone(), opf.into_bytes());
+            assert!(document.edition_sample(240).is_err());
+        }
+        let mut document = edition_fixture(false);
+        document
+            .entries
+            .insert("OPS/Text/front.xhtml".into(), vec![0xff, 0xfe]);
+        assert!(document.edition_sample(240).is_err());
+    }
+
+    #[test]
+    fn edition_sample_bounds_utf8_text_and_skips_oversized_pages_without_mutating_the_book() {
+        let mut document = edition_fixture(false);
+        document.entries.insert(
+            "OPS/Text/front.xhtml".into(),
+            "<html><body>Édition 日本語</body></html>"
+                .as_bytes()
+                .to_vec(),
+        );
+        document.entries.insert(
+            "OPS/Text/legal page.xhtml".into(),
+            vec![b' '; 512 * 1024 + 1],
+        );
+        let original = document.entries.clone();
+        for limit in [0, 1, 2, 17, 240, usize::MAX] {
+            let sample = document.edition_sample(limit).unwrap();
+            assert!(sample.chars().count() <= limit.min(MAX_INSPECTION_SAMPLE_CHARACTERS));
+        }
+        assert_eq!(document.edition_sample(1).unwrap(), "É");
+        let sample = document.edition_sample(240).unwrap();
+        assert!(sample.contains("Édition 日本語"));
+        assert!(sample.contains("CHAPTER NARRATIVE"));
+        assert_eq!(document.entries, original);
+    }
+
+    #[test]
+    fn edition_sample_keeps_a_plain_chapter_when_no_frontmatter_is_declared() {
+        let document =
+            EpubDocument::from_entries(fixture("3.0", "<d:title>Book</d:title>"), "Fallback")
+                .unwrap();
+        let sample = document.edition_sample(120).unwrap();
+        assert!(sample.contains("All text & punctuation stays."));
+        assert!(sample.chars().count() <= 120);
+    }
+
+    #[test]
+    fn edition_sample_rejects_entity_declarations_and_ignores_script_content() {
+        let mut document = edition_fixture(false);
+        document.entries.insert("OPS/Text/front.xhtml".into(), br#"<!DOCTYPE html [<!ENTITY private SYSTEM "file:///etc/passwd">]><html><body>&private;</body></html>"#.to_vec());
+        assert!(document.edition_sample(240).is_err());
+        document.entries.insert("OPS/Text/front.xhtml".into(), b"<html><body>TITLE EDITION<script>PRIVATE_SCRIPT</script><style>PRIVATE_STYLE</style></body></html>".to_vec());
+        let sample = document.edition_sample(240).unwrap();
+        assert!(sample.contains("TITLE EDITION"));
+        assert!(!sample.contains("PRIVATE_SCRIPT"));
+        assert!(!sample.contains("PRIVATE_STYLE"));
     }
 
     #[test]

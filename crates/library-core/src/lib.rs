@@ -9,6 +9,7 @@
 pub mod book_repository;
 pub mod calibre_wireless;
 pub mod chat;
+pub mod chat_tools;
 pub mod conversion;
 pub mod database;
 pub mod devices;

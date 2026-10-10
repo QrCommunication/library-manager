@@ -1,5 +1,27 @@
 # Qualité et validations de Library Manager
 
+## Version 0.2.0 — assistant et revue des métadonnées
+
+État au 10 octobre 2026, avant validation de la livraison. Cette version rassemble les corrections du chargement de la bibliothèque et des fiches pendant l’inventaire, la normalisation commune des valeurs et preuves de métadonnées, les diagnostics du fournisseur et les outils d’inspection et de modification autorisée de l’assistant. Les actions de sélection et les accès à la revue sont maintenant visibles depuis la bibliothèque. Une proposition déjà appliquée ne reste pas présentée comme un changement à faire. Le détail du parcours et de ses garanties figure dans [ASSISTANT_METADATA_PLAN.md](ASSISTANT_METADATA_PLAN.md) et [CHANGELOG.md](../CHANGELOG.md).
+
+L’accès **Examiner** repose sur une analyse terminée contenant une proposition valide et sur le livre concerné. Le statut `needsReview` seul ne prouve pas qu’une proposition existe. La sélection d’actions est limitée à 200 livres ; les modifications de l’assistant exigent une autorisation pour la demande envoyée et restent limitées aux livres sélectionnés. L’inspection lit les fichiers gérés, vérifie leur intégrité et transmet des extraits bornés, avec priorité aux pages de titre et de copyright. Ces extraits ne constituent pas une lecture intégrale du livre.
+
+### Vérifications locales confirmées
+
+| Périmètre | Résultat et provenance |
+| --- | --- |
+| Interface frontend | 41 tests réussis pour les sources locales |
+| TypeScript/Svelte | Zéro erreur et zéro avertissement au contrôle local |
+| Format Rust | `cargo fmt --all -- --check` réussi localement |
+| Moteur Rust `library-core` | Base validée du paquet local `.5` : 240 tests réussis, un test réseau volontairement ignoré, aucun échec |
+| Coque Tauri | Base validée du paquet local `.5` : huit tests réussis |
+
+Les résultats moteur et Tauri ci-dessus proviennent de la phase locale `.5`, documentée dans le plan assistant. Depuis cette phase, les sources Rust sont inchangées hors déclaration de version ; les changements du parcours 0.2.0 portent sur l’interface et sa documentation. Cette continuité ne remplace pas les tests et constructions de la CI sur le commit exact de livraison.
+
+### Livraison et preuves encore en cours
+
+La CI sur le commit exact, les paquets Linux DEB/RPM/AppImage, leurs parcours natifs et la publication de 0.2.0 sont encore en cours de préparation ou de validation. Aucun de ces résultats n’est déclaré réussi dans cette section. Les liens de rapports, empreintes des artefacts, résultats du parcours partant de zéro sélection et contrôles de téléchargement public seront consignés après vérification. Les preuves historiques `.5`, 0.1.1 et 0.1.0 restent distinctes ; aucune nouvelle compatibilité matérielle ou multiplateforme n’est déduite des tests locaux.
+
 ## Version 0.1.1 — inventaire USB et import depuis la liseuse
 
 État au 9 octobre 2026. Les sources de cette correction sont figées dans [739d3dd](https://github.com/QrCommunication/library-manager/commit/739d3ddf874b794dbe762027dd3df7c4ee1d3269). L’inventaire USB publie les étapes et les octets effectivement lus ; les livres présents uniquement sur la liseuse apparaissent dans la bibliothèque et peuvent être importés individuellement ou par lot. Les détails du suivi figurent dans [DEVICE_INVENTORY_PLAN.md](DEVICE_INVENTORY_PLAN.md).

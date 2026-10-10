@@ -18,6 +18,7 @@ use crate::{
     database::Database,
     error::{AppError, Result},
     models::{ErrorCode, Job, JobKind, JobStatus, PublicError},
+    providers::is_safe_provider_detail,
 };
 
 const MAX_PAYLOAD_BYTES: usize = 256 * 1024;
@@ -120,9 +121,45 @@ impl JobService {
         };
         let id = Uuid::new_v4().to_string();
         let now = timestamp();
-        let connection = self.database.connect()?;
-        connection.execute("INSERT INTO jobs(id,kind,status,progress,payload_json,result_json,created_at,updated_at) VALUES(?1,?2,'queued',0,?3,?4,?5,?5)", params![id,kind.as_str(),serde_json::to_string(&envelope)?,initial_result.as_ref().map(serde_json::to_string).transpose()?,now])?;
-        let job = decode(load(&connection, &id)?)?.0;
+        let mut connection = self.database.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Enrichment can be requested concurrently by the UI and several conversations.
+        // Origins and baseline revisions remain independent work, while a matching live
+        // request is one durable job. Terminal history never prevents an explicit retry.
+        if kind == JobKind::Enrich
+            && let Some(book_id) = envelope.payload.get("id").and_then(Value::as_str)
+        {
+            let origin = envelope.payload.get("origin").and_then(Value::as_str);
+            let baseline = envelope
+                .payload
+                .get("baselineRevision")
+                .and_then(Value::as_u64)
+                .and_then(|value| i64::try_from(value).ok());
+            let valid_origin = envelope
+                .payload
+                .get("origin")
+                .is_none_or(|value| value.is_null() || value.is_string());
+            let valid_baseline = envelope
+                .payload
+                .get("baselineRevision")
+                .is_none_or(|value| {
+                    value.is_null()
+                        || value
+                            .as_u64()
+                            .is_some_and(|value| i64::try_from(value).is_ok())
+                });
+            if valid_origin && valid_baseline {
+                let existing:Option<String>=transaction.query_row("SELECT id FROM jobs WHERE kind='enrich' AND status IN ('queued','running','waitingForConfiguration','waitingForNetwork') AND json_extract(payload_json,'$.payload.id')=?1 AND json_extract(payload_json,'$.payload.origin') IS ?2 AND json_extract(payload_json,'$.payload.baselineRevision') IS ?3 ORDER BY rowid LIMIT 1",params![book_id,origin,baseline],|row|row.get(0)).optional()?;
+                if let Some(existing) = existing {
+                    let job = decode(load(&transaction, &existing)?)?.0;
+                    transaction.commit()?;
+                    return Ok(job);
+                }
+            }
+        }
+        transaction.execute("INSERT INTO jobs(id,kind,status,progress,payload_json,result_json,created_at,updated_at) VALUES(?1,?2,'queued',0,?3,?4,?5,?5)", params![id,kind.as_str(),serde_json::to_string(&envelope)?,initial_result.as_ref().map(serde_json::to_string).transpose()?,now])?;
+        let job = decode(load(&transaction, &id)?)?.0;
+        transaction.commit()?;
         self.notify(&job);
         Ok(job)
     }
@@ -142,6 +179,13 @@ impl JobService {
         validate_id(book_id)?;
         let connection = self.database.connect()?;
         Ok(connection.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE kind='enrich' AND (json_extract(payload_json,'$.payload.bookId')=?1 OR EXISTS(SELECT 1 FROM json_each(payload_json,'$.bookIds') WHERE type='text' AND value=?1)))",[book_id],|row|row.get(0))?)
+    }
+
+    /// Explicit assistant verification is blocked only by unfinished work, not history.
+    pub fn has_active_enrichment_for_book(&self, book_id: &str) -> Result<bool> {
+        validate_id(book_id)?;
+        let connection = self.database.connect()?;
+        Ok(connection.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE kind='enrich' AND status IN ('queued','running','waitingForConfiguration','waitingForNetwork') AND (json_extract(payload_json,'$.payload.id')=?1 OR json_extract(payload_json,'$.payload.bookId')=?1 OR EXISTS(SELECT 1 FROM json_each(payload_json,'$.bookIds') WHERE type='text' AND value=?1)))",[book_id],|row|row.get(0))?)
     }
 
     /// Latest 500 jobs, including terminal states, in deterministic creation order.
@@ -752,7 +796,9 @@ fn validate_message(message: &str) -> Result<()> {
 }
 fn safe_error(mut error: PublicError) -> Result<PublicError> {
     validate_message(&error.message)?;
-    error.detail = None;
+    error.detail = error
+        .detail
+        .filter(|detail| is_safe_provider_detail(error.code, detail));
     Ok(error)
 }
 fn public_error(code: ErrorCode, message: &str, retryable: bool) -> PublicError {
@@ -887,6 +933,129 @@ mod tests {
             .unwrap();
         assert!(service.has_enrichment_for_book("other-book").unwrap());
         assert!(service.has_enrichment_for_book("../invalid").is_err());
+    }
+
+    #[test]
+    fn active_enrichment_excludes_terminal_history_but_includes_all_waiting_states() {
+        for terminal in [
+            JobStatus::Completed,
+            JobStatus::Failed,
+            JobStatus::Cancelled,
+        ] {
+            let (_directory, service) = queue();
+            let job = service
+                .enqueue(JobKind::Enrich, json!({"id":"book-a","bookIds":["book-a"]}))
+                .unwrap();
+            assert!(service.has_active_enrichment_for_book("book-a").unwrap());
+            let claim = service.claim_next(1).unwrap().unwrap();
+            assert!(service.has_active_enrichment_for_book("book-a").unwrap());
+            match terminal {
+                JobStatus::Completed => {
+                    service.complete(&claim, json!({})).unwrap();
+                }
+                JobStatus::Failed => {
+                    service.fail(&claim, network_error()).unwrap();
+                }
+                JobStatus::Cancelled => {
+                    service.cancel(&job.id).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(!service.has_active_enrichment_for_book("book-a").unwrap());
+            assert!(service.has_enrichment_for_book("book-a").unwrap());
+        }
+        let (_directory, service) = queue();
+        service
+            .enqueue(JobKind::Enrich, json!({"id":"book-a","bookIds":["book-a"]}))
+            .unwrap();
+        let claim = service.claim_next(1).unwrap().unwrap();
+        service
+            .wait_for_configuration(&claim, network_error())
+            .unwrap();
+        assert!(service.has_active_enrichment_for_book("book-a").unwrap());
+        service.wake_configuration().unwrap();
+        let claim = service.claim_next(1).unwrap().unwrap();
+        service.wait_for_network(&claim, network_error()).unwrap();
+        assert!(service.has_active_enrichment_for_book("book-a").unwrap());
+        assert!(!service.has_active_enrichment_for_book("book-b").unwrap());
+        assert!(service.has_active_enrichment_for_book("../book").is_err());
+    }
+
+    #[test]
+    fn enrichment_enqueue_reuses_only_matching_active_origin_and_baseline() {
+        let (_directory, service) = queue();
+        let payload = json!({"id":"book-a","bookIds":["book-a"],"origin":"assistantReview","baselineRevision":2});
+        let first = service.enqueue(JobKind::Enrich, payload.clone()).unwrap();
+        assert_eq!(
+            first.id,
+            service
+                .enqueue(JobKind::Enrich, payload.clone())
+                .unwrap()
+                .id
+        );
+        let claim = service.claim_next(1).unwrap().unwrap();
+        assert_eq!(
+            first.id,
+            service
+                .enqueue(JobKind::Enrich, payload.clone())
+                .unwrap()
+                .id
+        );
+        service
+            .wait_for_configuration(&claim, network_error())
+            .unwrap();
+        assert_eq!(
+            first.id,
+            service
+                .enqueue(JobKind::Enrich, payload.clone())
+                .unwrap()
+                .id
+        );
+        let different_origin = service
+            .enqueue(
+                JobKind::Enrich,
+                json!({"id":"book-a","bookIds":["book-a"],"origin":"manual","baselineRevision":2}),
+            )
+            .unwrap();
+        let different_baseline=service.enqueue(JobKind::Enrich,json!({"id":"book-a","bookIds":["book-a"],"origin":"assistantReview","baselineRevision":3})).unwrap();
+        assert_ne!(first.id, different_origin.id);
+        assert_ne!(first.id, different_baseline.id);
+        service.cancel(&first.id).unwrap();
+        let retried = service.enqueue(JobKind::Enrich, payload.clone()).unwrap();
+        assert_ne!(first.id, retried.id);
+        assert_eq!(
+            retried.id,
+            service.enqueue(JobKind::Enrich, payload).unwrap().id
+        );
+        let transfer = service
+            .enqueue(JobKind::Transfer, json!({"id":"book-a"}))
+            .unwrap();
+        assert_ne!(
+            transfer.id,
+            service
+                .enqueue(JobKind::Transfer, json!({"id":"book-a"}))
+                .unwrap()
+                .id
+        );
+    }
+
+    #[test]
+    fn simultaneous_enrichment_requests_create_one_durable_job() {
+        let (_directory, service) = queue();
+        let barrier = Arc::new(Barrier::new(6));
+        let workers=(0..6).map(|_|{
+            let database=service.database.clone();let barrier=barrier.clone();
+            std::thread::spawn(move||{
+                let queue=JobService::new(database);barrier.wait();
+                queue.enqueue(JobKind::Enrich,json!({"id":"book-a","bookIds":["book-a"],"origin":"assistantReview","baselineRevision":2})).unwrap().id
+            })
+        }).collect::<Vec<_>>();
+        let ids = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(service.list().unwrap().len(), 1);
     }
 
     #[test]
@@ -1096,6 +1265,133 @@ mod tests {
         );
         assert_eq!(service.cancel(&job.id).unwrap().status, JobStatus::Failed);
         assert!(service.complete(&claim, json!({})).is_err());
+    }
+
+    #[test]
+    fn failed_provider_diagnostics_survive_persistence_listing_and_restart_recovery() {
+        let (_directory, service) = queue();
+        for detail in [
+            "providerDiagnostics.authenticationRejected",
+            "providerDiagnostics.requestRejected",
+            "providerDiagnostics.requestFailed",
+            "providerDiagnostics.responseIncomplete",
+            "providerDiagnostics.responseMalformed",
+            "providerDiagnostics.noFinalAnswer",
+            "providerDiagnostics.metadataInvalid",
+        ] {
+            let job = service
+                .enqueue(JobKind::Enrich, json!({"bookId":"book"}))
+                .unwrap();
+            let claim = service.claim_next(1).unwrap().unwrap();
+            let error = PublicError {
+                code: ErrorCode::ProviderError,
+                message: "Provider request failed".into(),
+                retryable: false,
+                detail: Some(detail.into()),
+            };
+            let failed = service.fail(&claim, error.clone()).unwrap();
+            assert_eq!(failed.status, JobStatus::Failed);
+            assert_eq!(failed.error, Some(error.clone()));
+            assert_eq!(service.get(&job.id).unwrap(), failed);
+            assert!(service.list().unwrap().contains(&failed));
+            let stored: String = service
+                .database
+                .connect()
+                .unwrap()
+                .query_row(
+                    "SELECT error_json FROM jobs WHERE id=?1",
+                    [&job.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(serde_json::from_str::<PublicError>(&stored).unwrap(), error);
+
+            let reopened = JobService::new(service.database.clone());
+            assert_eq!(reopened.recover().unwrap(), 0);
+            assert_eq!(reopened.get(&job.id).unwrap(), failed);
+            assert!(reopened.list().unwrap().contains(&failed));
+            assert!(reopened.claim_next(1).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn unsafe_provider_details_are_removed_before_storage_and_when_reading_legacy_rows() {
+        let (_directory, service) = queue();
+        for (code, detail) in [
+            (
+                ErrorCode::ProviderError,
+                "Authorization: Bearer private-token",
+            ),
+            (ErrorCode::ProviderError, "/home/private/library/book.epub"),
+            (
+                ErrorCode::ProviderError,
+                "{\"content\":\"PRIVATE_RESPONSE\"}",
+            ),
+            (ErrorCode::ProviderError, "providerDiagnostics.unknown"),
+            (
+                ErrorCode::ProviderError,
+                " providerDiagnostics.metadataInvalid",
+            ),
+            (
+                ErrorCode::ProviderError,
+                "providerDiagnostics.metadataInvalid\n",
+            ),
+            (
+                ErrorCode::ProviderError,
+                "providerDiagnostics.metadataInvalid\0",
+            ),
+            (
+                ErrorCode::InvalidInput,
+                "providerDiagnostics.metadataInvalid",
+            ),
+            (
+                ErrorCode::NetworkUnavailable,
+                "providerDiagnostics.requestFailed",
+            ),
+        ] {
+            let job = service.enqueue(JobKind::Enrich, json!({})).unwrap();
+            let claim = service.claim_next(1).unwrap().unwrap();
+            let original = PublicError {
+                code,
+                message: "Request failed".into(),
+                retryable: true,
+                detail: Some(detail.into()),
+            };
+            let expected = PublicError {
+                detail: None,
+                ..original.clone()
+            };
+            let failed = service.fail(&claim, original.clone()).unwrap();
+            assert_eq!(failed.status, JobStatus::Failed);
+            assert_eq!(failed.error, Some(expected.clone()));
+            let connection = service.database.connect().unwrap();
+            let stored: String = connection
+                .query_row(
+                    "SELECT error_json FROM jobs WHERE id=?1",
+                    [&job.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<PublicError>(&stored).unwrap(),
+                expected
+            );
+            assert_eq!(service.get(&job.id).unwrap(), failed);
+            assert!(service.list().unwrap().contains(&failed));
+
+            // Legacy persisted records must cross the same sanitization boundary on every read.
+            connection
+                .execute(
+                    "UPDATE jobs SET error_json=?2 WHERE id=?1",
+                    params![job.id, serde_json::to_string(&original).unwrap()],
+                )
+                .unwrap();
+            let reopened = JobService::new(service.database.clone());
+            assert_eq!(reopened.get(&job.id).unwrap().error, Some(expected));
+            assert!(reopened.list().unwrap().contains(&failed));
+            assert_eq!(reopened.recover().unwrap(), 0);
+            assert_eq!(reopened.get(&job.id).unwrap(), failed);
+        }
     }
 
     #[test]

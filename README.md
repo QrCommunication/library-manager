@@ -25,6 +25,10 @@ Six fournisseurs sont proposés : **Z.ai, Kimi, MiniMax, Codex via l’API OpenA
 
 L’accès au Web passe par les outils de Library Manager, communs aux fournisseurs. Les sources bibliographiques accompagnent les propositions. Les corrections incertaines restent à vérifier ; un modèle ne reçoit aucun outil de suppression ou d’exécution de commande. Les notes personnelles et la progression ne sont pas des métadonnées à réécrire par l’IA.
 
+Dans la **Bibliothèque**, cochez les livres concernés : la barre de sélection propose **Vérifier les métadonnées** pour lancer leurs analyses, ou **Assistant** pour travailler sur cette sélection. L’assistant peut inspecter les fichiers et demander des analyses ; l’option d’autorisation des modifications s’applique uniquement à la demande envoyée. Sans cette autorisation, il reste en lecture seule. Une sélection peut contenir jusqu’à 200 livres.
+
+Cliquez sur **Examiner les propositions**, ou sur **Examiner** auprès d’un livre ayant une proposition disponible, pour ouvrir sa fenêtre de revue. Comparez les valeurs actuelles, les changements proposés et leurs sources, puis appliquez la proposition. Les champs déjà identiques ne sont pas présentés comme des changements. Les modifications sont enregistrées dans l’historique, où les opérations réversibles peuvent être annulées. L’inspection lit le fichier réellement conservé et vérifie son intégrité ; les extraits EPUB donnent priorité aux pages de titre, de copyright et d’édition, puis à un chapitre. Cette lecture est bornée et ne constitue pas une lecture intégrale du livre.
+
 Les fournisseurs nécessitent une clé API et peuvent facturer leur utilisation. Un abonnement à un site de chat n’est pas automatiquement une clé API. Choisissez un modèle et une clé dans les paramètres. Les clés peuvent rester en mémoire pour la session ou être conservées dans le coffre de secrets Linux ; aucun repli silencieux en texte clair.
 
 Voir [les fournisseurs et leurs sources officielles](docs/PROVIDERS.md) et [la politique de métadonnées](docs/METADATA_POLICY.md).
@@ -65,18 +69,18 @@ Le lecteur EPUB propose un sommaire et une position sauvegardée. Le contenu du 
 
 ## Installation
 
-Téléchargez les paquets **DEB, RPM ou AppImage** dans la [version v0.1.1](https://github.com/QrCommunication/library-manager/releases/tag/v0.1.1). Cette version cible Linux **x86_64 (64 bits)** et utilise Ubuntu 22.04, avec glibc 2.35, comme base de compilation. Les notes de version indiquent les distributions testées et les sommes SHA-256.
+Téléchargez les paquets **DEB, RPM ou AppImage** dans la [version v0.2.0](https://github.com/QrCommunication/library-manager/releases/tag/v0.2.0). Cette version cible Linux **x86_64 (64 bits)** et utilise Ubuntu 22.04, avec glibc 2.35, comme base de compilation. Les notes de version indiquent les distributions testées et les sommes SHA-256.
 
 Debian, Ubuntu et dérivés :
 
 ```sh
-sudo apt install ./library-manager_0.1.1_amd64.deb
+sudo apt install ./library-manager_0.2.0_amd64.deb
 ```
 
 Fedora et distributions RPM :
 
 ```sh
-sudo dnf install ./library-manager-0.1.1-1.x86_64.rpm
+sudo dnf install ./library-manager-0.2.0-1.x86_64.rpm
 ```
 
 Le gestionnaire de paquets installe les bibliothèques système GTK/WebKit, leurs dépendances et le magasin de certificats TLS `ca-certificates`, nécessaire aux connexions HTTPS. Après installation, lancez **Library Manager** depuis le menu des applications. Aucun environnement Node, Python, Rust ou Calibre n’est requis.
@@ -84,14 +88,14 @@ Le gestionnaire de paquets installe les bibliothèques système GTK/WebKit, leur
 AppImage, sans installation du paquet :
 
 ```sh
-chmod +x ./library-manager_0.1.1_amd64.AppImage
-./library-manager_0.1.1_amd64.AppImage
+chmod +x ./library-manager_0.2.0_amd64.AppImage
+./library-manager_0.2.0_amd64.AppImage
 ```
 
 L’AppImage utilise les bibliothèques compatibles et le magasin de certificats du système. Son montage classique nécessite FUSE. Si FUSE n’est pas disponible, essayez le mode d’extraction et d’exécution :
 
 ```sh
-APPIMAGE_EXTRACT_AND_RUN=1 ./library-manager_0.1.1_amd64.AppImage
+APPIMAGE_EXTRACT_AND_RUN=1 ./library-manager_0.2.0_amd64.AppImage
 ```
 
 Consultez le [rapport de qualité](docs/QUALITY.md) pour les vérifications effectuées et les limites des essais.
