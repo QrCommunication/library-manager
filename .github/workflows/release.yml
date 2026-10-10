@@ -128,8 +128,8 @@ jobs:
               require(len(body) <= 10 * 1024 * 1024, 'API response exceeds limit')
               return json.loads(body)
 
-          def download(url, target, digest=None, auth=True):
-              response = request(url, accept='application/octet-stream', auth=auth)
+          def download(url, target, digest=None, auth=True, accept='application/octet-stream'):
+              response = request(url, accept=accept, auth=auth)
               require(response is not None, 'Download is missing')
               redirects = 0
               while response.status in (301, 302, 303, 307, 308):
@@ -285,7 +285,8 @@ jobs:
                   digest = artifact.get('digest', '')
                   require(re.fullmatch('sha256:[a-f0-9]{64}', digest), 'CI ZIP has no SHA-256 provenance')
                   archive = ROOT / (platform + '.zip')
-                  download(API + '/actions/artifacts/' + str(artifact['id']) + '/zip', archive, digest[7:])
+                  download(API + '/actions/artifacts/' + str(artifact['id']) + '/zip', archive, digest[7:],
+                           accept='application/vnd.github+json')
                   directory = ROOT / platform
                   extract_zip(archive, directory)
                   checksums = verify_sums(directory)
@@ -530,6 +531,7 @@ jobs:
                   print('Release validation failed: ' + detail, file=sys.stderr)
                   sys.exit(1)
           PY
+          python3 -Werror scripts/test-release-download.py
           python3 release-transport/release.py collect
 
       - name: Build an isolated Ubuntu 22.04 native QA image
