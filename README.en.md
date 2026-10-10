@@ -2,9 +2,9 @@
 
 <img src="public/library-manager.png" width="96" height="96" alt="Library Manager" />
 
-**Your library, wherever you read.** A standalone Linux desktop application for organizing ebooks, reading EPUBs, and preparing files for ereaders.
+**Your library, wherever you read.** A standalone application for organizing ebooks, reading EPUBs, and preparing files for ereaders. Linux packages are available; Windows and macOS installers are being prepared for version **0.2.1**.
 
-[Français](README.md) · [Downloads](https://github.com/QrCommunication/library-manager/releases/tag/v0.2.0) · [Architecture](docs/BLUEPRINT.md) · [Issues](https://github.com/QrCommunication/library-manager/issues)
+[Français](README.md) · [Downloads](https://github.com/QrCommunication/library-manager/releases) · [Architecture](docs/BLUEPRINT.md) · [Issues](https://github.com/QrCommunication/library-manager/issues)
 
 Developed by QR Communication under **GPL-3.0**. The Rust engine, SQLite database, and MOBI converter are bundled. **Calibre, Node, Rust, and Python are not required to run release packages.**
 
@@ -17,6 +17,10 @@ Developed by QR Communication under **GPL-3.0**. The Rust engine, SQLite databas
 - Personal notes, favorites, ratings, reading progress, and file variants.
 - Immutable originals and normalized **Author → Series → numbered title** paths. Volume zero and decimal series positions are supported.
 
+The library and device book views share a selection bar with **Assistant**, **Verify metadata**, **Transfer**, and **Remove from library**. A selection can contain up to 200 books. Unavailable actions explain their requirements, such as a ready provider for analysis or a writable device for transfer.
+
+**Remove from library** removes books from the local catalog after confirmation. It preserves original files, variants, and copies on devices. Removal is recorded in history and can be undone; restoration checks the retained files and any conflicts with the current catalog.
+
 ## Assistant and metadata
 
 Imports automatically queue metadata work when automatic enrichment is enabled. Books remain usable when an AI provider has not been configured; enrichment waits for configuration.
@@ -25,9 +29,15 @@ Choose **Z.ai, Kimi, MiniMax, Codex through the OpenAI API, Claude, or Mistral**
 
 Library Manager provides common Internet research tools for every provider. Bibliographic sources accompany metadata proposals; uncertain corrections remain available for review. Models cannot execute shell commands or delete files. Personal notes and reading progress are protected from metadata enrichment.
 
-In the **Library**, check the books you want to work on. The selection bar offers **Verify metadata** to queue their analyses, or **Assistant** to work with that selection. The assistant can inspect files and request analyses; permission to edit and organize applies only to the request being sent. Without that permission, it remains read-only. You can select up to 200 books.
+In the **Library**, check the books you want to work on. Choose **Verify metadata** to queue their analyses, or **Assistant** to open a conversation about that selection. Bulk analysis requires a selected, configured, ready provider and a model. Books with an active analysis are not queued again.
 
-Choose **Review proposals**, or **Review** beside a book with an available proposal, to open its review window. Compare current values, proposed changes, and their sources, then apply the proposal. Fields already matching the catalog are not shown as changes. Changes are recorded in history, where reversible operations can be undone. Inspection reads the stored file and verifies its integrity. EPUB excerpts prioritize title, copyright, and edition pages, followed by a chapter. This reading is bounded and does not cover the entire book.
+The assistant can inspect files and request analyses. **Allow the assistant to edit and organize selected books** applies only to the request being sent and the selected books; the option resets after that request is accepted. Without permission, the assistant remains read-only. Originals are preserved.
+
+Choose **Review proposals**, or **Review** beside a book with an available proposal, to open its review window. Compare current values, proposed changes, and their sources, then apply the proposal. A metadata review badge may also indicate incomplete metadata without an available proposal.
+
+Proposal validation is stored durably with the book update and its history: an applied proposal does not return after a refresh or restart. Editing personal information does not implicitly validate a proposal. Fields already matching the catalog are not shown as changes; an obsolete proposal cannot silently overwrite a more recent edit. Reversible operations can be undone from history.
+
+Inspection reads the actual stored file and verifies its integrity. EPUB excerpts prioritize title, copyright, and edition pages, followed by a chapter. This reading is bounded and does not cover the entire book.
 
 Providers require API credentials and may charge for use. A chat-site subscription does not automatically provide an API key. Keys can be kept in session memory or the Linux secret service. The application never silently falls back to plaintext storage.
 
@@ -40,6 +50,8 @@ Mounted USB/SD volumes are detected and indexed. Books already present on a conn
 USB inventory progress follows the amount of data actually read. Detected books appear as the inventory advances. Books stored only on the reader are marked in the library: import one book or all books missing from the local catalog, while preserving the files on the card. Results distinguish successful imports, duplicates, and rejected files.
 
 The **CrossPoint** connector talks directly to the firmware's HTTP transfer service on your LAN. Enable file-transfer mode on the reader and enter its address. No Calibre installation is needed. Transfers verify their contents and do not silently overwrite existing files.
+
+To send several books, select them and choose **Transfer**. The dialog lets you choose a connected writable device and an optimization profile, then confirm the transfer. The job appears in Activity; files in the local library are preserved.
 
 An **integrated Calibre wireless server** also accepts compatible clients such as KOReader's Calibre plugin. Start it explicitly in Readers, using the computer's LAN address and port 9090. This version uses an address configured manually; UDP discovery and physical trials of this wireless protocol are not yet validated. The protocol is implemented inside Library Manager, with no Calibre installation.
 
@@ -67,18 +79,29 @@ The EPUB reader includes a table of contents and saved position. Book HTML is sa
 
 ## Installation
 
-Download the **DEB, RPM, or AppImage** from the [v0.2.0 release](https://github.com/QrCommunication/library-manager/releases/tag/v0.2.0). These packages target **Linux x86_64 (AMD64)** and are built on **Ubuntu 22.04 with glibc 2.35**. They require glibc 2.35 or newer and compatible GTK/WebKit system libraries. See [the validation report](docs/QUALITY.md) for the environments actually tested and the remaining limits.
+**Version 0.2.1 is in preparation.** Its [v0.2.1 release page](https://github.com/QrCommunication/library-manager/releases/tag/v0.2.1) will become available when packages are published. The [published v0.2.0 release](https://github.com/QrCommunication/library-manager/releases/tag/v0.2.0) remains available for Linux.
+
+| Target platform for 0.2.1 | Planned packages |
+| --- | --- |
+| Linux x86_64 (64-bit) | DEB, RPM, AppImage |
+| Windows 11 x64 | MSI and EXE installers |
+| macOS 13 or newer, Apple Silicon | DMG and ARM64 application |
+| macOS 13 or newer, Intel | DMG and x86_64 application |
+
+Windows and macOS builds, signing, and macOS notarization are being validated. This table describes release targets; it does not establish package availability or completed notarization. Release notes will identify published packages, completed checks, and SHA-256 checksums.
+
+Linux packages use **Ubuntu 22.04 with glibc 2.35** as their build baseline. They require glibc 2.35 or newer and compatible GTK/WebKit system libraries. The following commands use **0.2.1** package names, to be used once those packages are published and downloaded.
 
 On Debian, Ubuntu, and derivatives, install the downloaded DEB:
 
 ```sh
-sudo apt install ./library-manager_0.2.0_amd64.deb
+sudo apt install ./library-manager_0.2.1_amd64.deb
 ```
 
 On Fedora and compatible RPM distributions:
 
 ```sh
-sudo dnf install ./library-manager-0.2.0-1.x86_64.rpm
+sudo dnf install ./library-manager-0.2.1-1.x86_64.rpm
 ```
 
 The package manager installs required GTK/WebKit system libraries and `ca-certificates` for HTTPS connections. Launch **Library Manager** from the applications menu.
@@ -86,17 +109,19 @@ The package manager installs required GTK/WebKit system libraries and `ca-certif
 For the AppImage, make the downloaded file executable and start it:
 
 ```sh
-chmod +x ./library-manager_0.2.0_amd64.AppImage
-./library-manager_0.2.0_amd64.AppImage
+chmod +x ./library-manager_0.2.1_amd64.AppImage
+./library-manager_0.2.1_amd64.AppImage
 ```
 
 The AppImage uses the host operating system's libraries, services, and trusted certificate store. If FUSE is unavailable, start it in extraction mode:
 
 ```sh
-APPIMAGE_EXTRACT_AND_RUN=1 ./library-manager_0.2.0_amd64.AppImage
+APPIMAGE_EXTRACT_AND_RUN=1 ./library-manager_0.2.1_amd64.AppImage
 ```
 
 It needs no Calibre installation or Node, Rust, or Python runtime. Release assets include SHA-256 checksums.
+
+See [the validation report](docs/QUALITY.md) for the environments actually tested and the remaining limits.
 
 ## Localization
 

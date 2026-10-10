@@ -81,7 +81,7 @@ interface BookFile {
 
 `coverPath` est une URI opaque autorisée par l’application, pas un chemin de sortie arbitraire. `onDeviceIds` est calculé à partir de l’inventaire actuel des appareils connectés. Une déconnexion invalide immédiatement ce calcul, même si l’inventaire historique reste dans SQLite. Dans un filtre multi-valeurs, les valeurs d’une même facette sont combinées par OU ; les différentes facettes sont combinées par ET. `seriesIndex` accepte zéro et des décimales.
 
-Un `BookPatch` distingue propriété absente (ne rien changer) et `null` (effacer un champ nullable). Les patches vides sont refusés. Les champs libres ont des longueurs maximales ; un numéro de série ou une confiance non fini est invalide. Le serveur vérifie la révision avant d’appliquer le patch et renvoie `revisionConflict` en cas de changement concurrent.
+Un `BookPatch` distingue propriété absente (ne rien changer) et `null` (effacer un champ nullable). `book_update` refuse les patches vides ; `book_review` accepte un patch vide pour valider explicitement une proposition sans modification de valeur. Les champs libres ont des longueurs maximales ; un numéro de série ou une confiance non fini est invalide. Le serveur vérifie la révision avant d’appliquer le patch et renvoie `revisionConflict` en cas de changement concurrent.
 
 ## Appareils, jobs et optimisation
 
@@ -131,6 +131,8 @@ interface Operation {
   id: string; kind: string; status: 'applied' | 'reverted' | 'failed';
   description: string; reversible: boolean; createdAt: string;
 }
+interface RemoveBookSelection { bookId: string; expectedRevision: number }
+interface RemoveBooksResult { removedBookIds: string[]; operations: Operation[] }
 ```
 
 Une progression est dans `[0,1]`. Un job terminé ne passe pas de nouveau à `running`. Un job interrompu par fermeture de l’application est repris ou signalé en échec suivant son journal ; les copies partiellement écrites ne deviennent jamais des fichiers finaux. Les modèles ne reçoivent aucune action `delete`, `shell` ou `writeFile`.
@@ -160,6 +162,16 @@ interface MetadataProposal {
   bookId: string; patch: BookPatch; confidence: number;
   evidence: { field: string; value: string; confidence: number; sourceUrls: string[] }[];
   warnings: string[]; providerId: ProviderId; modelId: string;
+}
+interface MetadataReview {
+  state: 'pending' | 'applied' | 'dismissed' | 'obsolete';
+  sourceRevision?: number;
+  reviewRevision?: number;
+  resolvedRevision?: number;
+}
+interface MetadataResult {
+  proposal: MetadataProposal;
+  review: MetadataReview;
 }
 interface Conversation { id: string; title: string; createdAt: string }
 interface ChatMessage {
@@ -226,6 +238,8 @@ Les noms ci-dessous sont les chaînes exactes utilisées par `invoke`. Les param
 | `book_files` | `{ id }` | `BookFile[]` |
 | `import_books` | `{ paths: string[] }` | `Job` |
 | `book_update` | `{ id, patch: BookPatch, expectedRevision }` | `Book` |
+| `book_review` | `{ id, jobId, patch: BookPatch, expectedRevision }` | `Book` |
+| `books_remove` | `{ requestId: string, books: RemoveBookSelection[] }` | `RemoveBooksResult` |
 | `book_enrich` | `{ id }` | `Job` |
 | `book_optimize` | `{ id, profileId }` | `Job` |
 | `book_convert` | `{ id, format: BookFormat }` | `Job` |
@@ -256,6 +270,24 @@ Les noms ci-dessous sont les chaînes exactes utilisées par `invoke`. Les param
 | `operation_undo` | `{ id }` | `Operation` |
 
 `import_books` accepte des chemins sources absolus, validés comme fichiers réguliers. Un appel accepte au plus 200 chemins ; l’interface découpe les sélections plus importantes en lots séquentiels. `device_import` reçoit uniquement des chemins relatifs issus de l’inventaire de l’appareil connecté. La racine de bibliothèque est le dossier de données de l’application, affiché en lecture seule et imposée côté backend. Les destinations, variantes et fichiers d’appareil sont calculés depuis des IDs autoritatifs. Les commandes n’acceptent ni commande shell, ni SQL, ni chemin de destination fourni pour contourner le stockage.
+
+### Validation durable d’une proposition
+
+Les nouveaux résultats des jobs `enrich` utilisent l’enveloppe `{ proposal, review }`. `sourceRevision` désigne la révision de référence de l’analyse ; `reviewRevision` désigne la révision sur laquelle la proposition en attente peut être examinée. Une édition personnelle peut déplacer `reviewRevision` sans changer `sourceRevision` ni consommer la proposition. Une revue résolue porte `resolvedRevision`. Les champs de révision sont optionnels dans le type ci-dessus pour conserver la lecture des résultats historiques ; une nouvelle proposition `pending` possède une `reviewRevision` valide. Les anciens résultats contenant directement une `MetadataProposal` restent compatibles sans leur attribuer une révision source fictive.
+
+`book_review({ id, jobId, patch, expectedRevision })` lie la validation au job `enrich` terminé dont la proposition concerne ce livre. Le backend vérifie la révision du livre et, pour une enveloppe, `reviewRevision` ainsi que l’état `pending`. La transaction commune écrit le livre, les éventuelles variantes, l’historique et la résolution de revue. Le patch peut être vide pour acquitter une proposition dont les valeurs correspondent déjà au catalogue ; il suit sinon les mêmes contrôles de champs que `book_update`.
+
+Une validation explicite marque la proposition `applied`. Une modification bibliographique ordinaire résout les propositions en attente comme `dismissed`, ou `obsolete` si leur révision ne correspond plus ; une modification des notes, favoris, évaluations ou état de lecture les conserve. Les états résolus ne doivent plus offrir d’action de revue. Un conflit de révision renvoie `revisionConflict` et exige une nouvelle lecture. Un état incompatible renvoie `operationConflict`. La répétition sans changement d’une validation déjà appliquée à la même révision résolue restitue le livre sans nouvel historique ; cela n’autorise pas à réappliquer une proposition après une autre édition.
+
+### Retrait réversible du catalogue
+
+`books_remove` reçoit un UUID canonique `requestId` et de 1 à 200 livres distincts, chacun avec `bookId` et `expectedRevision` strictement positive. Les propriétés inconnues d’une entrée `RemoveBookSelection` sont refusées. Le backend valide la sélection complète et ses révisions avant le retrait transactionnel : aucun livre introuvable ou en conflit n’est ignoré pour produire un succès partiel.
+
+La réponse contient `removedBookIds` et une opération réversible de type `catalogueRemove` par livre. Les reçus incluent les instantanés nécessaires à la restauration. Le retrait concerne le catalogue local ; il conserve les fichiers originaux, les variantes et les copies physiques sur les appareils. Un événement `library:changed` de raison `catalogueRemove` invite à actualiser les vues.
+
+En cas de réponse incertaine, le client répète le même `requestId` avec les mêmes couples livre/révision : tant que les opérations restent appliquées, le backend restitue les opérations existantes sans nouveau retrait ni doublon d’historique. L’ordre des livres est normalisé côté serveur. Réutiliser cet identifiant avec un autre contenu, ou après annulation du retrait, provoque `operationConflict`. Après un conflit de révision, le client relit les livres, fait confirmer la nouvelle sélection et utilise un nouvel identifiant si le contenu de la demande change.
+
+`operation_undo({ id })` restaure un retrait à partir de son instantané, après contrôle des fichiers conservés et des collisions avec le catalogue courant. Un conflit ne doit pas écraser une entrée existante. La restauration et son état d’historique sont transactionnels ; elle n’effectue aucune suppression physique sur un appareil.
 
 `chat_send` accepte au plus 200 identifiants de livres sélectionnés. `allowChanges` vaut `false` lorsqu’il est omis ou nul ; les requêtes historiques restent donc en lecture seule. Le backend enregistre le texte, la sélection et cette autorisation avec le message utilisateur avant de créer le job. L’interface consomme la case d’autorisation après acceptation du job : chaque demande suivante nécessite un nouveau choix explicite. Une reprise doit conserver ce périmètre exact : ni le modèle, ni un extrait de livre ou de site ne peuvent élargir les droits. Le contexte initial fournit au plus 32 aperçus de métadonnées et annonce cette limite ; les identifiants des autres livres sélectionnés restent disponibles aux outils bornés. Une réponse est limitée à huit étapes d’outil ou de réponse finale, et le contexte JSON à 384 KiB. Une seule complétion corrective du format est autorisée pour toute la requête (neuf appels maximum dans ce cycle, hors planner préalable), puis le contrat strict est revalidé avant toute exécution. Le texte invalide reste éphémère, borné à 64 KiB et ne peut pas accorder de permission. Ces limites ne constituent pas une lecture de toute la sélection.
 

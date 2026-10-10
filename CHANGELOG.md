@@ -2,6 +2,25 @@
 
 Les notes détaillées sont en français, suivies d’un résumé en anglais.
 
+## 0.2.1 — En préparation / In preparation
+
+### Français
+
+- Validation persistante des propositions de métadonnées : le livre, les éventuelles variantes, l’historique et l’état de revue sont enregistrés dans une transaction commune, avec contrôle de révision. Une proposition appliquée ne réapparaît plus après rafraîchissement ou redémarrage.
+- Validation explicite possible même lorsque les valeurs proposées sont déjà identiques. Une édition personnelle conserve la proposition en attente et ajuste sa révision de revue ; elle ne la valide pas implicitement et ne permet pas d’écraser une modification concurrente.
+- Barre d’actions groupées commune à toutes les vues de bibliothèque : Assistant, vérification des métadonnées, transfert et retrait du catalogue, jusqu’à **200 livres**. L’analyse exige un fournisseur sélectionné, configuré et prêt ainsi qu’un modèle renseigné ; les actions indisponibles expliquent leur condition.
+- Transfert groupé avec choix d’un appareil connecté accessible en écriture, profil d’optimisation et confirmation avant envoi.
+- Retrait confirmé du catalogue local avec contrôle de révision et reçu de demande idempotent : une répétition de la même demande ne crée pas de retrait ou d’historique en double. Les originaux, variantes et copies sur les appareils sont conservés ; l’historique permet une annulation avec vérification des fichiers et des collisions.
+- Préparation de la construction native et des installateurs Windows x64 et macOS Intel/Apple Silicon, avec minimum macOS 13. Le pipeline prévoit des contrôles distincts de signature, notarisation et validation Gatekeeper de l’application et du DMG. La compilation du moteur Windows et les validations des paquets restent en cours ; aucune livraison ni notarisation accomplie n’est annoncée par cette entrée.
+
+### English summary
+
+Metadata proposal review is persisted atomically with the book, generated variants and operation history, with revision checks. Explicit review can acknowledge proposals whose values already match; personal edits retain pending proposals and update their review revision without silently accepting them or bypassing concurrent changes.
+
+Shared bulk actions across library views support up to **200 books**, with provider/model readiness required for metadata analysis and explicit device selection and confirmation for transfers. Confirmed catalogue removal uses revision checks and idempotent request receipts, preserves original files, variants and device copies, and supports undo with file and collision checks.
+
+Native Windows x64 and macOS Intel/Apple Silicon packaging is being prepared, targeting macOS 13 or later. The pipeline includes separate application/DMG signing, notarization and Gatekeeper checks. Windows engine compilation and package validation are still in progress; this entry does not claim published packages or completed notarization.
+
 ## 0.2.0 — 2026-10-10
 
 ### Français
