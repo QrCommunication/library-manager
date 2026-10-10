@@ -922,12 +922,20 @@ def main():
     except (native.SmokeFailure, OSError, ValueError, KeyError, TypeError, sqlite3.Error) as error:
         report["status"] = "failed"
         report["errorCode"] = str(error) if isinstance(error, native.SmokeFailure) else "smokeInfrastructureOrContractError"
+        if isinstance(error, native.SmokeFailure) and isinstance(error.phase, str) and error.phase in native.DIAGNOSTIC_PHASES:
+            report["failurePhase"] = error.phase
     finally:
         if driver:
             try:
                 driver.close()
-            except native.SmokeFailure:
+            except native.SmokeFailure as error:
                 report["cleanupWarning"] = "webdriverSessionCloseFailed"
+                if report["status"] == "passed":
+                    report["status"] = "failed"
+                    report["errorCode"] = "webdriverSessionCloseFailed"
+                    exit_code = 1
+                    if isinstance(error.phase, str) and error.phase in native.DIAGNOSTIC_PHASES:
+                        report["failurePhase"] = error.phase
         try:
             arguments.report.parent.mkdir(parents=True, exist_ok=True)
             arguments.report.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")

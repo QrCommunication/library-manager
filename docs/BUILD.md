@@ -8,6 +8,8 @@ Ce document décrit la construction de **Library Manager 0.2.1** et ses conditio
 
 Les versions de référence sont **Rust 1.99.0**, **Node.js 26.11.1** et **pnpm 10.33.0**, fixées dans la toolchain, le manifeste et les workflows. Installer les dépendances verrouillées sans modifier les lockfiles pour contourner une erreur de compilation.
 
+Dans les workflows desktop et release, l’action `dtolnay/rust-toolchain` est épinglée au SHA `fb523f40495206854c36b250850817ae0f83e3d1`. Sa [définition exacte](https://github.com/dtolnay/rust-toolchain/blob/fb523f40495206854c36b250850817ae0f83e3d1/action.yml) fixe déjà Rust 1.99.0 et ne déclare pas d’entrée `toolchain`. Cette entrée a été retirée pour supprimer le warning GitHub ; la version installée et le SHA de l’action restent inchangés.
+
 | Plateforme | Runner CI | Cible Rust | Paquets |
 | --- | --- | --- | --- |
 | Linux x86_64 | Ubuntu 22.04, workflow `ci.yml` | `x86_64-unknown-linux-gnu` | DEB, RPM, AppImage |
@@ -174,10 +176,11 @@ La préparation possède uniquement `contents: read` et `actions: read`. Le job 
 
 Le téléchargement distingue l’endpoint GitHub Actions et le contenu binaire. La requête authentifiée vers `/actions/artifacts/{id}/zip` utilise `Accept: application/vnd.github+json` pour obtenir la redirection HTTP 302. Sur cet endpoint, demander directement `application/octet-stream` provoquait l’erreur HTTP 415 avant les tests GUI. Les requêtes suivantes vers les hôtes CDN autorisés utilisent `Accept: application/octet-stream` et ne transmettent aucune authentification GitHub. Les bornes de téléchargement, l’allowlist des destinations et le contrôle du digest ZIP restent obligatoires. Le téléchargement d’un asset de release conserve son contrat binaire propre ; il ne reçoit pas par défaut le contrat de l’API Actions.
 
-Le test de régression [test-release-download.py](../scripts/test-release-download.py) vérifie ce parcours avec des réponses HTTP synthétiques, sans jeton réel ni appel réseau. Le workflow l’exécute avant la collecte :
+Le test de régression [test-release-download.py](../scripts/test-release-download.py) vérifie ce parcours avec des réponses HTTP synthétiques, sans jeton réel ni appel réseau. Le test [test-native-driver.py](../scripts/test-native-driver.py) contrôle le cycle des sessions WebDriver avec un transport simulé. Les deux tests s’exécutent avant la collecte :
 
 ```sh
 python3 -Werror scripts/test-release-download.py
+python3 -Werror scripts/test-native-driver.py
 ```
 
 La préparation télécharge les archives CI et vérifie leurs SHA-256, chaque fichier de `SHA256SUMS`, les licences identiques aux sources du tag et le contenu complet de l’archive source. Les rapports de provenance doivent confirmer le commit, la version, l’architecture et l’exécution du moteur compagnon. Les paquets macOS doivent être signés, avec contrôles `codesign`, tickets validés, Gatekeeper et notarisation du DMG **`Accepted`**. Les MSI/EXE Windows sont explicitement **non signés** ; leur audit du sidecar doit refuser les DLL non système non embarquées.
@@ -195,6 +198,10 @@ Un échec bloque les étapes suivantes. Si le contrôle anonyme échoue après o
 ## Tests natifs Linux sur profil isolé
 
 Les scripts Python utilisent le protocole HTTP WebDriver, `tauri-driver` et `WebKitWebDriver`, avec GTK/WebKit, Xvfb et une session D-Bus isolée. Ces outils servent aux tests et ne sont pas des dépendances d’exécution de l’application.
+
+Le pilote conserve l’identifiant de session jusqu’à l’accusé de réception du `DELETE`. Un échec de fermeture reste un échec observable ; il ne libère pas fictivement la session pour autoriser un nouveau `POST`. La fermeture finale fait partie du verdict des parcours général, assistant et catalogue : son échec invalide un scénario jusque-là réussi et renvoie une sortie non nulle. Si une erreur avait déjà eu lieu, le rapport conserve cette première cause et ajoute un avertissement de fermeture. Les diagnostics distinguent les phases au moyen de codes autorisés, sans identifiant de session, chemin, URL, réponse brute ni donnée personnelle. La création de session n’est pas réessayée et les délais des scénarios restent inchangés.
+
+Checkpoint historique : le [run 38037237406](https://github.com/QrCommunication/library-manager/actions/runs/38037237406) a validé la collecte et l’image Ubuntu, puis huit contrôles du parcours général DEB. Le neuvième, persistance de la langue après redémarrage, a échoué avec `webdriverUnreachable` et une connexion réinitialisée ; la phase de transport exacte n’était pas enregistrée. Les trois autres scénarios et la publication ont été ignorés. Deux reproductions locales ont ensuite réussi les dix contrôles du même parcours, sans établir la cause de l’échec CI. Ces résultats ne valident pas la livraison : le run final et ses rapports doivent établir les 39 contrôles requis avant publication. Une validation locale ultérieure a réussi les 39 contrôles sur des profils neufs sans réseau, avec les paquets CI de `c0efabe` et le helper corrigé du répertoire de travail. Cette exécution précède le renforcement du verdict de fermeture finale ; elle ne prouve pas les 39 contrôles avec ce nouveau garde. Une nouvelle exécution complète, la provenance du nouveau commit, le run final et les téléchargements publics restent à vérifier avant de conclure à une publication validée.
 
 Lancer le conteneur ou namespace **sans réseau**, par exemple avec `docker run --network none`, puis créer un profil neuf à l’intérieur. Le driver et le script doivent hériter du même environnement ; le script ne peut pas changer rétroactivement celui d’un driver existant. Ne jamais utiliser un profil personnel.
 

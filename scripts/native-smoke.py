@@ -24,6 +24,10 @@ MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_FIXTURE_BYTES = 8 * 1024 * 1024
 PROVIDER_IDS = {"zai", "kimi", "minimax", "codex", "claude", "mistral"}
 TERMINAL_JOBS = {"completed", "failed", "cancelled"}
+DIAGNOSTIC_PHASES = frozenset({
+    "requestOperation", "persistenceRead", "persistenceSave", "driverReady",
+    "sessionDelete", "sessionCreate", "timeouts", "bridge",
+})
 FIXTURE_TEXT = (
     "Bibliothèque synthétique de validation.\n\n"
     "SMOKE_NATIVE_PARAGRAPH_A vérifie les accents : été, cœur, bibliothèque.\n\n"
@@ -87,6 +91,21 @@ requestAnimationFrame(next);
 
 class SmokeFailure(RuntimeError):
     """Only fixed diagnostic codes are printed; raw IPC/driver details stay private."""
+
+    def __init__(self, code: str, phase: str | None = None):
+        self.phase = phase if isinstance(phase, str) and phase in DIAGNOSTIC_PHASES else None
+        super().__init__(code)
+
+
+@contextmanager
+def diagnostic_phase(phase: str):
+    """Attach a fixed phase, letting the caller refine generic transport errors."""
+    try:
+        yield
+    except SmokeFailure as error:
+        if isinstance(phase, str) and phase in DIAGNOSTIC_PHASES:
+            error.phase = phase
+        raise
 
 
 class IpcFailure(SmokeFailure):
@@ -181,6 +200,10 @@ class Driver:
         return remaining
 
     def request(self, method: str, path: str, payload: dict | None = None):
+        with diagnostic_phase("requestOperation"):
+            return self._request(method, path, payload)
+
+    def _request(self, method: str, path: str, payload: dict | None = None):
         data = json.dumps(payload).encode() if payload is not None else None
         request = Request(self.url + path, data=data, method=method, headers={"Content-Type": "application/json"})
         try:
@@ -221,25 +244,33 @@ class Driver:
                     return False
                 raise
             return isinstance(status, dict) and status.get("ready") is True
-        self.wait(ready, "webdriverNotReady", 15)
-        response = self.request("POST", "/session", {"capabilities": {"alwaysMatch": {"tauri:options": {"application": str(binary), "args": []}}, "firstMatch": [{}]}})
-        require(isinstance(response, dict) and isinstance(response.get("sessionId"), str), "webdriverSessionShapeInvalid")
-        session_id = response["sessionId"]
-        require(0 < len(session_id) <= 128, "webdriverSessionIdInvalid")
-        self.session_id = session_id
-        self.request("POST", self.endpoint("/timeouts"), {"script": 30000, "pageLoad": 30000, "implicit": 0})
-        self.wait(lambda: self.execute("return typeof window.__TAURI_INTERNALS__?.invoke === 'function';"), "nativeBridgeNotReady")
+        with diagnostic_phase("driverReady"):
+            self.wait(ready, "webdriverNotReady", 15)
+        with diagnostic_phase("sessionCreate"):
+            response = self.request("POST", "/session", {"capabilities": {"alwaysMatch": {"tauri:options": {"application": str(binary), "args": []}}, "firstMatch": [{}]}})
+            require(isinstance(response, dict) and isinstance(response.get("sessionId"), str), "webdriverSessionShapeInvalid")
+            session_id = response["sessionId"]
+            require(0 < len(session_id) <= 128, "webdriverSessionIdInvalid")
+            self.session_id = session_id
+        with diagnostic_phase("timeouts"):
+            self.request("POST", self.endpoint("/timeouts"), {"script": 30000, "pageLoad": 30000, "implicit": 0})
+        with diagnostic_phase("bridge"):
+            self.wait(lambda: self.execute("return typeof window.__TAURI_INTERNALS__?.invoke === 'function';"), "nativeBridgeNotReady")
 
     def close(self) -> None:
         if self.session_id is None:
             return
         endpoint = self.endpoint("")
-        self.session_id = None
         # Cleanup must still run if the main smoke deadline expired.
         previous_deadline = self.deadline
         self.deadline = max(previous_deadline, time.monotonic() + 10)
         try:
-            self.request("DELETE", endpoint)
+            with diagnostic_phase("sessionDelete"):
+                response = self.request("DELETE", endpoint)
+                require(response is None, "webdriverSessionCloseResponseInvalid")
+                # A lost response leaves the session uncertain. Keep its ID for
+                # bounded cleanup and prevent a new session until DELETE is ACKed.
+                self.session_id = None
         finally:
             self.deadline = previous_deadline
 
@@ -323,8 +354,10 @@ def checked(report: dict, name: str):
     try:
         yield
         result["status"] = "passed"
-    except Exception:
+    except Exception as error:
         result["status"] = "failed"
+        if isinstance(error, SmokeFailure) and isinstance(error.phase, str) and error.phase in DIAGNOSTIC_PHASES:
+            result["phase"] = error.phase
         raise
     finally:
         result["durationMs"] = round((time.monotonic() - start) * 1000)
@@ -447,17 +480,20 @@ def smoke(driver: Driver, binary: Path, profile: Path, screenshot: Path | None, 
                     require(cancelled["status"] == "cancelled", "waitingJobCancellationFailed")
 
         with checked(report, "languagePersistsAcrossNativeProcessRestart"):
-            settings = driver.invoke("settings_get")
-            require(settings["language"] == "fr", "frenchSettingNotPersisted")
-            settings["language"] = "en"
-            driver.invoke("settings_save", {"settings": settings})
+            with diagnostic_phase("persistenceRead"):
+                settings = driver.invoke("settings_get")
+                require(settings["language"] == "fr", "frenchSettingNotPersisted")
+            with diagnostic_phase("persistenceSave"):
+                settings["language"] = "en"
+                driver.invoke("settings_save", {"settings": settings})
             driver.close()
             driver.start(binary)
-            bootstrap = driver.invoke("app_bootstrap")
-            require(bootstrap["settings"]["language"] == "en", "englishSettingLostAcrossRestart")
-            require(driver.invoke("library_list", {"query": QUERY})["total"] == 2, "libraryLostAcrossRestart")
-            require(driver.invoke("book_get", {"id": book_id})["readingProgress"] == 0.25, "progressLostAcrossRestart")
-            require(file_sha256(fixture) == fixture_hash, "nativeWorkflowModifiedSource")
+            with diagnostic_phase("persistenceRead"):
+                bootstrap = driver.invoke("app_bootstrap")
+                require(bootstrap["settings"]["language"] == "en", "englishSettingLostAcrossRestart")
+                require(driver.invoke("library_list", {"query": QUERY})["total"] == 2, "libraryLostAcrossRestart")
+                require(driver.invoke("book_get", {"id": book_id})["readingProgress"] == 0.25, "progressLostAcrossRestart")
+                require(file_sha256(fixture) == fixture_hash, "nativeWorkflowModifiedSource")
             report["bookCount"] = 2
             report["providerCount"] = 6
 
@@ -684,12 +720,20 @@ def main() -> int:
     except (SmokeFailure, OSError, ValueError, KeyError, TypeError) as error:
         report["status"] = "failed"
         report["errorCode"] = str(error) if isinstance(error, SmokeFailure) else "smokeInfrastructureOrContractError"
+        if isinstance(error, SmokeFailure) and isinstance(error.phase, str) and error.phase in DIAGNOSTIC_PHASES:
+            report["failurePhase"] = error.phase
     finally:
         if driver:
             try:
                 driver.close()
-            except SmokeFailure:
+            except SmokeFailure as error:
                 report["cleanupWarning"] = "webdriverSessionCloseFailed"
+                if report["status"] == "passed":
+                    report["status"] = "failed"
+                    report["errorCode"] = "webdriverSessionCloseFailed"
+                    if isinstance(error.phase, str) and error.phase in DIAGNOSTIC_PHASES:
+                        report["failurePhase"] = error.phase
+                    exit_code = 1
         if arguments.report:
             try:
                 arguments.report.parent.mkdir(parents=True, exist_ok=True)

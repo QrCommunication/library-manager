@@ -40,8 +40,6 @@ jobs:
 
       - name: Install the pinned native driver toolchain
         uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1
-        with:
-          toolchain: 1.99.0
 
       - name: Build the driver before network isolation
         run: cargo install tauri-driver --version 2.1.0 --locked --root "$RUNNER_TEMP/native-driver"
@@ -532,6 +530,7 @@ jobs:
                   sys.exit(1)
           PY
           python3 -Werror scripts/test-release-download.py
+          python3 -Werror scripts/test-native-driver.py
           python3 release-transport/release.py collect
 
       - name: Build an isolated Ubuntu 22.04 native QA image
