@@ -42,7 +42,11 @@ jobs:
         uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1
 
       - name: Build the driver before network isolation
-        run: cargo install tauri-driver --version 2.1.0 --locked --root "$RUNNER_TEMP/native-driver"
+        run: |
+          python3 scripts/build-native-driver.py --root "$RUNNER_TEMP/native-driver" --work-dir "$RUNNER_TEMP/native-driver-source" --report "$RUNNER_TEMP/native-driver-provenance.json"
+          mkdir -p release-transport/qa
+          cp "$RUNNER_TEMP/native-driver-provenance.json" release-transport/qa/driver-provenance.json
+          python3 -Werror scripts/test-native-driver-transport.py --driver "$RUNNER_TEMP/native-driver/bin/tauri-driver"
 
       - name: Gate CI, download verified artifacts, and assemble canonical packages
         id: collect
@@ -538,6 +542,15 @@ jobs:
           mkdir -p "$RUNNER_TEMP/release-native-image/scripts" release-transport/qa
           cp scripts/native-smoke.py scripts/native-assistant-smoke.py "$RUNNER_TEMP/release-native-image/scripts/"
           cp "$RUNNER_TEMP/native-driver/bin/tauri-driver" "$RUNNER_TEMP/release-native-image/tauri-driver"
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          temporary = Path(os.environ['RUNNER_TEMP'])
+          report = json.loads(Path('release-transport/qa/driver-provenance.json').read_text(encoding='utf-8'))
+          copied_driver = temporary / 'release-native-image/tauri-driver'
+          if hashlib.sha256(copied_driver.read_bytes()).hexdigest() != report['driverSha256']:
+              raise RuntimeError('Native driver provenance does not match the Docker input')
+          PY
           cp release-transport/assets/*.deb "$RUNNER_TEMP/release-native-image/application.deb"
           cp release-transport/assets/*.AppImage "$RUNNER_TEMP/release-native-image/application.AppImage"
           cat > "$RUNNER_TEMP/release-native-image/Dockerfile" <<'DOCKER'
