@@ -41,6 +41,12 @@ Le checkout Windows peut donner aux prérequis Autotools un horodatage plus réc
 
 L’audit `objdump` exige un exécutable PE x86_64 et refuse les DLL redistribuables MSYS, MinGW ou zlib. Seuls les imports système autorisés passent ce contrôle. Le rapport `sidecar-dependencies.log` accompagne les artefacts Windows ; il ne remplace pas un essai d’installation ou de GUI. Trois tests du build-script ont réussi sous Linux : le choix statique face à une bibliothèque partagée concurrente, la dépendance transitive réelle `exécutable → libmobi.la → uncompress`, avec absence d’archive zlib imbriquée et de dépendance dynamique, et les prérequis Autotools figés sans masquer une erreur de compilation C. Ces tests ne constituent pas une exécution du sidecar Windows ; la CI doit encore auditer les imports du véritable PE et valider les paquets natifs.
 
+L’adaptateur [secure_fs/windows.rs](../crates/library-core/src/secure_fs/windows.rs) publie les fichiers avec `NtSetInformationFile`, classe `FileRenameInformation` (`10`), un handle parent vérifié et un nom relatif. Il conserve `ReplaceIfExists = false` et le contrôle d’identité de la stage. Cet appel remplace le wrapper Win32 `SetFileInformationByHandle` qui a produit l’erreur 87 au renommage dans la CI du commit `8e37f8a` ; l’écriture du fichier avait déjà réussi. Le [contrat NT de renommage](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information) conserve l’association entre le handle parent et le nom, sans reconstruire un chemin absolu.
+
+Pour synchroniser un répertoire, l’adaptateur ouvre ce même objet avec `NtCreateFile`, un nom vide relatif au handle parent, `FILE_DIRECTORY_FILE`, le mode synchrone et le refus des points de réanalyse. Il demande `FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE`, contrôle à nouveau le type et l’identité, puis appelle `NtFlushBuffersFileEx` avec des flags nuls. Cette ouverture remplace `ReOpenFile`, qui renvoyait l’erreur 5 avant même l’appel de synchronisation. Les ACL et les droits de partage restent inchangés ; aucune réouverture par chemin absolu ni réussite fictive de synchronisation n’est introduite.
+
+La CI Windows du commit `8e37f8a` a compilé le sidecar MOBI, puis a enregistré **118 tests Rust réussis et 194 échoués**, notamment sur cette barrière commune de fichiers et de profil. Ce résultat ne valide pas les paquets Windows. La compilation croisée Windows GNU des tests du nouvel adaptateur et le formatage ont réussi ; les nouveaux tests couvrent les noms Unicode et d’un caractère, ainsi que la conservation de l’identité et des ACL lors de la barrière de répertoire. Leur exécution native Windows reste attendue avant livraison.
+
 ### macOS
 
 Installer les outils de ligne de commande Xcode et construire séparément sur Intel et Apple Silicon. Le moteur MOBI utilise le compilateur C natif, `configure` et `make`, comme sous Linux. Définir `MACOSX_DEPLOYMENT_TARGET=13.0` avant compilation.
@@ -124,7 +130,7 @@ Les secrets GitHub attendus pour la méthode API sont, uniquement par leurs noms
 - `APPLE_API_KEY` : identifiant de cette clé API.
 - `APPLE_API_KEY_CONTENT` : contenu privé de sa clé `.p8`.
 
-La méthode alternative utilise `APPLE_ID` et `APPLE_PASSWORD` avec l’équipe et les éléments du certificat. Si les deux méthodes sont complètes, la clé API est prioritaire. Aucun identifiant, certificat privé ou contenu de secret ne doit entrer dans le dépôt, les logs ou les rapports publics.
+La méthode alternative utilise `APPLE_ID` et `APPLE_PASSWORD` avec l’équipe et les éléments du certificat. Si les deux méthodes sont complètes, le workflow choisit la clé API et retire `APPLE_ID`/`APPLE_PASSWORD` de l’environnement transmis à Tauri. Une valeur vide reste une variable présente : Tauri CLI 2.12.1 sélectionnerait sinon le mode Apple ID avant le mode API. Le mode Apple ID retire symétriquement les variables API inutilisées. Aucun identifiant, certificat privé ou contenu de secret ne doit entrer dans le dépôt, les logs ou les rapports publics.
 
 Le workflow importe le P12 dans un trousseau temporaire, donne les droits nécessaires à `codesign` et écrit la clé API dans un fichier de permissions `0600` transmis par `APPLE_API_KEY_PATH`. Le nettoyage s’exécute même en cas d’échec et restaure la liste des trousseaux. Une configuration Apple partielle bloque le packaging ; sans aucun secret Apple, un build explicitement marqué `unsigned` peut être produit, sans signature Developer ID ni promesse de notarisation.
 
@@ -135,7 +141,7 @@ Pour le parcours signé, distinguer les contrôles suivants :
 3. Signature du DMG, soumission `notarytool submit --wait` et résultat JSON **`Accepted`**.
 4. Agrafage et validation du ticket du DMG avec `stapler`, puis contrôle `spctl --assess --type open --context context:primary-signature`.
 
-La présence de secrets ou la réussite de la compilation ne prouve aucun de ces résultats. `notarization-report.json` décrit les contrôles effectivement réussis pour le commit et les artefacts concernés. Un essai GUI macOS reste une preuve supplémentaire.
+Sur le checkpoint `8e37f8a`, l’import du P12 et la signature Developer ID réussissent, mais la notarisation échoue avec HTTP 401 parce que les variables Apple ID vides sélectionnent le mauvais mode. La clé centrale a réussi des requêtes Apple en lecture seule avec HTTP 200 ; le nettoyage des variables doit encore être confirmé par la nouvelle CI. La présence de secrets ou la réussite de la compilation ne prouve aucun de ces résultats. `notarization-report.json` décrit les contrôles effectivement réussis pour le commit et les artefacts concernés. Un essai GUI macOS reste une preuve supplémentaire.
 
 ## Publication vérifiée depuis le tag
 

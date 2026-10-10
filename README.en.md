@@ -92,6 +92,18 @@ Windows and macOS builds, signing, and macOS notarization are being validated. T
 
 The Windows MSI and EXE installers are planned without Authenticode signing. The macOS packages must be signed and receive an **Accepted** notarization status; this validation is still pending for the final artifacts.
 
+### Windows installation
+
+Once published, download the Windows x64 EXE or MSI from the release page and run it. The EXE uses NSIS and installs for the current user by default; the MSI uses WiX and installs for all users, requiring administrator permission. Launch **Library Manager** from the Start menu after installation.
+
+The installer checks for Microsoft Edge WebView2. If it is missing, the default installation mode downloads and runs its bootstrapper silently, requiring Internet access. The Windows installer is therefore not a fully offline installer. These are the current [Tauri installer defaults](https://v2.tauri.app/reference/config/#nsisinstallermode) and [WebView2 installation mode](https://v2.tauri.app/reference/config/#webviewinstallmode); native package validation is still pending.
+
+### macOS installation
+
+macOS **13.0 or later** is required. Choose the **ARM64** package for Apple Silicon or the **x86_64** package for an Intel Mac. Once published, open the matching DMG, drag **Library Manager** into **Applications**, then launch it from that folder. The application ZIP is an alternative: extract it and move **Library Manager.app** into **Applications**. ARM64 and Intel packages are separate; they are not a universal application.
+
+### Linux installation
+
 Linux packages use **Ubuntu 22.04 with glibc 2.35** as their build baseline. They require glibc 2.35 or newer and compatible GTK/WebKit system libraries. The following commands use **0.2.1** package names, to be used once those packages are published and downloaded.
 
 On Debian, Ubuntu, and derivatives, install the downloaded DEB:
@@ -122,6 +134,12 @@ APPIMAGE_EXTRACT_AND_RUN=1 ./library-manager_0.2.1_amd64.AppImage
 ```
 
 It needs no Calibre installation or Node, Rust, or Python runtime. Release assets include SHA-256 checksums.
+
+### Upgrading and checking the version
+
+Close Library Manager before upgrading. Closing its only window quits this version; there is no tray mode. Install the new package for the same architecture and, on Windows, use the same installer type as your previous installation. On macOS, replace the application in **Applications** with the matching new version. On Linux, install the new DEB/RPM with the package manager or replace the AppImage. Keep your library profile when replacing the application.
+
+Reopen Library Manager and check **Settings → About** and the version shown in the sidebar. For this planned release, both should show **0.2.1**. If an older version opens, check which installed copy or AppImage your shortcut launches.
 
 See [the validation report](docs/QUALITY.md) for the environments actually tested and the remaining limits.
 

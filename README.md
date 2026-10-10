@@ -123,6 +123,24 @@ L’AppImage utilise les bibliothèques compatibles et le magasin de certificats
 APPIMAGE_EXTRACT_AND_RUN=1 ./library-manager_0.2.1_amd64.AppImage
 ```
 
+### Windows
+
+Une fois les paquets publiés, téléchargez l’installateur **EXE x64** ou **MSI x64**, puis lancez-le. L’EXE installe l’application pour l’utilisateur courant ; le MSI l’installe pour la machine et demande des droits administrateur. Ces installateurs ne sont pas signés avec Authenticode : vérifiez leur provenance et leur SHA-256 sur la page de livraison.
+
+Si **Microsoft Edge WebView2 Runtime** manque, l’installateur télécharge son bootstrapper et lance son installation silencieuse. Une connexion Internet est alors nécessaire ; ces paquets ne sont pas des installateurs entièrement hors ligne. Lancez ensuite **Library Manager** depuis le menu Démarrer. Voir les [options d’installation Windows de Tauri](https://v2.tauri.app/distribute/windows-installer/).
+
+### macOS
+
+**macOS 13 ou ultérieur** est requis. Choisissez **ARM64** pour un Mac Apple Silicon, ou **x86_64** pour un Mac Intel ; les deux applications sont distinctes. Une fois les paquets publiés, ouvrez le **DMG**, glissez **Library Manager** dans **Applications**, puis lancez-le depuis ce dossier. Le fichier **`.app.zip`** constitue une alternative : décompressez-le et placez l’application obtenue dans **Applications**.
+
+La signature et la notarisation des paquets finaux restent à valider pour la version 0.2.1. Consultez les notes de livraison avant de considérer ces contrôles comme accomplis.
+
+### Mise à jour
+
+Fermez Library Manager : la fermeture de son unique fenêtre quitte l’application, sans la laisser active dans une icône de notification. Téléchargez le nouveau paquet pour la même plateforme et la même architecture. Sous Linux ou Windows, installez-le avec le même format de paquet ; sous macOS, remplacez l’application dans **Applications**. Pour une AppImage, remplacez le fichier utilisé pour la lancer.
+
+Rouvrez l’application et vérifiez la version dans **Paramètres → À propos**, également affichée en bas de la barre latérale. Après installation de la prochaine livraison, elle doit indiquer **0.2.1**. Cette mise à jour remplace l’application ; il n’est pas nécessaire de retirer les livres du catalogue ni de supprimer son profil local.
+
 Consultez le [rapport de qualité](docs/QUALITY.md) pour les vérifications effectuées et les limites des essais.
 
 ## Français, anglais et autres langues

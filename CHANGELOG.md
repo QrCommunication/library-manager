@@ -8,10 +8,13 @@ Les notes détaillées sont en français, suivies d’un résumé en anglais.
 
 - Validation persistante des propositions de métadonnées : le livre, les éventuelles variantes, l’historique et l’état de revue sont enregistrés dans une transaction commune, avec contrôle de révision. Une proposition appliquée ne réapparaît plus après rafraîchissement ou redémarrage.
 - Validation explicite possible même lorsque les valeurs proposées sont déjà identiques. Une édition personnelle conserve la proposition en attente et ajuste sa révision de revue ; elle ne la valide pas implicitement et ne permet pas d’écraser une modification concurrente.
-- Barre d’actions groupées commune à toutes les vues de bibliothèque : Assistant, vérification des métadonnées, transfert et retrait du catalogue, jusqu’à **200 livres**. L’analyse exige un fournisseur sélectionné, configuré et prêt ainsi qu’un modèle renseigné ; les actions indisponibles expliquent leur condition.
-- Transfert groupé avec choix d’un appareil connecté accessible en écriture, profil d’optimisation et confirmation avant envoi.
+- Barre d’actions groupées commune à toutes les vues de bibliothèque : Assistant, vérification des métadonnées, **Envoyer à la liseuse** et retrait du catalogue, jusqu’à **200 livres**. L’analyse exige un fournisseur sélectionné, configuré et prêt ainsi qu’un modèle renseigné ; les actions indisponibles expliquent leur condition.
+- Transfert groupé avec choix d’un appareil connecté accessible en écriture, optimisation facultative et confirmation avant envoi. Le reçu de transfert reste associé à l’appareil choisi pendant le suivi de la tâche.
 - Retrait confirmé du catalogue local avec contrôle de révision et reçu de demande idempotent : une répétition de la même demande ne crée pas de retrait ou d’historique en double. Les originaux, variantes et copies sur les appareils sont conservés ; l’historique permet une annulation avec vérification des fichiers et des collisions.
-- Préparation de la construction native et des installateurs Windows x64 et macOS Intel/Apple Silicon, avec minimum macOS 13. Le pipeline prévoit des contrôles distincts de signature, notarisation et validation Gatekeeper de l’application et du DMG. La compilation du moteur Windows et les validations des paquets restent en cours ; aucune livraison ni notarisation accomplie n’est annoncée par cette entrée.
+- Accès à une proposition conservé après une édition personnelle et son annulation, sans devoir recharger l’application. Les actualisations préservent les brouillons et le focus ; les livres sélectionnés dans l’assistant ouvrent une fiche fraîche.
+- Inspection des vrais fichiers de l’édition avec vérification de leur intégrité et extraits bornés de pages de titre, de copyright et de chapitre. Les corrections de l’assistant restent limitées aux livres sélectionnés, avec permission consommée pour une seule demande ; une inspection partielle ne constitue pas une lecture intégrale.
+- Préparation des installateurs natifs Windows x64 et macOS Intel/Apple Silicon, avec minimum macOS 13. Corrections de la liaison statique du moteur MOBI Windows et de la conversion du certificat Apple pour le trousseau temporaire. Le pipeline contrôle séparément signature, notarisation et Gatekeeper ; la CI finale et les paquets restent à valider, sans annonce de livraison ni de notarisation accomplie.
+- Publication préparée depuis le commit exact du tag, avec contrôle des artefacts CI, licences, empreintes, parcours natifs Linux et téléchargements publics avant promotion comme dernière version. Les notices tierces utilisent désormais un inventaire canonique des dépendances de toutes les plateformes. L’exécution finale du workflow de publication reste attendue.
 
 ### English summary
 
@@ -19,7 +22,9 @@ Metadata proposal review is persisted atomically with the book, generated varian
 
 Shared bulk actions across library views support up to **200 books**, with provider/model readiness required for metadata analysis and explicit device selection and confirmation for transfers. Confirmed catalogue removal uses revision checks and idempotent request receipts, preserves original files, variants and device copies, and supports undo with file and collision checks.
 
-Native Windows x64 and macOS Intel/Apple Silicon packaging is being prepared, targeting macOS 13 or later. The pipeline includes separate application/DMG signing, notarization and Gatekeeper checks. Windows engine compilation and package validation are still in progress; this entry does not claim published packages or completed notarization.
+Pending reviews remain accessible after personal edits and undo. Background refreshes preserve drafts and focus, and selected assistant books open fresh details. Inspection checks actual edition files and provides bounded title, copyright and chapter excerpts. Assistant write permission remains limited to one request and its selected books.
+
+Native Windows x64 and macOS Intel/Apple Silicon packaging is being prepared, targeting macOS 13 or later. Windows MOBI static linking and Apple certificate conversion have been corrected; final native CI and package validation are still pending. The release workflow binds packages to the exact tagged source, checks licenses, hashes and Linux native scenarios, and requires verified anonymous downloads before promotion to latest. Third-party notices now use a canonical dependency inventory across platforms. This entry does not claim publication or completed notarization.
 
 ## 0.2.0 — 2026-10-10
 

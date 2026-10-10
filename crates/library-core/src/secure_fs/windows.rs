@@ -39,12 +39,11 @@ use windows_sys::Win32::{
         CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
         FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO,
         FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_ID_INFO,
-        FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, FileBasicInfo,
-        FileDispositionInfo, FileIdInfo, FileRenameInfo, FileStandardInfo,
-        GetFileInformationByHandleEx, GetFileType, OPEN_EXISTING, READ_CONTROL, ReOpenFile,
-        SYNCHRONIZE, SetFileInformationByHandle, WRITE_DAC, WRITE_OWNER,
+        FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
+        FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
+        FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FileBasicInfo, FileDispositionInfo,
+        FileIdInfo, FileStandardInfo, GetFileInformationByHandleEx, GetFileType, OPEN_EXISTING,
+        READ_CONTROL, SYNCHRONIZE, SetFileInformationByHandle, WRITE_DAC, WRITE_OWNER,
     },
     System::Threading::{GetCurrentProcess, OpenProcessToken},
 };
@@ -64,6 +63,7 @@ const FILE_OPEN: u32 = 1;
 const FILE_CREATE: u32 = 2;
 const FILE_OPEN_IF: u32 = 3;
 const FILE_FS_FULL_SIZE_INFORMATION: u32 = 7;
+const FILE_RENAME_INFORMATION: u32 = 10;
 const UNIX_EPOCH_TICKS: i64 = 116_444_736_000_000_000;
 
 #[repr(C)]
@@ -116,6 +116,13 @@ unsafe extern "system" {
         handle: HANDLE,
         status: *mut IoStatusBlock,
         information: *mut c_void,
+        length: u32,
+        class: u32,
+    ) -> i32;
+    fn NtSetInformationFile(
+        handle: HANDLE,
+        status: *mut IoStatusBlock,
+        information: *const c_void,
         length: u32,
         class: u32,
     ) -> i32;
@@ -579,7 +586,9 @@ pub(super) fn publish_noreplace(
     drop(current);
     staged.sync_all()?;
     let wide: Vec<u16> = target.encode_wide().collect();
-    let bytes = offset_of!(FILE_RENAME_INFO, FileName) + wide.len() * 2;
+    // Follow the native contract's minimum allocation, including the structure
+    // and the complete name even though FileName already occupies its tail.
+    let bytes = size_of::<FILE_RENAME_INFO>() + wide.len() * 2;
     // usize storage provides proper alignment for the variable-length native structure.
     let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
     let rename = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
@@ -589,14 +598,20 @@ pub(super) fn publish_noreplace(
         (*rename).RootDirectory = parent.as_raw_handle();
         (*rename).FileNameLength = (wide.len() * 2) as u32;
         std::ptr::copy_nonoverlapping(wide.as_ptr(), (*rename).FileName.as_mut_ptr(), wide.len());
-        if SetFileInformationByHandle(
+        // The native structure has the same layout as FILE_RENAME_INFO. The
+        // Win32 wrapper interprets names through the DOS namespace; use the NT
+        // contract directly so RootDirectory and the relative name stay paired.
+        // https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information
+        let mut status = IoStatusBlock::default();
+        let result = NtSetInformationFile(
             staged.as_raw_handle(),
-            FileRenameInfo,
+            &mut status,
             rename.cast(),
             bytes as u32,
-        ) == 0
-        {
-            let error = io::Error::last_os_error();
+            FILE_RENAME_INFORMATION,
+        );
+        if result < 0 {
+            let error = io::Error::from_raw_os_error(RtlNtStatusToDosError(result) as i32);
             if matches!(error.raw_os_error(), Some(code) if code == ERROR_ALREADY_EXISTS as i32 || code == ERROR_FILE_EXISTS as i32)
             {
                 return Ok(PublishResult::AlreadyExists);
@@ -937,27 +952,52 @@ fn private_access_matches(file: &File, policy: PrivateAccess) -> Result<bool> {
 
 pub(super) fn sync_directory(parent: &File) -> Result<()> {
     verify_kind(parent, true)?;
-    // Upgrade rights on the same filesystem object, not by reopening its pathname.
-    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-reopenfile
-    // SAFETY: parent is a live file-object handle; flags preserve the directory
-    // and disable reparse processing, without delete access or attribute changes.
-    let handle = unsafe {
-        ReOpenFile(
-            parent.as_raw_handle(),
-            FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES,
+    // An empty native name opens the already pinned directory itself. Keep this
+    // separate from open_native: caller-supplied components must never be empty.
+    // ReOpenFile is a Win32 file wrapper and does not establish this directory
+    // contract. Microsoft's filesystem sample handles relative NULL-name opens:
+    // https://github.com/microsoft/Windows-driver-samples/blob/main/filesys/fastfat/create.c
+    let mut empty = UnicodeString {
+        length: 0,
+        maximum_length: 0,
+        buffer: null_mut(),
+    };
+    let mut attributes = ObjectAttributes {
+        length: size_of::<ObjectAttributes>() as u32,
+        root_directory: parent.as_raw_handle(),
+        object_name: &mut empty,
+        attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+        security_descriptor: null_mut(),
+        security_qos: null_mut(),
+    };
+    let mut handle = null_mut();
+    let mut open_status = IoStatusBlock::default();
+    // SAFETY: parent is a live verified directory. All argument buffers remain
+    // alive; FILE_OPEN cannot create or alter its ACL, and no DELETE is requested.
+    let result = unsafe {
+        NtCreateFile(
+            &mut handle,
+            FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            &mut attributes,
+            &mut open_status,
+            null(),
+            0,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+            null(),
+            0,
         )
     };
-    if handle == INVALID_HANDLE_VALUE {
+    if result < 0 {
+        // SAFETY: conversion of the returned scalar status has no pointer requirements.
+        let code = unsafe { RtlNtStatusToDosError(result) };
         return Err(AppError::Unsupported(format!(
             "Windows cannot obtain directory flush rights (OS error {})",
-            io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or_default()
+            code
         )));
     }
-    // SAFETY: successful ReOpenFile transfers one new owned handle, distinct from parent.
+    // SAFETY: successful NtCreateFile transfers one owned handle, distinct from parent.
     let writable = unsafe { File::from_raw_handle(handle) };
     verify_kind(&writable, true)?;
     if identity(&writable)? != identity(parent)? {
@@ -1424,5 +1464,51 @@ mod tests {
         .unwrap();
         // Creation permission is not required to synchronize an existing directory.
         sync_directory(&read_handle).unwrap();
+    }
+
+    #[test]
+    fn relative_publication_preserves_unicode_and_single_character_names() {
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = temporary.path().join("destination");
+        let parent = open_dir(&destination, true, AccessPolicy::Private).unwrap();
+        for (stage_name, target, bytes) in [
+            (
+                "unicode-stage",
+                "métadonnées-読み物.epub",
+                b"unicode bytes".as_slice(),
+            ),
+            ("short-stage", "x", b"short name bytes".as_slice()),
+        ] {
+            let mut stage =
+                create_new(&parent, OsStr::new(stage_name), AccessPolicy::Private).unwrap();
+            stage.write_all(bytes).unwrap();
+            let original_identity = identity(&stage).unwrap();
+            assert_eq!(
+                publish_noreplace(&parent, &stage, OsStr::new(stage_name), OsStr::new(target))
+                    .unwrap(),
+                PublishResult::Published
+            );
+            let published = open_regular(&parent, OsStr::new(target)).unwrap();
+            assert_eq!(identity(&published).unwrap(), original_identity);
+            assert_eq!(std::fs::read(destination.join(target)).unwrap(), bytes);
+            assert!(!destination.join(stage_name).exists());
+        }
+        sync_directory(&parent).unwrap();
+    }
+
+    #[test]
+    fn synchronizing_an_existing_directory_preserves_its_identity_and_private_acl() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("private");
+        let created = open_dir(&path, true, AccessPolicy::Private).unwrap();
+        let expected = identity(&created).unwrap();
+        assert!(is_private_read_write(&created).unwrap());
+        drop(created);
+        let read_handle = open_dir(&path, false, AccessPolicy::Private).unwrap();
+        for _ in 0..2 {
+            sync_directory(&read_handle).unwrap();
+            assert_eq!(identity(&read_handle).unwrap(), expected);
+            assert!(is_private_read_write(&read_handle).unwrap());
+        }
     }
 }

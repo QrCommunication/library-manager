@@ -2,7 +2,7 @@
 
 ## Version 0.2.1 — validations Linux et portage natif en cours
 
-État au 10 octobre 2026 : les actions groupées communes, la revue persistante des propositions et le retrait réversible du catalogue sont en cours de livraison, avec le portage natif Windows et macOS. Les sources du commit `69641a0` ont réussi leur validation globale Docker, la CI Linux et les parcours natifs Linux général, assistant et catalogue. Des corrections supplémentaires du générateur de notices et de la liaison du moteur Windows sont validées localement ; leur CI sur le prochain commit reste attendue. Les installateurs Windows/macOS, la notarisation et la publication publique ne sont pas encore validés. Les résultats historiques des versions publiées restent conservés dans les sections suivantes.
+État au 10 octobre 2026 : les actions groupées communes, la revue persistante des propositions et le retrait réversible du catalogue sont en cours de livraison, avec le portage natif Windows et macOS. Le commit `69641a0` a réussi sa validation globale Docker, la CI Linux et les parcours natifs Linux général, assistant, catalogue et AppRun extrait. Au checkpoint `8e37f8a`, la compilation du moteur C statique Windows réussit, mais les tests du moteur Rust échouent encore sur les primitives de fichiers ; macOS réussit ses tests et la signature, puis échoue à la notarisation. Les corrections Windows sont revues et compilées en croisé ; leur exécution native reste attendue. La correction d’authentification Apple est implémentée et testée localement ; sa validation native reste attendue. Les installateurs finaux et la publication publique de la 0.2.1 ne sont pas validés. Les résultats historiques des versions publiées restent conservés dans les sections suivantes.
 
 ### Sources actuelles : tests ciblés et analyse statique
 
@@ -23,7 +23,7 @@
 | Inventaire EPUB | Cinq tests réussis, avec lecture par fichier ouvert, limites et sources remplacées |
 | Analyse statique du moteur | Clippy `library-core`, toutes cibles, avec `-D warnings`, réussi sur l’hôte Linux |
 | Interface | 53 tests réussis ; contrôle TypeScript/Svelte sans erreur ni avertissement |
-| Compilation croisée Windows | Neuf tests spécifiques compilés, **non exécutés** sur Windows |
+| Compilation croisée Windows après correction NT | Douze tests spécifiques compilés sur la cible GNU ; Clippy avec `-D warnings` réussi ; **non exécutés** sur Windows |
 
 Ces suites ciblées portent sur le portage, les gardes métier et la publication atomique des analyses ; leurs comptes ne sont pas à additionner pour annoncer une suite globale. Le résultat global après les derniers ports figure ci-dessous. La compilation croisée ne prouve ni l’exécution des tests Windows, ni le comportement de sa GUI ou de ses installateurs.
 
@@ -71,6 +71,16 @@ Les rapports locaux suivants utilisent tous le binaire Linux produit par la CI d
 
 Le premier essai assistant échouait dans la fixture : l’indication de configuration était visible avant que les titres des 33 boutons sélectionnés soient chargés. La reproduction sur le même binaire montre les boutons sans titre cible à 9 ms, puis le titre et la fiche fraîche à environ 328 ms. Le scénario attend désormais le bouton cible activé, sans délai fixe ni assouplissement du contrôle. La relance complète sur un profil neuf réussit les dix contrôles.
 
+Le contenu extrait de l’AppImage CI `69641a0` a également réussi **dix contrôles généraux sur dix** dans un profil neuf et un conteneur sans réseau externe. Le rapport local [native-appimage-general-69641a0-report.json](/tmp/library-manager-0.2.1-qa/native-appimage-general-69641a0-report.json) indique `status: passed` et la version 0.2.1. Il mesure le lanceur `AppRun`, distinct des deux binaires principaux :
+
+| Objet mesuré du checkpoint `69641a0` | SHA-256 |
+| --- | --- |
+| Binaire principal du DEB | `abc65b87bc671477f9b0418d0ed064b0f232074913d4c4e309c40304e9c341a1` |
+| Binaire principal extrait de l’AppImage | `e4d72128c0b4a1d60192c6e9785475e38d57b4dbfbf09ee0b4b285b5758dd438` |
+| Lanceur `AppRun` exécuté par le scénario AppImage | `eb0b254ac0dae6543e6dd7cd02e1baf40a060de95b927313122d6b46323c00aa` |
+
+Les différences de transformation ELF lors de l’assemblage des paquets empêchent d’exiger une empreinte identique entre les binaires principaux DEB et AppImage. Chaque mesure reste liée à son paquet et à son rapport ; l’exécution du contenu extrait ne prouve pas le montage FUSE.
+
 Ces rapports indiquent zéro appel API payant et zéro écriture sur appareil physique. Le scénario assistant neuf ne contient aucune proposition terminée : sa revue est explicitement non exercée, et la preuve correspondante vient du scénario catalogue. Les échanges CrossPoint restent une preuve du transport réel contre une fixture privée, sans preuve de firmware ou de matériel physique.
 
 ### Notices communes aux plateformes et liaison du moteur Windows
@@ -79,13 +89,25 @@ Après le checkpoint `69641a0`, le générateur recense l’union du graphe verr
 
 Les **treize autotests** du générateur réussissent, notamment l’indépendance du graphe à la plateforme Linux/macOS, le refus d’une source optionnelle manquante et la résolution explicite du lanceur `pnpm.cmd` Windows. Cette dernière vérification simule le chemin de lancement Windows ; elle ne remplace pas son exécution native dans la CI Windows. Les versions et fichiers de verrouillage restent identiques.
 
-Deux tests ciblés de `build.rs` réussissent sur l’hôte Linux avec libtool : la sélection du vrai fichier d’archive statique et le refus d’une DLL comme entrée de liaison statique. La correction vise l’échec Windows relatif à `zlib1.dll` ; son succès natif Windows reste à confirmer.
+Trois tests ciblés de `build.rs` réussissent sur l’hôte Linux avec libtool : sélection de la bibliothèque statique lorsque la bibliothèque partagée est également présente, résolution de la dépendance transitive `libmobi.la` vers `uncompress` sans archive imbriquée ni dépendance dynamique, et vérification des prérequis Autotools figés. Le lien utilise exactement `-all-static` avec `LIBZ_LDFLAGS="-L/ucrt64/lib -lz"`, sans archive imbriquée. Au checkpoint `8e37f8a`, la compilation du moteur C statique Windows réussit ; cela ne valide pas les primitives de fichiers du moteur Rust ni les installateurs.
 
 ### CI et paquets restant à valider
 
-La [CI Linux 38025145928](https://github.com/QrCommunication/library-manager/actions/runs/38025145928) du commit `69641a0` a réussi et produit les paquets utilisés par les parcours ci-dessus. La [CI native 38025145921](https://github.com/QrCommunication/library-manager/actions/runs/38025145921) a échoué : les notices différaient selon les sources optionnelles installées sur macOS, et la liaison Windows nécessitait une archive statique plutôt que `zlib1.dll`. Les corrections de ces deux causes sont présentes dans les sources locales et leurs tests ciblés réussissent ; les jobs natifs du nouveau commit restent attendus.
+La [CI Linux 38025145928](https://github.com/QrCommunication/library-manager/actions/runs/38025145928) du commit `69641a0` a réussi et produit les paquets utilisés par les parcours ci-dessus. La [CI native 38025145921](https://github.com/QrCommunication/library-manager/actions/runs/38025145921) a échoué : les notices différaient selon les sources optionnelles installées sur macOS, et la liaison Windows nécessitait une archive statique plutôt que `zlib1.dll`. Les corrections des notices et de la liaison statique sont présentes dans le checkpoint ultérieur `8e37f8a`, dont les limites natives sont décrites ci-dessous.
 
-Sur le checkpoint macOS ARM de cette CI, 316 tests du moteur et six tests Tauri réussissent, ainsi que l’analyse statique. Ce résultat intermédiaire ne prouve pas la construction finale, la signature, la notarisation ou le parcours graphique macOS. Les installateurs Windows/macOS et les téléchargements publics de la 0.2.1 restent à valider ; aucune notarisation accomplie ni validation matérielle Windows n’est revendiquée.
+Sur le checkpoint macOS ARM de la CI `69641a0`, 316 tests du moteur et six tests Tauri réussissent, ainsi que l’analyse statique. Ce résultat intermédiaire reste distinct du checkpoint suivant.
+
+Le commit [8e37f8a87cca647b302d36c4b97749e186d968b8](https://github.com/QrCommunication/library-manager/commit/8e37f8a87cca647b302d36c4b97749e186d968b8) apporte les preuves natives suivantes :
+
+| Plateforme et étape | Résultat du checkpoint `8e37f8a` |
+| --- | --- |
+| Windows, moteur C statique | Compilation réussie |
+| Windows, moteur Rust | 118 tests réussis, **194 échecs**, un test réseau ignoré ; erreurs système 5 et 87 lors des opérations de fichiers |
+| macOS, moteur et coque | 316 tests du moteur et six tests Tauri réussis |
+| macOS, signature | Réussie ; ce résultat ne prouve pas la notarisation |
+| macOS, notarisation | Échec HTTP 401 : Tauri 2.12.1 utilise le mode Apple ID avec des variables d’environnement vides. Le contrôle indépendant en lecture seule avec les identifiants centraux répond HTTP 200 ; le workflow transmet désormais les identifiants du mode choisi et supprime les variables du mode inutilisé, y compris leurs valeurs vides. Les fixtures des deux modes réussissent après reproduction de l’échec ; les contrôles Bash et actionlint réussissent. La validation native reste attendue |
+
+Les sources Windows corrigées remplacent les wrappers concernés par le renommage NT relatif au handle du parent et la synchronisation native du même répertoire, avec contrôles d’identité, refus des points de réanalyse et conservation des ACL. La revue finale rapporte `findings: []` ; douze tests Windows sont compilés en croisé GNU et Clippy réussit. Ces résultats **ne constituent pas une relance native Windows réussie** : la prochaine CI doit vérifier les corrections sur Windows. Les installateurs finaux Windows/macOS, l’acceptation Apple et les téléchargements publics de la 0.2.1 restent à valider ; aucune validation matérielle Windows n’est revendiquée.
 
 Voir [le guide utilisateur](USER_GUIDE.md), [le plan de livraison 0.2.1](RELEASE_0.2.1_PLAN.md) et [les environnements et commandes de construction](BUILD.md). Le plan distingue la construction, la signature, la notarisation et la vérification des paquets effectivement publiés.
 
