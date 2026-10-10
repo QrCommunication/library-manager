@@ -997,6 +997,7 @@ fn native_volumes() -> Result<Vec<NativeVolume>> {
 // PowerShell 5.1 ships with Windows 11; InputObject keeps 0/1/N results arrays.
 #[cfg(any(windows, test))]
 const WINDOWS_VOLUME_PROBE: &str = r#"
+[Console]::Error.WriteLine('library-manager-volume-probe:bootstrap:0')
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $clock = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1169,7 +1170,15 @@ fn safe_probe_diagnostic(line: &str) -> Option<String> {
     let (stage, elapsed) = tail.split_once(':')?;
     if !matches!(
         stage,
-        "start" | "disks" | "partitions" | "volumes" | "complete"
+        "bootstrap"
+            | "json-start"
+            | "json-complete"
+            | "mock-entry"
+            | "start"
+            | "disks"
+            | "partitions"
+            | "volumes"
+            | "complete"
     ) || elapsed.is_empty()
         || elapsed.len() > 5
         || !elapsed.bytes().all(|byte| byte.is_ascii_digit())
@@ -1265,6 +1274,15 @@ fn run_probe(program: &Path, arguments: &[&str], deadline: std::time::Instant) -
             });
         }
         if Instant::now() >= deadline {
+            // Snapshot before killing: EOF and process termination are separate
+            // conditions. Only fixed boolean state is logged, never OS output.
+            let status_collected = status.is_some();
+            let process_exited = status_collected || matches!(child.try_wait(), Ok(Some(_)));
+            let stdout_finished = reader.is_finished();
+            let output_collected = output.is_some();
+            eprintln!(
+                "Mounted volume probe deadline: processExited={process_exited}, statusCollected={status_collected}, stdoutFinished={stdout_finished}, outputCollected={output_collected}"
+            );
             let _ = child.kill();
             let _ = child.wait();
             return Err(AppError::Unsupported(
@@ -1782,6 +1800,51 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn execute_windows_probe_script(script: &str) -> Result<String> {
+        let program = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        run_probe(
+            &program,
+            &[
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ],
+            std::time::Instant::now() + PROBE_TIMEOUT,
+        )
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_probe_constant_json_subprocess_completes() {
+        let script = r#"
+[Console]::Error.WriteLine('library-manager-volume-probe:bootstrap:0')
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::Out.Write('[]')
+"#;
+        let output = execute_windows_probe_script(script).unwrap();
+        assert!(parse_windows_volumes(&output).unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_probe_json_conversion_subprocess_completes() {
+        let script = r#"
+[Console]::Error.WriteLine('library-manager-volume-probe:bootstrap:0')
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::Error.WriteLine('library-manager-volume-probe:json-start:0')
+$fixture = ConvertFrom-Json -InputObject '{"volumes":[]}'
+[Console]::Error.WriteLine('library-manager-volume-probe:json-complete:0')
+ConvertTo-Json -InputObject @($fixture.volumes) -Depth 4 -Compress
+"#;
+        let output = execute_windows_probe_script(script).unwrap();
+        assert!(parse_windows_volumes(&output).unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
     #[test]
     fn windows_bulk_probe_joins_complete_snapshots_and_rejects_partial_results() {
         let base = serde_json::json!({
@@ -1797,10 +1860,14 @@ mod tests {
             // three OS queries with deterministic snapshots. No device is touched.
             let script = format!(
                 r#"
+[Console]::Error.WriteLine('library-manager-volume-probe:bootstrap:0')
+[Console]::Error.WriteLine('library-manager-volume-probe:json-start:0')
 $fixture = ConvertFrom-Json -InputObject '{}'
+[Console]::Error.WriteLine('library-manager-volume-probe:json-complete:0')
 $script:calls = 0
 function Get-CimInstance {{
   param([string]$Namespace,[string]$ClassName,[string[]]$Property,[uint32]$OperationTimeoutSec)
+  [Console]::Error.WriteLine('library-manager-volume-probe:mock-entry:0')
   if ($Namespace -ne 'root/Microsoft/Windows/Storage' -or $OperationTimeoutSec -ne 8 -or $Property.Count -eq 0) {{ throw 'Invalid query contract' }}
   $script:calls++
   switch ($ClassName) {{
@@ -1816,19 +1883,7 @@ if ($script:calls -ne 3) {{ throw 'Incorrect query count' }}
                 fixture.to_string().replace('\'', "''"),
                 WINDOWS_VOLUME_PROBE
             );
-            let program = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
-                .join("System32/WindowsPowerShell/v1.0/powershell.exe");
-            let output = run_probe(
-                &program,
-                &[
-                    "-NoLogo",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    &script,
-                ],
-                std::time::Instant::now() + PROBE_TIMEOUT,
-            )?;
+            let output = execute_windows_probe_script(&script)?;
             parse_windows_volumes(&output)
         };
         let original = execute(&base).unwrap();
@@ -1880,6 +1935,19 @@ if ($script:calls -ne 3) {{ throw 'Incorrect query count' }}
             assert!(safe_probe_diagnostic(unsafe_line).is_none());
         }
         assert!(safe_probe_diagnostic("library-manager-volume-probe:complete:10000").is_some());
+        for stage in ["bootstrap", "json-start", "json-complete", "mock-entry"] {
+            assert_eq!(
+                safe_probe_diagnostic(&format!("library-manager-volume-probe:{stage}:0")),
+                Some(format!("Mounted volume probe stage {stage}: 0 ms"))
+            );
+        }
+        for unsafe_line in [
+            "library-manager-volume-probe:bootstrap:0:C:\\private\\profile",
+            "library-manager-volume-probe:json-start:token-value",
+            "library-manager-volume-probe:mock-entry-secret:0",
+        ] {
+            assert!(safe_probe_diagnostic(unsafe_line).is_none());
+        }
     }
 
     #[test]

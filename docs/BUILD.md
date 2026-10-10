@@ -51,6 +51,8 @@ L’inventaire Windows exécute trois requêtes CIM locales sur `MSFT_Disk`, `MS
 
 Le verrou du profil est acquis et son identité recontrôlée avant d’appliquer les permissions privées héritantes nécessaires à SQLite. Une seconde instance refusée ne modifie pas le profil actif. Les fixtures de montage Linux échappent les chemins Windows ; la fixture GVFS portable sépare le nom logique MTP de son chemin physique sans ajouter d’alias dans le détecteur de production. Les contrôles ciblés hôte enregistrent 22 tests Devices et dix tests Manager, ainsi que douze tests d’adaptateur Windows compilés en croisé. La CI du commit de livraison fournit la preuve Windows native.
 
+La CI Windows exécute séparément quatre sondes natives avant la suite complète : inventaire réel, jointures avec snapshots synthétiques, sortie JSON constante et conversion JSON PowerShell. Chacune garde le délai de production de dix secondes. Une expiration relève séparément la terminaison du processus et la fin de stdout ; les étapes du script sont limitées à une liste fixe sans données privées. Tous les contrôles du workspace, de Clippy et des notices s'exécutent même après un échec de sonde, puis le statut cumulé bloque le packaging si nécessaire.
+
 ### macOS
 
 Installer les outils de ligne de commande Xcode et construire séparément sur Intel et Apple Silicon. Le moteur MOBI utilise le compilateur C natif, `configure` et `make`, comme sous Linux. Définir `MACOSX_DEPLOYMENT_TARGET=13.0` avant compilation.

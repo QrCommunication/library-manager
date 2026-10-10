@@ -28,6 +28,8 @@ Le workflow de publication contrôlée est poussé et revu à ce checkpoint ; so
 
 ## Fonctionnalités et validations source
 
+Checkpoint suivant `4fa22a0` : CI Linux et CodeQL réussies ; les archives macOS Intel et ARM64 ont chacune leurs neuf attestations Apple, une notarisation `Accepted`, une empreinte ZIP et sept empreintes internes vérifiées. Windows passe 317 tests mais les deux sondes PowerShell expirent, y compris celle avec snapshots synthétiques. Les mesures du processus/stdout et l'exécution isolée des sondes doivent en établir la cause avant toute publication. Les archives de ce checkpoint ne doivent pas être mélangées à celles du commit final.
+
 - Revue persistante et publication atomique : raccords Library/Manager/IPC/UI implémentés. La publication du worker enregistre livre, références de variantes, historique, proposition/revue et tâche terminée dans une transaction commune ; les notifications suivent la libération des verrous.
 - Actions groupées : barre commune raccordée aux vues Bibliothèque/Appareils/Assistant, jusqu’à 200 livres, avec disponibilité du fournisseur, confirmation du transfert et retrait réversible du catalogue. Le retrait conserve les fichiers physiques et possède un reçu idempotent.
 - Tests ciblés du portage et des contrats : Database 12, secure_fs 8, Storage 12, Transfer 11, Jobs 20, Repository 31, Library 29, Manager 29, Conversion 12, inventaire EPUB 5, Enrichment 23 et Settings 4 réussis. Ces comptes désignent des suites ciblées et ne constituent pas une suite globale additionnable. L’inventaire Devices est couvert par les 22 tests hôte indiqués ci-dessus.

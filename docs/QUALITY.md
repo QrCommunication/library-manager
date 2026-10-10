@@ -8,6 +8,10 @@ Les résultats ci-dessous documentent les checkpoints de développement et leurs
 
 ### Checkpoints du portage : tests ciblés et analyse statique
 
+Le checkpoint `4fa22a0647a834ddc18f80497b99f52f31ed0bac` réussit les CI Linux et CodeQL. Ses deux archives macOS, Intel et ARM64, ont été téléchargées et contrôlées : empreinte ZIP identique à GitHub, sept empreintes internes et licences identiques aux sources, neuf attestations Apple réussies et notarisation du DMG `Accepted`. Ces rapports indiquent explicitement `nativeGuiTested: false`.
+
+La suite Windows du même checkpoint réussit 317 tests, échoue sur deux sondes PowerShell et conserve un test réseau ignoré. La sonde réelle et celle dont les trois requêtes CIM sont remplacées par des données synthétiques dépassent toutes deux le délai de dix secondes. Le marqueur `start: 35 ms` appartient seulement au test de la sonde réelle ; il ne démontre pas la cause du blocage. Le diagnostic relève désormais séparément la fin du processus et celle de stdout, ajoute des marqueurs fixes au scénario synthétique et exécute des sondes isolées avant la suite complète. Il conserve les délais, les limites et tous les contrôles ; ce checkpoint Windows ne constitue pas une validation réussie.
+
 | Périmètre ciblé | Résultat exécuté |
 | --- | --- |
 | Base de données | 12 tests réussis |

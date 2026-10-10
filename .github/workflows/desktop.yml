@@ -185,14 +185,40 @@ jobs:
 
       - name: Check the interface and native workspace
         run: |
-          pnpm check
-          pnpm test
-          pnpm build
-          cargo fmt --all -- --check
-          cargo test --workspace --locked
-          cargo clippy --workspace --all-targets --locked -- -D warnings
-          python scripts/third-party-notices.py --self-test
-          python scripts/third-party-notices.py --check
+          set -euo pipefail
+          checks_failed=0
+          run_check() {
+            local label="$1" result
+            shift
+            printf '\nCheck: %s\n' "$label"
+            if "$@"; then
+              printf 'Check passed: %s\n' "$label"
+            else
+              result=$?
+              printf 'Check failed: %s (exit %s)\n' "$label" "$result" >&2
+              checks_failed=1
+            fi
+          }
+          run_check 'Interface types' pnpm check
+          run_check 'Interface tests' pnpm test
+          run_check 'Interface build' pnpm build
+          run_check 'Rust formatting' cargo fmt --all -- --check
+          if [[ "$PACKAGE_PLATFORM" == windows ]]; then
+            # Run each native probe without workspace-test contention, retaining
+            # its production 10-second budget. Failures never skip the full suite.
+            for probe in \
+              native_readonly_volume_probe_runs_on_its_actual_operating_system \
+              windows_bulk_probe_joins_complete_snapshots_and_rejects_partial_results \
+              windows_probe_constant_json_subprocess_completes \
+              windows_probe_json_conversion_subprocess_completes; do
+              run_check "Windows probe: $probe" cargo test --locked -p library-core "devices::tests::$probe" -- --exact --nocapture --test-threads=1
+            done
+          fi
+          run_check 'Complete native workspace tests' cargo test --workspace --locked
+          run_check 'Complete native workspace Clippy' cargo clippy --workspace --all-targets --locked -- -D warnings
+          run_check 'Third-party notices tests' python scripts/third-party-notices.py --self-test
+          run_check 'Third-party notices check' python scripts/third-party-notices.py --check
+          exit "$checks_failed"
 
       - name: Determine Apple signing readiness
         if: runner.os == 'macOS'
