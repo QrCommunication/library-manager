@@ -1073,7 +1073,6 @@ fn lock_profile(root: &Path) -> Result<File> {
         return Err(invalid("The filesystem root cannot be a library profile"));
     }
     let directory = SecureDir::open(&root, true, AccessPolicy::Private)?;
-    secure_fs::make_private(directory.as_file(), false)?;
     let name = std::ffi::OsStr::new("runtime.lock");
     let file = match directory.open_regular(name) {
         Ok(file) => file,
@@ -1107,6 +1106,9 @@ fn lock_profile(root: &Path) -> Result<File> {
             "Profile lock identity changed during acquisition".into(),
         ));
     }
+    // Only the lock owner may set the profile policy. Preserve SQLite's
+    // owner-only inheritance instead of replacing it with a non-inheritable ACL.
+    secure_fs::make_private_inheritable(directory.as_file())?;
     Ok(file)
 }
 fn validate_batch(values: &[String]) -> Result<()> {
@@ -2302,17 +2304,24 @@ mod tests {
             .unwrap();
         let claim = manager.jobs.claim_next(1).unwrap().unwrap();
         manager.jobs.update_progress(&claim, 0.6, "").unwrap();
+        let profile = directory.path().join("profile");
+        let profile_directory = SecureDir::open(&profile, false, AccessPolicy::Private).unwrap();
+        let profile_identity = profile_directory.identity().unwrap();
+        assert!(secure_fs::is_private_inheritable(profile_directory.as_file()).unwrap());
         assert!(matches!(
-            create(&directory.path().join("profile"), events.clone()),
+            create(&profile, events.clone()),
             Err(AppError::ProfileInUse)
         ));
+        let retained_directory = SecureDir::open(&profile, false, AccessPolicy::Private).unwrap();
+        assert_eq!(retained_directory.identity().unwrap(), profile_identity);
+        assert!(secure_fs::is_private_inheritable(retained_directory.as_file()).unwrap());
         assert_eq!(
             manager.jobs.get(&job.id).unwrap().status,
             JobStatus::Running
         );
         drop(claim);
         drop(manager);
-        let manager = create(&directory.path().join("profile"), events).unwrap();
+        let manager = create(&profile, events).unwrap();
         let recovered = manager.jobs.get(&job.id).unwrap();
         assert_eq!(recovered.status, JobStatus::Queued);
         assert_eq!(recovered.progress, 0.0);
@@ -2327,6 +2336,29 @@ mod tests {
         );
     }
 
+    fn encode_mountinfo_field(value: &str) -> String {
+        let mut encoded = String::new();
+        for character in value.chars() {
+            match character {
+                '\\' => encoded.push_str("\\134"),
+                ' ' => encoded.push_str("\\040"),
+                '\t' => encoded.push_str("\\011"),
+                '\n' => encoded.push_str("\\012"),
+                _ => encoded.push(character),
+            }
+        }
+        encoded
+    }
+
+    #[test]
+    fn mountinfo_fixture_encodes_special_characters_once() {
+        assert_eq!(
+            encode_mountinfo_field("C:\\Books\\été \t\n"),
+            "C:\\134Books\\134été\\040\\011\\012"
+        );
+        assert_eq!(encode_mountinfo_field(r"\040"), r"\134040");
+    }
+
     fn device_fixture(count: usize) -> (TempDir, LibraryManager, Events, PathBuf, PathBuf, String) {
         let directory = tempfile::Builder::new()
             .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
@@ -2338,7 +2370,7 @@ mod tests {
         settings.auto_enrich = false;
         manager.settings_save(&settings).unwrap();
         let media = directory.path().join("media");
-        let card = media.join("Xteink");
+        let card = media.join("Xteink fixture");
         let gvfs = directory.path().join("gvfs");
         let mountinfo = directory.path().join("mountinfo");
         std::fs::create_dir_all(&card).unwrap();
@@ -2354,7 +2386,7 @@ mod tests {
             &mountinfo,
             format!(
                 "42 1 8:1 / {} rw,nosuid - vfat UUID=TEST-CARD rw\n",
-                card.display()
+                encode_mountinfo_field(&card.to_string_lossy())
             ),
         )
         .unwrap();

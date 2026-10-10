@@ -2,7 +2,7 @@
 
 <img src="public/library-manager.png" width="96" height="96" alt="Library Manager" />
 
-**Your library, wherever you read.** A standalone application for organizing ebooks, reading EPUBs, and preparing files for ereaders. Linux packages are available; Windows and macOS installers are being prepared for version **0.2.1**.
+**Your library, wherever you read.** A standalone application for organizing ebooks, reading EPUBs, and preparing files for ereaders. Version **0.2.1** includes native packaging for Linux, Windows, and macOS.
 
 [Français](README.md) · [Downloads](https://github.com/QrCommunication/library-manager/releases) · [User guide (French)](docs/USER_GUIDE.md) · [Architecture](docs/BLUEPRINT.md) · [Issues](https://github.com/QrCommunication/library-manager/issues)
 
@@ -79,32 +79,32 @@ The EPUB reader includes a table of contents and saved position. Book HTML is sa
 
 ## Installation
 
-**Version 0.2.1 is in preparation.** Its [v0.2.1 release page](https://github.com/QrCommunication/library-manager/releases/tag/v0.2.1) will become available when packages are published. The [published v0.2.0 release](https://github.com/QrCommunication/library-manager/releases/tag/v0.2.0) remains available for Linux.
+Use the [v0.2.1 release page](https://github.com/QrCommunication/library-manager/releases/tag/v0.2.1) for packages and their verification reports. Choose the package matching your operating system and processor.
 
-| Target platform for 0.2.1 | Planned packages |
+| Platform | Package names |
 | --- | --- |
-| Linux x86_64 (64-bit) | DEB, RPM, AppImage |
-| Windows 11 x64 | MSI and EXE installers |
-| macOS 13 or newer, Apple Silicon | DMG and ARM64 application |
-| macOS 13 or newer, Intel | DMG and x86_64 application |
+| Linux x86_64 (64-bit) | `library-manager_0.2.1_amd64.deb`, `library-manager-0.2.1-1.x86_64.rpm`, `library-manager_0.2.1_amd64.AppImage` |
+| Windows 11 x64 | `library-manager_0.2.1_windows_x64_unsigned.msi`, `library-manager_0.2.1_windows_x64_unsigned_setup.exe` |
+| macOS 13 or newer, Apple Silicon | `library-manager_0.2.1_macos_arm64_signed.dmg`, `library-manager_0.2.1_macos_arm64_signed.app.zip` |
+| macOS 13 or newer, Intel | `library-manager_0.2.1_macos_x64_signed.dmg`, `library-manager_0.2.1_macos_x64_signed.app.zip` |
 
-Windows and macOS builds, signing, and macOS notarization are being validated. This table describes release targets; it does not establish package availability or completed notarization. Release notes will identify published packages, completed checks, and SHA-256 checksums.
+The release workflow requires successful checks for the exact source commit before publishing packages. macOS publication additionally requires verified application and DMG signatures, **Accepted** notarization, validated stapled tickets, and successful Gatekeeper assessments. The Windows MSI and EXE installers have **no Authenticode signature**.
 
-The Windows MSI and EXE installers are planned without Authenticode signing. The macOS packages must be signed and receive an **Accepted** notarization status; this validation is still pending for the final artifacts.
+Check `BUILD_MANIFEST.json` and `SHA256SUMS` on the release page for source and package provenance. The attached native test reports identify the Linux package and scenarios exercised; the macOS notarization reports record signature, notarization, stapling, and Gatekeeper checks for each architecture. These reports distinguish package checks from physical Windows 11, Mac, or ereader trials.
 
 ### Windows installation
 
-Once published, download the Windows x64 EXE or MSI from the release page and run it. The EXE uses NSIS and installs for the current user by default; the MSI uses WiX and installs for all users, requiring administrator permission. Launch **Library Manager** from the Start menu after installation.
+Download the Windows x64 EXE or MSI from the release page and run it. The EXE uses NSIS and installs for the current user by default; the MSI uses WiX and installs for all users, requiring administrator permission. Launch **Library Manager** from the Start menu after installation.
 
-The installer checks for Microsoft Edge WebView2. If it is missing, the default installation mode downloads and runs its bootstrapper silently, requiring Internet access. The Windows installer is therefore not a fully offline installer. These are the current [Tauri installer defaults](https://v2.tauri.app/reference/config/#nsisinstallermode) and [WebView2 installation mode](https://v2.tauri.app/reference/config/#webviewinstallmode); native package validation is still pending.
+The installer checks for Microsoft Edge WebView2. If it is missing, the default installation mode downloads and runs its bootstrapper silently, requiring Internet access. The Windows installer is therefore not a fully offline installer. See the [Tauri installer defaults](https://v2.tauri.app/reference/config/#nsisinstallermode) and [WebView2 installation mode](https://v2.tauri.app/reference/config/#webviewinstallmode).
 
 ### macOS installation
 
-macOS **13.0 or later** is required. Choose the **ARM64** package for Apple Silicon or the **x86_64** package for an Intel Mac. Once published, open the matching DMG, drag **Library Manager** into **Applications**, then launch it from that folder. The application ZIP is an alternative: extract it and move **Library Manager.app** into **Applications**. ARM64 and Intel packages are separate; they are not a universal application.
+macOS **13.0 or later** is required. Choose the **ARM64** package for Apple Silicon or the **x86_64** package for an Intel Mac. Open the matching DMG, drag **Library Manager** into **Applications**, then launch it from that folder. The application ZIP is an alternative: extract it and move **Library Manager.app** into **Applications**. ARM64 and Intel packages are separate; they are not a universal application.
 
 ### Linux installation
 
-Linux packages use **Ubuntu 22.04 with glibc 2.35** as their build baseline. They require glibc 2.35 or newer and compatible GTK/WebKit system libraries. The following commands use **0.2.1** package names, to be used once those packages are published and downloaded.
+Linux packages use **Ubuntu 22.04 with glibc 2.35** as their build baseline. They require glibc 2.35 or newer and compatible GTK/WebKit system libraries. Run the following commands from the directory containing the downloaded **0.2.1** package.
 
 On Debian, Ubuntu, and derivatives, install the downloaded DEB:
 
@@ -139,7 +139,7 @@ It needs no Calibre installation or Node, Rust, or Python runtime. Release asset
 
 Close Library Manager before upgrading. Closing its only window quits this version; there is no tray mode. Install the new package for the same architecture and, on Windows, use the same installer type as your previous installation. On macOS, replace the application in **Applications** with the matching new version. On Linux, install the new DEB/RPM with the package manager or replace the AppImage. Keep your library profile when replacing the application.
 
-Reopen Library Manager and check **Settings → About** and the version shown in the sidebar. For this planned release, both should show **0.2.1**. If an older version opens, check which installed copy or AppImage your shortcut launches.
+Reopen Library Manager and check **Settings → About** and the version shown in the sidebar. Both should show **0.2.1**. If an older version opens, check which installed copy or AppImage your shortcut launches.
 
 See [the validation report](docs/QUALITY.md) for the environments actually tested and the remaining limits.
 

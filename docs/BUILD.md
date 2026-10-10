@@ -2,7 +2,7 @@
 
 Library Manager embarque son moteur Rust, SQLite et le convertisseur MOBI. Calibre, Node.js, Rust et Python sont inutiles pour exécuter les paquets ; les bibliothèques système et les prérequis propres à chaque plateforme restent nécessaires.
 
-**La version 0.2.1 est en préparation.** Ce document décrit les commandes et contrôles du dépôt actuel, sans attester que les installateurs Windows/macOS sont publiés, signés ou notarisés. Les preuves de la version publiée 0.2.0 restent distinctes dans [QUALITY.md](QUALITY.md) et les [notes de livraison 0.2.0](https://github.com/QrCommunication/library-manager/releases/tag/v0.2.0).
+Ce document décrit la construction de **Library Manager 0.2.1** et ses conditions de publication. Les résultats du commit et des paquets retenus sont consignés dans `BUILD_MANIFEST.json`, les rapports natifs, les rapports de notarisation et `SHA256SUMS` sur la [page de livraison](https://github.com/QrCommunication/library-manager/releases/tag/v0.2.1). Les checkpoints de développement et les preuves historiques restent distincts dans [QUALITY.md](QUALITY.md).
 
 ## Outils et plateformes natives
 
@@ -46,6 +46,10 @@ L’adaptateur [secure_fs/windows.rs](../crates/library-core/src/secure_fs/windo
 Pour synchroniser un répertoire, l’adaptateur ouvre ce même objet avec `NtCreateFile`, un nom vide relatif au handle parent, `FILE_DIRECTORY_FILE`, le mode synchrone et le refus des points de réanalyse. Il demande `FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE`, contrôle à nouveau le type et l’identité, puis appelle `NtFlushBuffersFileEx` avec des flags nuls. Cette ouverture remplace `ReOpenFile`, qui renvoyait l’erreur 5 avant même l’appel de synchronisation. Les ACL et les droits de partage restent inchangés ; aucune réouverture par chemin absolu ni réussite fictive de synchronisation n’est introduite.
 
 La CI Windows du commit `8e37f8a` a compilé le sidecar MOBI, puis a enregistré **118 tests Rust réussis et 194 échoués**, notamment sur cette barrière commune de fichiers et de profil. Ce résultat ne valide pas les paquets Windows. La compilation croisée Windows GNU des tests du nouvel adaptateur et le formatage ont réussi ; les nouveaux tests couvrent les noms Unicode et d’un caractère, ainsi que la conservation de l’identité et des ACL lors de la barrière de répertoire. Leur exécution native Windows reste attendue avant livraison.
+
+L’inventaire Windows exécute trois requêtes CIM locales sur `MSFT_Disk`, `MSFT_Partition` et `MSFT_Volume`, puis joint leurs identités. Il conserve un délai global de dix secondes, 4 Mio de sortie au maximum, 128 volumes retournés et un contrôle strict des flags USB/amovible, système, démarrage et lecture seule. Les diagnostics n’exposent que cinq étapes fixes et leurs durées, sans identité de volume ni chemin. Le test natif exécute toujours l’inventaire réel ; une fixture PowerShell teste aussi les jointures et les réponses incomplètes.
+
+Le verrou du profil est acquis et son identité recontrôlée avant d’appliquer les permissions privées héritantes nécessaires à SQLite. Une seconde instance refusée ne modifie pas le profil actif. Les fixtures de montage Linux échappent les chemins Windows ; la fixture GVFS portable sépare le nom logique MTP de son chemin physique sans ajouter d’alias dans le détecteur de production. Les contrôles ciblés hôte enregistrent 22 tests Devices et dix tests Manager, ainsi que douze tests d’adaptateur Windows compilés en croisé. La CI du commit de livraison fournit la preuve Windows native.
 
 ### macOS
 
@@ -141,9 +145,11 @@ Pour le parcours signé, distinguer les contrôles suivants :
 3. Signature du DMG, soumission `notarytool submit --wait` et résultat JSON **`Accepted`**.
 4. Agrafage et validation du ticket du DMG avec `stapler`, puis contrôle `spctl --assess --type open --context context:primary-signature`.
 
-Sur le checkpoint `8e37f8a`, l’import du P12 et la signature Developer ID réussissent, mais la notarisation échoue avec HTTP 401 parce que les variables Apple ID vides sélectionnent le mauvais mode. La clé centrale a réussi des requêtes Apple en lecture seule avec HTTP 200 ; le nettoyage des variables doit encore être confirmé par la nouvelle CI. La présence de secrets ou la réussite de la compilation ne prouve aucun de ces résultats. `notarization-report.json` décrit les contrôles effectivement réussis pour le commit et les artefacts concernés. Un essai GUI macOS reste une preuve supplémentaire.
+Sur le checkpoint `8e37f8a`, l’import du P12 et la signature Developer ID réussissent, mais la notarisation échoue avec HTTP 401 parce que les variables Apple ID vides sélectionnent le mauvais mode. La clé centrale a réussi des requêtes Apple en lecture seule avec HTTP 200 ; le nettoyage des variables est ensuite confirmé sur le checkpoint macOS ARM `c599a68`, dont application et DMG passent les contrôles de notarisation, tickets et Gatekeeper. Les rapports des archives finales restent liés à leur propre commit. La présence de secrets ou la réussite de la compilation ne prouve aucun de ces résultats. `notarization-report.json` décrit les contrôles effectivement réussis pour le commit et les artefacts concernés. Un essai GUI macOS reste une preuve supplémentaire.
 
 ## Publication vérifiée depuis le tag
+
+Les scénarios natifs conservent leurs rapports JSON et les journaux du pilote, de Xvfb, du scénario et de l’extraction AppImage dans un artefact de diagnostic GitHub pendant sept jours, après succès comme après échec. La copie précède le nettoyage du conteneur ; aucun profil ni base de bibliothèque ne fait partie de cette collecte. Ces diagnostics restent séparés des archives publiques.
 
 Le workflow [release.yml](../.github/workflows/release.yml) publie les artefacts construits par les CI du **commit exact du tag**. Il se déclenche au push d’un tag stable `vX.Y.Z`. Le déclenchement manuel accepte également un tag existant, avec les mêmes contrôles. Son exécution complète reste à valider pour la livraison 0.2.1 ; la présence du workflow ne prouve pas une publication réussie.
 

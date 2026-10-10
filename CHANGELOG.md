@@ -2,7 +2,7 @@
 
 Les notes détaillées sont en français, suivies d’un résumé en anglais.
 
-## 0.2.1 — En préparation / In preparation
+## 0.2.1 — 2026-10-10
 
 ### Français
 
@@ -13,8 +13,8 @@ Les notes détaillées sont en français, suivies d’un résumé en anglais.
 - Retrait confirmé du catalogue local avec contrôle de révision et reçu de demande idempotent : une répétition de la même demande ne crée pas de retrait ou d’historique en double. Les originaux, variantes et copies sur les appareils sont conservés ; l’historique permet une annulation avec vérification des fichiers et des collisions.
 - Accès à une proposition conservé après une édition personnelle et son annulation, sans devoir recharger l’application. Les actualisations préservent les brouillons et le focus ; les livres sélectionnés dans l’assistant ouvrent une fiche fraîche.
 - Inspection des vrais fichiers de l’édition avec vérification de leur intégrité et extraits bornés de pages de titre, de copyright et de chapitre. Les corrections de l’assistant restent limitées aux livres sélectionnés, avec permission consommée pour une seule demande ; une inspection partielle ne constitue pas une lecture intégrale.
-- Préparation des installateurs natifs Windows x64 et macOS Intel/Apple Silicon, avec minimum macOS 13. Corrections de la liaison statique du moteur MOBI Windows et de la conversion du certificat Apple pour le trousseau temporaire. Le pipeline contrôle séparément signature, notarisation et Gatekeeper ; la CI finale et les paquets restent à valider, sans annonce de livraison ni de notarisation accomplie.
-- Publication préparée depuis le commit exact du tag, avec contrôle des artefacts CI, licences, empreintes, parcours natifs Linux et téléchargements publics avant promotion comme dernière version. Les notices tierces utilisent désormais un inventaire canonique des dépendances de toutes les plateformes. L’exécution finale du workflow de publication reste attendue.
+- Installateurs natifs Windows x64 et macOS Intel/Apple Silicon, avec minimum macOS 13. Liaison statique du moteur MOBI Windows, publication relative aux handles et synchronisation réelle des répertoires. Une ouverture de profil refusée ne modifie plus les permissions du propriétaire actif. Le pipeline macOS sélectionne explicitement l’authentification API et contrôle séparément signature, notarisation et Gatekeeper.
+- Publication depuis le commit exact du tag, conditionnée aux CI réussies, au contrôle des artefacts, licences, empreintes et parcours natifs Linux. Les téléchargements publics doivent être vérifiés avant promotion comme dernière version. Les notices tierces utilisent un inventaire canonique des dépendances de toutes les plateformes ; les rapports de la livraison constituent les preuves finales de ses paquets.
 
 ### English summary
 
@@ -24,7 +24,7 @@ Shared bulk actions across library views support up to **200 books**, with provi
 
 Pending reviews remain accessible after personal edits and undo. Background refreshes preserve drafts and focus, and selected assistant books open fresh details. Inspection checks actual edition files and provides bounded title, copyright and chapter excerpts. Assistant write permission remains limited to one request and its selected books.
 
-Native Windows x64 and macOS Intel/Apple Silicon packaging is being prepared, targeting macOS 13 or later. Windows MOBI static linking and Apple certificate conversion have been corrected; final native CI and package validation are still pending. The release workflow binds packages to the exact tagged source, checks licenses, hashes and Linux native scenarios, and requires verified anonymous downloads before promotion to latest. Third-party notices now use a canonical dependency inventory across platforms. This entry does not claim publication or completed notarization.
+Native Windows x64 and macOS Intel/Apple Silicon packages target macOS 13 or later. Windows MOBI static linking, handle-relative publication and directory synchronization are corrected. A rejected second profile owner preserves the active owner’s permissions. Apple builds select the intended API authentication mode. The release workflow binds packages to the exact tagged source, checks licenses, hashes and Linux native scenarios, and requires verified anonymous downloads before promotion to latest. Third-party notices now use a canonical dependency inventory across platforms. Release manifests and validation reports record the final package evidence.
 
 ## 0.2.0 — 2026-10-10
 

@@ -1,10 +1,10 @@
 # Utiliser Library Manager
 
-Ce guide décrit les parcours de la **version 0.2.1 en préparation**. La disponibilité des paquets et les plateformes effectivement validées seront précisées lors de la publication.
+Ce guide décrit les parcours de la **version 0.2.1**. Téléchargez les paquets et consultez leurs rapports de validation sur la [page de livraison](https://github.com/QrCommunication/library-manager/releases/tag/v0.2.1). Le manifeste `BUILD_MANIFEST.json` relie les fichiers au commit testé ; `SHA256SUMS` permet de vérifier leurs empreintes.
 
 ## Installer ou mettre à jour
 
-Quand les paquets seront publiés, choisissez celui de votre système et de votre architecture. Pour une mise à jour, attendez la fin des tâches, puis fermez la fenêtre de Library Manager : cette fermeture quitte l’application. Installez la nouvelle version en conservant le profil et le dossier de bibliothèque existants.
+Choisissez le paquet de votre système et de votre architecture sur la page de livraison. Pour une mise à jour, attendez la fin des tâches, puis fermez la fenêtre de Library Manager : cette fermeture quitte l’application. Installez la nouvelle version en conservant le profil et le dossier de bibliothèque existants.
 
 | Système | Installation |
 | --- | --- |
@@ -12,7 +12,7 @@ Quand les paquets seront publiés, choisissez celui de votre système et de votr
 | **Windows 11 x64** | L’installateur **EXE** installe l’application pour l’utilisateur courant. Le **MSI** l’installe pour la machine et demande des droits administrateur. Si Microsoft Edge WebView2 Runtime manque, l’installateur télécharge son programme d’installation : une connexion Internet est alors nécessaire. |
 | **macOS 13 ou ultérieur** | Choisissez **ARM64** pour un Mac Apple Silicon ou **Intel/x64** pour un Mac Intel. Ouvrez le **DMG**, puis copiez Library Manager dans **Applications**. Le **ZIP de l’application** est une autre possibilité : extrayez-le et placez l’application dans Applications. |
 
-Les installateurs Windows prévus pour cette version ne sont pas signés avec Authenticode. Les contrôles de signature et de notarisation macOS restent à confirmer avant publication ; le présent guide ne vaut pas preuve de leur réussite.
+Les installateurs Windows ne sont pas signés avec Authenticode. La publication des paquets macOS exige une signature Developer ID, une notarisation `Accepted`, des tickets agrafés et une validation Gatekeeper. Leurs rapports de notarisation sur la page de livraison consignent ces contrôles ; un test GUI macOS ou Windows 11 sur une machine personnelle constitue une preuve distincte.
 
 Après installation, ouvrez Library Manager et vérifiez **0.2.1** dans **Paramètres → À propos** et dans la barre latérale. Pour une mise à jour, vérifiez également que votre bibliothèque habituelle est affichée avant de lancer de nouvelles opérations.
 

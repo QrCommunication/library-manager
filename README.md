@@ -2,7 +2,7 @@
 
 <img src="public/library-manager.png" width="96" height="96" alt="Library Manager" />
 
-**Votre bibliothèque, partout où vous lisez.** Application autonome pour organiser les livres numériques, lire les EPUB et préparer des fichiers adaptés aux liseuses. Les paquets Linux sont disponibles ; les installateurs Windows et macOS sont en préparation pour la version **0.2.1**.
+**Votre bibliothèque, partout où vous lisez.** Application autonome pour organiser les livres numériques, lire les EPUB et préparer des fichiers adaptés aux liseuses. Ce document décrit la version **0.2.1**.
 
 [English](README.en.md) · [Téléchargements](https://github.com/QrCommunication/library-manager/releases) · [Guide utilisateur](docs/USER_GUIDE.md) · [Architecture](docs/BLUEPRINT.md) · [Signaler un problème](https://github.com/QrCommunication/library-manager/issues)
 
@@ -79,22 +79,22 @@ La conversion de documents à mise en page complexe peut aplatir le style. Les a
 
 Le lecteur EPUB propose un sommaire et une position sauvegardée. Le contenu du livre est assaini et isolé, avec scripts et ressources distantes bloqués.
 
-## Installation
+## Télécharger 0.2.1
 
-La **version 0.2.1 est en préparation**. Sa [page de livraison v0.2.1](https://github.com/QrCommunication/library-manager/releases/tag/v0.2.1) sera disponible lors de la publication des paquets. La [version publiée v0.2.0](https://github.com/QrCommunication/library-manager/releases/tag/v0.2.0) reste disponible pour Linux.
+Consultez la [page de livraison v0.2.1](https://github.com/QrCommunication/library-manager/releases/tag/v0.2.1) pour les fichiers publiés, puis choisissez le paquet correspondant à votre système et à son architecture.
 
-| Plateforme ciblée en 0.2.1 | Paquets prévus |
+| Plateforme | Noms des paquets 0.2.1 |
 | --- | --- |
-| Linux x86_64 (64 bits) | DEB, RPM, AppImage |
-| Windows 11 x64 | Installateurs MSI et EXE |
-| macOS 13 ou ultérieur, Apple Silicon | DMG et application ARM64 |
-| macOS 13 ou ultérieur, Intel | DMG et application x86_64 |
+| Linux x86_64 (64 bits) | `library-manager_0.2.1_amd64.deb` · `library-manager-0.2.1-1.x86_64.rpm` · `library-manager_0.2.1_amd64.AppImage` |
+| Windows 11 x64 | `library-manager_0.2.1_windows_x64_unsigned.msi` · `library-manager_0.2.1_windows_x64_unsigned_setup.exe` |
+| macOS 13 ou ultérieur, Apple Silicon | `library-manager_0.2.1_macos_arm64_signed.dmg` · `library-manager_0.2.1_macos_arm64_signed.app.zip` |
+| macOS 13 ou ultérieur, Intel | `library-manager_0.2.1_macos_x64_signed.dmg` · `library-manager_0.2.1_macos_x64_signed.app.zip` |
 
-Les builds Windows et macOS, la signature et la notarisation macOS sont en cours de validation. Cette liste décrit les cibles de livraison, sans attester leur disponibilité ni une notarisation accomplie. Les notes de version préciseront les paquets publiés, les essais effectués et leurs sommes SHA-256.
+Avant l’installation, vérifiez l’empreinte du téléchargement dans **SHA256SUMS**. Consultez **BUILD_MANIFEST.json** et les rapports joints à la page de livraison pour le commit source, la provenance des paquets et les contrôles réalisés. Les notes de version précisent le périmètre des essais.
 
-Les installateurs Windows MSI et EXE sont prévus sans signature Authenticode. Les paquets macOS doivent être signés et obtenir le statut de notarisation **Accepted** ; cette validation reste attendue sur les artefacts finaux.
+Les installateurs Windows MSI et EXE n’ont pas de signature Authenticode. Pour macOS, la publication exige une signature Developer ID, une notarisation **Accepted**, un ticket agrafé aux paquets et une validation Gatekeeper. Vérifiez ces résultats dans les rapports de notarisation de chaque architecture.
 
-Les paquets Linux utilisent Ubuntu 22.04, avec glibc 2.35, comme base de compilation. Les commandes suivantes correspondent aux noms des paquets **0.2.1**, à utiliser une fois ceux-ci publiés et téléchargés.
+Les paquets Linux utilisent Ubuntu 22.04, avec glibc 2.35, comme base de compilation. Après le téléchargement, utilisez la commande correspondant à votre paquet.
 
 Debian, Ubuntu et dérivés :
 
@@ -125,21 +125,21 @@ APPIMAGE_EXTRACT_AND_RUN=1 ./library-manager_0.2.1_amd64.AppImage
 
 ### Windows
 
-Une fois les paquets publiés, téléchargez l’installateur **EXE x64** ou **MSI x64**, puis lancez-le. L’EXE installe l’application pour l’utilisateur courant ; le MSI l’installe pour la machine et demande des droits administrateur. Ces installateurs ne sont pas signés avec Authenticode : vérifiez leur provenance et leur SHA-256 sur la page de livraison.
+Téléchargez l’installateur **EXE x64** ou **MSI x64**, puis lancez-le. L’EXE installe l’application pour l’utilisateur courant ; le MSI l’installe pour la machine et demande des droits administrateur. Vérifiez la provenance et le SHA-256 de l’installateur sur la page de livraison.
 
 Si **Microsoft Edge WebView2 Runtime** manque, l’installateur télécharge son bootstrapper et lance son installation silencieuse. Une connexion Internet est alors nécessaire ; ces paquets ne sont pas des installateurs entièrement hors ligne. Lancez ensuite **Library Manager** depuis le menu Démarrer. Voir les [options d’installation Windows de Tauri](https://v2.tauri.app/distribute/windows-installer/).
 
 ### macOS
 
-**macOS 13 ou ultérieur** est requis. Choisissez **ARM64** pour un Mac Apple Silicon, ou **x86_64** pour un Mac Intel ; les deux applications sont distinctes. Une fois les paquets publiés, ouvrez le **DMG**, glissez **Library Manager** dans **Applications**, puis lancez-le depuis ce dossier. Le fichier **`.app.zip`** constitue une alternative : décompressez-le et placez l’application obtenue dans **Applications**.
+**macOS 13 ou ultérieur** est requis. Choisissez **ARM64** pour un Mac Apple Silicon, ou **x86_64** pour un Mac Intel ; les deux applications sont distinctes. Après le téléchargement, ouvrez le **DMG**, glissez **Library Manager** dans **Applications**, puis lancez-le depuis ce dossier. Le fichier **`.app.zip`** constitue une alternative : décompressez-le et placez l’application obtenue dans **Applications**.
 
-La signature et la notarisation des paquets finaux restent à valider pour la version 0.2.1. Consultez les notes de livraison avant de considérer ces contrôles comme accomplis.
+Consultez le rapport de notarisation correspondant à votre architecture sur la page de livraison avant l’installation.
 
 ### Mise à jour
 
 Fermez Library Manager : la fermeture de son unique fenêtre quitte l’application, sans la laisser active dans une icône de notification. Téléchargez le nouveau paquet pour la même plateforme et la même architecture. Sous Linux ou Windows, installez-le avec le même format de paquet ; sous macOS, remplacez l’application dans **Applications**. Pour une AppImage, remplacez le fichier utilisé pour la lancer.
 
-Rouvrez l’application et vérifiez la version dans **Paramètres → À propos**, également affichée en bas de la barre latérale. Après installation de la prochaine livraison, elle doit indiquer **0.2.1**. Cette mise à jour remplace l’application ; il n’est pas nécessaire de retirer les livres du catalogue ni de supprimer son profil local.
+Rouvrez l’application et vérifiez la version dans **Paramètres → À propos**, également affichée en bas de la barre latérale. Après installation du paquet 0.2.1, elle doit indiquer **0.2.1**. Cette mise à jour remplace l’application ; il n’est pas nécessaire de retirer les livres du catalogue ni de supprimer son profil local.
 
 Consultez le [rapport de qualité](docs/QUALITY.md) pour les vérifications effectuées et les limites des essais.
 

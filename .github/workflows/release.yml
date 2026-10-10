@@ -427,12 +427,38 @@ jobs:
               expected = dict(checksums)
               expected['SHA256SUMS'] = file_sha(ASSETS / 'SHA256SUMS')
               body = ('Library Manager ' + manifest['version'] + '\n\n'
-                      'Source commit: `' + commit + '`. Packages and checksums are bound to this commit in BUILD_MANIFEST.json.\n\n'
-                      'Linux DEB and extracted AppImage were tested with fresh synthetic profiles and no network. '
-                      'macOS ARM64 and Intel applications and disk images are signed, notarized, stapled, and assessed by Gatekeeper. '
-                      'Windows x64 MSI and NSIS packages are unsigned; the native sidecar dependency audit passed. '
-                      'Windows and macOS GUI operation is not covered by the Linux smoke tests.\n\n'
-                      'GPL-3.0 license, third-party notices, exact source archive, native test reports, and SHA256SUMS are attached.')
+                      '## Nouveautés\n\n'
+                      '- Revue persistante des métadonnées : les propositions validées restent résolues après un rafraîchissement '
+                      'ou un redémarrage. La validation explicite reste possible sans différence entre les champs.\n'
+                      '- Actions groupées communes à la bibliothèque, aux livres locaux des appareils et à l’assistant, '
+                      'jusqu’à 200 livres. L’analyse exige un fournisseur API sélectionné, configuré et prêt, avec un modèle renseigné.\n'
+                      '- Retrait confirmé et réversible du catalogue : originaux, variantes et copies sur les appareils sont conservés. '
+                      'L’annulation vérifie les fichiers et les conflits éventuels.\n'
+                      '- Autorisation de modification par l’assistant limitée à une demande et aux livres cochés. '
+                      'L’inspection vérifie les vrais fichiers et utilise des extraits bornés, dont les pages de copyright et d’édition ; '
+                      'elle ne constitue pas une lecture intégrale du livre.\n\n'
+                      '## Paquets et contrôles\n\n'
+                      'Neuf paquets : Linux x86_64 DEB, RPM et AppImage ; Windows x64 MSI et EXE NSIS sans signature Authenticode ; '
+                      'macOS ARM64 et Intel, chacun en DMG et .app.zip signés.\n\n'
+                      'Le DEB et le lanceur AppRun de l’AppImage extraite ont été testés dans Docker, avec des profils synthétiques '
+                      'neufs et sans réseau. Les rapports couvrent la bibliothèque, l’assistant et les actions de catalogue. '
+                      'Les applications et DMG macOS ont passé la signature Developer ID, la notarisation Accepted, '
+                      'l’agrafage des tickets et la validation Gatekeeper. L’audit des dépendances natives Windows est joint. '
+                      'Les essais GUI Windows et macOS, les appareils physiques et les appels IA payants restent hors du périmètre de cette QA.\n\n'
+                      'Commit exact : [' + commit + '](https://github.com/' + REPO + '/commit/' + commit + '). '
+                      'BUILD_MANIFEST.json lie les paquets, leurs empreintes et les contrôles à ce commit. '
+                      'Vérifiez les téléchargements avec SHA256SUMS. La licence GPL-3.0, les notices tierces, '
+                      'l’archive source exacte et les rapports sont joints.\n\n'
+                      '[Changelog ' + tag + '](https://github.com/' + REPO + '/blob/' + tag + '/CHANGELOG.md) · '
+                      '[Guide utilisateur](https://github.com/' + REPO + '/blob/' + tag + '/docs/USER_GUIDE.md)\n\n'
+                      '## English summary\n\n'
+                      'Persistent metadata review, shared bulk actions for up to 200 books, and reversible catalogue removal preserve '
+                      'originals, variants and device copies. Metadata analysis requires a ready API provider and a selected model. '
+                      'Assistant write permission covers one request and its selected books; actual-file inspection uses bounded excerpts. '
+                      'Nine packages cover Linux, unsigned Windows x64, and signed macOS ARM64/Intel. '
+                      'Attached reports bind checks to the exact source commit: fresh offline Docker tests for DEB and extracted AppRun, '
+                      'plus macOS Accepted notarization, signing, stapling and Gatekeeper checks. '
+                      'Physical-device tests, Windows/macOS GUI tests and paid AI calls are outside this QA scope.')
               if release is None:
                   release = api('/releases', 'POST', {'tag_name': tag, 'target_commitish': commit, 'name': 'Library Manager ' + manifest['version'],
                                                      'body': body, 'draft': True, 'prerelease': False, 'make_latest': 'false'})
@@ -573,16 +599,42 @@ jobs:
       - name: Exercise actual DEB and extracted AppImage without network
         run: |
           set -euo pipefail
+          container=''
+          cleanup_native_container() {
+            if [[ -z "$container" ]]; then return; fi
+            local cleanup_failed=0 stopped=false
+            # Only fixed diagnostic files from this synthetic, network-isolated
+            # container are retained; never copy its profile or library.
+            if ! timeout 20 docker stop --time 10 "$container" >/dev/null 2>&1; then
+              timeout 20 docker kill "$container" >/dev/null 2>&1 || true
+            fi
+            if [[ "$(timeout 20 docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null || true)" == false ]]; then
+              stopped=true
+            else
+              cleanup_failed=1
+            fi
+            for log in xvfb driver native-smoke appimage-extraction; do
+              destination="release-transport/qa/$scenario-$log.log"
+              if [[ "$stopped" != true ]]; then
+                printf '%s\n' 'Diagnostics unavailable: container stop could not be verified.' > "$destination"
+              elif ! timeout 20 docker cp "$container:/tmp/$log.log" "$destination" >/dev/null 2>&1; then
+                printf '%s\n' 'Diagnostic file unavailable in this scenario.' > "$destination"
+              fi
+            done
+            timeout 20 docker rm --force "$container" >/dev/null 2>&1 || cleanup_failed=1
+            container=''
+            return "$cleanup_failed"
+          }
+          trap cleanup_native_container EXIT
           for scenario in deb-general deb-assistant deb-catalogue appimage-general; do
             container="release-native-$scenario-${GITHUB_RUN_ID}"
             docker create --name "$container" --network none --mount "type=bind,src=$GITHUB_WORKSPACE/release-transport/qa,dst=/reports" library-manager-release-native "$scenario" >/dev/null
             test "$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$container")" = none
             if ! timeout 720 docker start --attach "$container"; then
-              docker rm --force "$container" >/dev/null
               exit 1
             fi
             test "$(docker inspect --format '{{.State.ExitCode}}' "$container")" = 0
-            docker rm "$container" >/dev/null
+            cleanup_native_container
           done
           python3 - <<'PY'
           import json
@@ -606,12 +658,14 @@ jobs:
           retention-days: 14
           compression-level: 0
 
-      - name: Keep native QA diagnostics when a check fails
-        if: failure()
+      - name: Keep native QA diagnostics for every outcome
+        if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: release-native-qa-diagnostics-${{ github.run_id }}
-          path: release-transport/qa/*.json
+          path: |
+            release-transport/qa/*.json
+            release-transport/qa/*.log
           if-no-files-found: ignore
           retention-days: 7
 

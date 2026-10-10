@@ -796,14 +796,14 @@ impl DeviceService {
                 let Ok(children) = fs::read_dir(&mount.mount_point) else {
                     continue;
                 };
-                for child in children.take(MAX_MOUNTS) {
-                    let child = child?;
-                    if !child.file_name().to_string_lossy().starts_with("mtp:host=") {
-                        continue;
-                    }
-                    let stable = format!("mtp:{}", child.file_name().to_string_lossy());
-                    self.insert_capability(&mut result, &mount, child.path(), stable)?;
-                }
+                self.insert_gvfs_children(
+                    &mut result,
+                    &mount,
+                    children.map(|child| {
+                        let child = child?;
+                        Ok((child.file_name(), child.path()))
+                    }),
+                )?;
             } else if mount.root == "/"
                 && !ignored_filesystem(&mount.filesystem)
                 && self
@@ -830,6 +830,40 @@ impl DeviceService {
             }
         }
         Ok(result)
+    }
+
+    /// Logical GVFS names identify the transport; paths remain filesystem capabilities.
+    /// Production supplies both from the same directory entry. Keeping this seam
+    /// explicit also permits portable fixtures without illegal Windows ':' names.
+    fn insert_gvfs_children(
+        &self,
+        result: &mut BTreeMap<String, MountCapability>,
+        mount: &MountEntry,
+        children: impl IntoIterator<Item = std::io::Result<(std::ffi::OsString, PathBuf)>>,
+    ) -> Result<()> {
+        if mount.filesystem != "fuse.gvfsd-fuse"
+            || !self.source.gvfs_roots.contains(&mount.mount_point)
+        {
+            return Ok(());
+        }
+        for child in children.into_iter().take(MAX_MOUNTS) {
+            let (name, path) = child?;
+            if !name.to_string_lossy().starts_with("mtp:host=") {
+                continue;
+            }
+            if path.parent() != Some(mount.mount_point.as_path()) {
+                return Err(AppError::InvalidInput(
+                    "GVFS child is outside its mounted root".into(),
+                ));
+            }
+            self.insert_capability(
+                result,
+                mount,
+                path,
+                format!("mtp:{}", name.to_string_lossy()),
+            )?;
+        }
+        Ok(())
     }
 
     fn insert_capability(
@@ -965,32 +999,72 @@ fn native_volumes() -> Result<Vec<NativeVolume>> {
 const WINDOWS_VOLUME_PROBE: &str = r#"
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-$result = @()
-foreach ($disk in @(Get-Disk)) {
-  if ($disk.IsBoot -or $disk.IsSystem) { continue }
-  foreach ($partition in @($disk | Get-Partition)) {
-    if (-not $partition.DriveLetter) { continue }
-    foreach ($volume in @($partition | Get-Volume)) {
-      if (($disk.BusType -ne 'USB') -and ($volume.DriveType -ne 'Removable')) { continue }
-      if (-not $volume.DriveLetter -or -not $volume.FileSystemType -or $volume.FileSystemType -eq 'Unknown') { continue }
-      $result += [pscustomobject]@{
-        driveLetter = [string]$volume.DriveLetter
-        volumeId = [string]$volume.UniqueId
-        diskId = [string]$disk.UniqueId
-        diskNumber = [uint32]$disk.Number
-        partitionNumber = [uint32]$partition.PartitionNumber
-        label = [string]$volume.FileSystemLabel
-        filesystem = [string]$volume.FileSystemType
-        readOnly = [bool]($disk.IsReadOnly -or $partition.IsReadOnly)
-        isBoot = [bool]$disk.IsBoot
-        isSystem = [bool]$disk.IsSystem
-        usb = [bool]($disk.BusType -eq 'USB')
-        removable = [bool]($volume.DriveType -eq 'Removable')
-        sizeBytes = [uint64]$volume.Size
-      }
-    }
-  }
+$clock = [System.Diagnostics.Stopwatch]::StartNew()
+function Write-ProbeStage([string]$stage) {
+  [Console]::Error.WriteLine(('library-manager-volume-probe:{0}:{1}' -f $stage, $clock.ElapsedMilliseconds))
 }
+Write-ProbeStage 'start'
+$namespace = 'root/Microsoft/Windows/Storage'
+# Three local read-only snapshots avoid Storage-module initialization and N+1
+# association queries for every disk/partition, including unrelated fixed disks.
+$disks = @(Get-CimInstance -Namespace $namespace -ClassName MSFT_Disk -Property Number,UniqueId,BusType,IsBoot,IsSystem,IsReadOnly -OperationTimeoutSec 8)
+Write-ProbeStage 'disks'
+$partitions = @(Get-CimInstance -Namespace $namespace -ClassName MSFT_Partition -Property DiskNumber,PartitionNumber,DriveLetter,IsReadOnly,IsBoot,IsSystem -OperationTimeoutSec 8)
+Write-ProbeStage 'partitions'
+$volumes = @(Get-CimInstance -Namespace $namespace -ClassName MSFT_Volume -Property DriveLetter,UniqueId,FileSystem,FileSystemLabel,DriveType,Size -OperationTimeoutSec 8)
+Write-ProbeStage 'volumes'
+if ($disks.Count -gt 4096 -or $partitions.Count -gt 4096 -or $volumes.Count -gt 4096) { throw 'Volume snapshot limit exceeded' }
+$diskByNumber = @{}
+foreach ($disk in $disks) {
+  if ($null -eq $disk.Number -or $diskByNumber.ContainsKey([string]$disk.Number)) { throw 'Ambiguous disk snapshot' }
+  $diskByNumber[[string]$disk.Number] = $disk
+}
+$partitionByLetter = @{}
+foreach ($partition in $partitions) {
+  $letter = [string]$partition.DriveLetter
+  if ([string]::IsNullOrEmpty($letter) -or $letter -eq [string][char]0) { continue }
+  if ($letter -notmatch '^[a-zA-Z]$' -or $partitionByLetter.ContainsKey($letter)) { throw 'Ambiguous partition snapshot' }
+  $partitionByLetter[$letter] = $partition
+}
+$result = @()
+foreach ($volume in $volumes) {
+  $letter = [string]$volume.DriveLetter
+  if ([string]::IsNullOrEmpty($letter) -or $letter -eq [string][char]0) { continue }
+  if ($letter -notmatch '^[a-zA-Z]$' -or $null -eq $volume.DriveType) { throw 'Invalid mounted volume' }
+  $removable = [uint32]$volume.DriveType -eq 2
+  $partition = $partitionByLetter[$letter]
+  if ($null -eq $partition) {
+    if ($removable) { throw 'Mounted removable volume has no partition' }
+    continue
+  }
+  $disk = $diskByNumber[[string]$partition.DiskNumber]
+  if ($null -eq $disk -or $null -eq $disk.BusType) { throw 'Mounted partition has no disk' }
+  $usb = [uint16]$disk.BusType -eq 7
+  if (-not $usb -and -not $removable) { continue }
+  foreach ($entry in @($disk, $partition)) {
+    if ($entry.IsBoot -isnot [bool] -or $entry.IsSystem -isnot [bool] -or $entry.IsReadOnly -isnot [bool]) { throw 'Incomplete disk safety properties' }
+  }
+  if ($disk.IsBoot -or $disk.IsSystem -or $partition.IsBoot -or $partition.IsSystem) { continue }
+  if ([string]::IsNullOrEmpty([string]$volume.FileSystem) -or $volume.FileSystem -eq 'Unknown') { continue }
+  if ([string]::IsNullOrEmpty([string]$disk.UniqueId) -or [string]::IsNullOrEmpty([string]$volume.UniqueId) -or $null -eq $partition.PartitionNumber -or $null -eq $volume.Size) { throw 'Incomplete mounted volume identity' }
+  $result += [pscustomobject]@{
+    driveLetter = $letter
+    volumeId = [string]$volume.UniqueId
+    diskId = [string]$disk.UniqueId
+    diskNumber = [uint32]$disk.Number
+    partitionNumber = [uint32]$partition.PartitionNumber
+    label = [string]$volume.FileSystemLabel
+    filesystem = [string]$volume.FileSystem
+    readOnly = [bool]($disk.IsReadOnly -or $partition.IsReadOnly)
+    isBoot = [bool]($disk.IsBoot -or $partition.IsBoot)
+    isSystem = [bool]($disk.IsSystem -or $partition.IsSystem)
+    usb = [bool]$usb
+    removable = [bool]$removable
+    sizeBytes = [uint64]$volume.Size
+  }
+  if ($result.Count -gt 128) { throw 'Mounted volume limit exceeded' }
+}
+Write-ProbeStage 'complete'
 ConvertTo-Json -InputObject @($result) -Depth 4 -Compress
 "#;
 
@@ -1089,6 +1163,24 @@ fn probe_limit() -> AppError {
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
+fn safe_probe_diagnostic(line: &str) -> Option<String> {
+    let line = line.trim_end_matches(['\r', '\n']);
+    let tail = line.strip_prefix("library-manager-volume-probe:")?;
+    let (stage, elapsed) = tail.split_once(':')?;
+    if !matches!(
+        stage,
+        "start" | "disks" | "partitions" | "volumes" | "complete"
+    ) || elapsed.is_empty()
+        || elapsed.len() > 5
+        || !elapsed.bytes().all(|byte| byte.is_ascii_digit())
+        || elapsed.parse::<u64>().ok()? > PROBE_TIMEOUT.as_millis() as u64
+    {
+        return None;
+    }
+    Some(format!("Mounted volume probe stage {stage}: {elapsed} ms"))
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
 fn run_probe(program: &Path, arguments: &[&str], deadline: std::time::Instant) -> Result<String> {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -1101,8 +1193,21 @@ fn run_probe(program: &Path, arguments: &[&str], deadline: std::time::Instant) -
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
+    if let Some(stderr) = child.stderr.take() {
+        // Bounded diagnostics contain no provider output, paths or identifiers.
+        // This reader ends when the subprocess exits or is killed at the deadline.
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(stderr.take(4096));
+            for line in reader.lines().map_while(std::result::Result::ok) {
+                if let Some(message) = safe_probe_diagnostic(&line) {
+                    eprintln!("{message}");
+                }
+            }
+        });
+    }
     let stdout = child
         .stdout
         .take()
@@ -1665,6 +1770,119 @@ mod tests {
     }
 
     #[test]
+    fn windows_probe_uses_bulk_snapshots_without_per_partition_queries() {
+        assert_eq!(WINDOWS_VOLUME_PROBE.matches("Get-CimInstance").count(), 3);
+        for command in ["Get-Disk", "Get-Partition", "Get-Volume"] {
+            assert!(!WINDOWS_VOLUME_PROBE.contains(command));
+        }
+        for class in ["MSFT_Disk", "MSFT_Partition", "MSFT_Volume"] {
+            assert!(WINDOWS_VOLUME_PROBE.contains(class));
+        }
+        assert_eq!(PROBE_TIMEOUT.as_secs(), 10);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_bulk_probe_joins_complete_snapshots_and_rejects_partial_results() {
+        let base = serde_json::json!({
+            "disks": [{"Number":2,"UniqueId":"usb-serial","BusType":7,
+                "IsBoot":false,"IsSystem":false,"IsReadOnly":false}],
+            "partitions": [{"DiskNumber":2,"PartitionNumber":1,"DriveLetter":"E",
+                "IsBoot":false,"IsSystem":false,"IsReadOnly":false}],
+            "volumes": [{"DriveLetter":"E","UniqueId":"volume-unique","FileSystem":"FAT32",
+                "FileSystemLabel":"Reader","DriveType":3,"Size":32_000_000}]
+        });
+        let execute = |fixture: &serde_json::Value| -> Result<Vec<NativeVolume>> {
+            // Execute the production PowerShell join/parser, replacing only the
+            // three OS queries with deterministic snapshots. No device is touched.
+            let script = format!(
+                r#"
+$fixture = ConvertFrom-Json -InputObject '{}'
+$script:calls = 0
+function Get-CimInstance {{
+  param([string]$Namespace,[string]$ClassName,[string[]]$Property,[uint32]$OperationTimeoutSec)
+  if ($Namespace -ne 'root/Microsoft/Windows/Storage' -or $OperationTimeoutSec -ne 8 -or $Property.Count -eq 0) {{ throw 'Invalid query contract' }}
+  $script:calls++
+  switch ($ClassName) {{
+    'MSFT_Disk' {{ return $fixture.disks }}
+    'MSFT_Partition' {{ return $fixture.partitions }}
+    'MSFT_Volume' {{ return $fixture.volumes }}
+    default {{ throw 'Unexpected query' }}
+  }}
+}}
+{}
+if ($script:calls -ne 3) {{ throw 'Incorrect query count' }}
+"#,
+                fixture.to_string().replace('\'', "''"),
+                WINDOWS_VOLUME_PROBE
+            );
+            let program = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+                .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+            let output = run_probe(
+                &program,
+                &[
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &script,
+                ],
+                std::time::Instant::now() + PROBE_TIMEOUT,
+            )?;
+            parse_windows_volumes(&output)
+        };
+        let original = execute(&base).unwrap();
+        assert_eq!(original.len(), 1);
+        assert_eq!(original[0].mount.options, ["rw"]);
+        for section in ["disks", "partitions"] {
+            let mut read_only = base.clone();
+            read_only[section][0]["IsReadOnly"] = true.into();
+            assert_eq!(execute(&read_only).unwrap()[0].mount.options, ["ro"]);
+        }
+        let mut internal = base.clone();
+        internal["disks"][0]["BusType"] = 17.into();
+        assert!(execute(&internal).unwrap().is_empty());
+        internal["volumes"][0]["DriveType"] = 2.into();
+        assert_eq!(execute(&internal).unwrap().len(), 1);
+        let mut boot = base.clone();
+        boot["partitions"][0]["IsBoot"] = true.into();
+        assert!(execute(&boot).unwrap().is_empty());
+        let mut missing_disk = base.clone();
+        missing_disk["disks"] = serde_json::json!([]);
+        assert!(execute(&missing_disk).is_err());
+        let mut missing_partition = internal.clone();
+        missing_partition["partitions"] = serde_json::json!([]);
+        assert!(execute(&missing_partition).is_err());
+        let mut unknown_readonly = base.clone();
+        unknown_readonly["partitions"][0]["IsReadOnly"] = serde_json::Value::Null;
+        assert!(execute(&unknown_readonly).is_err());
+        let mut unknown_identity = base.clone();
+        unknown_identity["volumes"][0]["UniqueId"] = "".into();
+        assert!(execute(&unknown_identity).is_err());
+        let empty = serde_json::json!({"disks":[],"partitions":[],"volumes":[]});
+        assert!(execute(&empty).unwrap().is_empty());
+    }
+
+    #[test]
+    fn probe_stage_diagnostics_do_not_copy_arbitrary_stderr() {
+        assert_eq!(
+            safe_probe_diagnostic("library-manager-volume-probe:disks:42\r\n"),
+            Some("Mounted volume probe stage disks: 42 ms".into())
+        );
+        for unsafe_line in [
+            "provider key or private path",
+            "library-manager-volume-probe:secret:42",
+            "library-manager-volume-probe:disks:42:private",
+            "library-manager-volume-probe:disks:-1",
+            "library-manager-volume-probe:disks:10001",
+            "library-manager-volume-probe:disks:",
+        ] {
+            assert!(safe_probe_diagnostic(unsafe_line).is_none());
+        }
+        assert!(safe_probe_diagnostic("library-manager-volume-probe:complete:10000").is_some());
+    }
+
+    #[test]
     fn windows_probe_filters_system_disks_and_preserves_readonly_volume_identity() {
         let mut row = windows_volume();
         let volumes = parse_windows_volumes(&serde_json::json!([row]).to_string()).unwrap();
@@ -2055,8 +2273,9 @@ mod tests {
     #[test]
     fn gvfs_only_indexes_mounted_mtp_children() {
         let fixture = Fixture::new();
-        let mtp = fixture.gvfs.join("mtp:host=Reader_SERIAL");
-        let remote = fixture.gvfs.join("sftp:host=remote");
+        // The logical GVFS transport name is not a legal Windows directory name.
+        let mtp = fixture.gvfs.join("mtp-child");
+        let remote = fixture.gvfs.join("remote-child");
         fs::create_dir_all(&mtp).unwrap();
         fs::create_dir_all(&remote).unwrap();
         fs::write(mtp.join("Mobile.txt"), b"mobile reader").unwrap();
@@ -2069,12 +2288,94 @@ mod tests {
             ),
         )
         .unwrap();
-        let devices = fixture.service.scan().unwrap();
-        assert_eq!(devices.len(), 1);
-        assert_eq!(devices[0].transport, DeviceTransport::Usb);
-        assert_eq!(
-            fixture.service.index(&devices[0].id).unwrap()[0].relative_path,
-            "Mobile.txt"
+        let mount = parse_mountinfo(&fs::read_to_string(&fixture.mountinfo).unwrap())
+            .unwrap()
+            .remove(0);
+        let mut capabilities = BTreeMap::new();
+        fixture
+            .service
+            .insert_gvfs_children(
+                &mut capabilities,
+                &mount,
+                [
+                    Ok(("mtp:host=Reader_SERIAL".into(), mtp.clone())),
+                    Ok(("sftp:host=remote".into(), remote.clone())),
+                ],
+            )
+            .unwrap();
+        assert_eq!(capabilities.len(), 1);
+        let capability = capabilities.values().next().unwrap();
+        assert_eq!(capability.path, mtp);
+        assert_eq!(capability.stable_identity, "mtp:mtp:host=Reader_SERIAL");
+        let mut selected_file =
+            open_device_file(&capability.path.join("Mobile.txt"), &capability.path).unwrap();
+        let mut contents = String::new();
+        selected_file.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "mobile reader");
+        assert!(!capability.path.join("Private.txt").exists());
+        // Linux/macOS can additionally exercise actual GVFS names through read_dir
+        // and the complete public indexing path; the common selection/read assertions
+        // above run on Windows as well, without skipping this test.
+        #[cfg(unix)]
+        {
+            fs::rename(&mtp, fixture.gvfs.join("mtp:host=Reader_SERIAL")).unwrap();
+            fs::rename(&remote, fixture.gvfs.join("sftp:host=remote")).unwrap();
+            let devices = fixture.service.scan().unwrap();
+            assert_eq!(devices.len(), 1);
+            assert_eq!(devices[0].transport, DeviceTransport::Usb);
+            assert_eq!(
+                fixture.service.index(&devices[0].id).unwrap()[0].relative_path,
+                "Mobile.txt"
+            );
+        }
+    }
+
+    #[test]
+    fn gvfs_selection_rejects_unmounted_roots_outside_children_and_links() {
+        let fixture = Fixture::new();
+        let mut mount = parse_mountinfo(&fs::read_to_string(&fixture.mountinfo).unwrap())
+            .unwrap()
+            .remove(0);
+        let child = fixture.gvfs.join("child");
+        fs::create_dir(&child).unwrap();
+        let mut found = BTreeMap::new();
+        fixture
+            .service
+            .insert_gvfs_children(
+                &mut found,
+                &mount,
+                [Ok(("mtp:host=Reader".into(), child.clone()))],
+            )
+            .unwrap();
+        assert!(found.is_empty());
+        mount.filesystem = "fuse.gvfsd-fuse".into();
+        mount.mount_point = fixture.gvfs.clone();
+        assert!(
+            fixture
+                .service
+                .insert_gvfs_children(
+                    &mut found,
+                    &mount,
+                    [Ok(("mtp:host=Reader".into(), fixture.card.clone()))]
+                )
+                .is_err()
+        );
+        let link = fixture.gvfs.join("link");
+        symlink(&fixture.card, &link).unwrap();
+        fixture
+            .service
+            .insert_gvfs_children(&mut found, &mount, [Ok(("mtp:host=Reader".into(), link))])
+            .unwrap();
+        assert!(found.is_empty());
+        assert!(
+            fixture
+                .service
+                .insert_gvfs_children(
+                    &mut found,
+                    &mount,
+                    [Err(std::io::Error::other("Enumeration failed"))]
+                )
+                .is_err()
         );
     }
 

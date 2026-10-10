@@ -1,10 +1,12 @@
 # Qualité et validations de Library Manager
 
-## Version 0.2.1 — validations Linux et portage natif en cours
+## Version 0.2.1 — construction et preuves de livraison
 
-État au 10 octobre 2026 : les actions groupées communes, la revue persistante des propositions et le retrait réversible du catalogue sont en cours de livraison, avec le portage natif Windows et macOS. Le commit `69641a0` a réussi sa validation globale Docker, la CI Linux et les parcours natifs Linux général, assistant, catalogue et AppRun extrait. Au checkpoint `8e37f8a`, la compilation du moteur C statique Windows réussit, mais les tests du moteur Rust échouent encore sur les primitives de fichiers ; macOS réussit ses tests et la signature, puis échoue à la notarisation. Les corrections Windows sont revues et compilées en croisé ; leur exécution native reste attendue. La correction d’authentification Apple est implémentée et testée localement ; sa validation native reste attendue. Les installateurs finaux et la publication publique de la 0.2.1 ne sont pas validés. Les résultats historiques des versions publiées restent conservés dans les sections suivantes.
+Les preuves finales de chaque paquet figurent sur la [page de livraison 0.2.1](https://github.com/QrCommunication/library-manager/releases/tag/v0.2.1) : `BUILD_MANIFEST.json` relie les archives au commit testé, `SHA256SUMS` contient leurs empreintes, et les rapports natifs et de notarisation consignent les contrôles exécutés. Le workflow exige la réussite des CI Linux, Windows, macOS ARM/Intel et CodeQL sur le commit exact avant publication, puis vérifie les téléchargements publics avant promotion comme dernière version.
 
-### Sources actuelles : tests ciblés et analyse statique
+Les résultats ci-dessous documentent les checkpoints de développement et leurs corrections. Ils restent liés à leurs commits ; ils ne remplacent pas les rapports des archives finales. Les installateurs Windows sont sans signature Authenticode. Les tests Windows s’exécutent sur un runner Windows Server et ne prouvent pas un parcours GUI sur Windows 11 personnel ; les validations macOS de signature et de notarisation sont distinctes d’un essai GUI.
+
+### Checkpoints du portage : tests ciblés et analyse statique
 
 | Périmètre ciblé | Résultat exécuté |
 | --- | --- |
@@ -91,7 +93,7 @@ Les **treize autotests** du générateur réussissent, notamment l’indépendan
 
 Trois tests ciblés de `build.rs` réussissent sur l’hôte Linux avec libtool : sélection de la bibliothèque statique lorsque la bibliothèque partagée est également présente, résolution de la dépendance transitive `libmobi.la` vers `uncompress` sans archive imbriquée ni dépendance dynamique, et vérification des prérequis Autotools figés. Le lien utilise exactement `-all-static` avec `LIBZ_LDFLAGS="-L/ucrt64/lib -lz"`, sans archive imbriquée. Au checkpoint `8e37f8a`, la compilation du moteur C statique Windows réussit ; cela ne valide pas les primitives de fichiers du moteur Rust ni les installateurs.
 
-### CI et paquets restant à valider
+### Checkpoints CI et corrections des plateformes
 
 La [CI Linux 38025145928](https://github.com/QrCommunication/library-manager/actions/runs/38025145928) du commit `69641a0` a réussi et produit les paquets utilisés par les parcours ci-dessus. La [CI native 38025145921](https://github.com/QrCommunication/library-manager/actions/runs/38025145921) a échoué : les notices différaient selon les sources optionnelles installées sur macOS, et la liaison Windows nécessitait une archive statique plutôt que `zlib1.dll`. Les corrections des notices et de la liaison statique sont présentes dans le checkpoint ultérieur `8e37f8a`, dont les limites natives sont décrites ci-dessous.
 
@@ -107,7 +109,20 @@ Le commit [8e37f8a87cca647b302d36c4b97749e186d968b8](https://github.com/QrCommun
 | macOS, signature | Réussie ; ce résultat ne prouve pas la notarisation |
 | macOS, notarisation | Échec HTTP 401 : Tauri 2.12.1 utilise le mode Apple ID avec des variables d’environnement vides. Le contrôle indépendant en lecture seule avec les identifiants centraux répond HTTP 200 ; le workflow transmet désormais les identifiants du mode choisi et supprime les variables du mode inutilisé, y compris leurs valeurs vides. Les fixtures des deux modes réussissent après reproduction de l’échec ; les contrôles Bash et actionlint réussissent. La validation native reste attendue |
 
-Les sources Windows corrigées remplacent les wrappers concernés par le renommage NT relatif au handle du parent et la synchronisation native du même répertoire, avec contrôles d’identité, refus des points de réanalyse et conservation des ACL. La revue finale rapporte `findings: []` ; douze tests Windows sont compilés en croisé GNU et Clippy réussit. Ces résultats **ne constituent pas une relance native Windows réussie** : la prochaine CI doit vérifier les corrections sur Windows. Les installateurs finaux Windows/macOS, l’acceptation Apple et les téléchargements publics de la 0.2.1 restent à valider ; aucune validation matérielle Windows n’est revendiquée.
+Les sources Windows corrigées remplacent les wrappers concernés par le renommage NT relatif au handle du parent et la synchronisation native du même répertoire, avec contrôles d’identité, refus des points de réanalyse et conservation des ACL. La revue finale rapporte `findings: []` ; douze tests Windows sont compilés en croisé GNU et Clippy réussit. Ces résultats de compilation croisée restent distincts de l’exécution Windows du checkpoint suivant et des rapports des archives finales. Aucune validation matérielle Windows n’est revendiquée.
+
+### Checkpoint `c599a68` et corrections de régression
+
+La [CI Linux 38029300580](https://github.com/QrCommunication/library-manager/actions/runs/38029300580) et les quatre analyses [CodeQL 38029300512](https://github.com/QrCommunication/library-manager/actions/runs/38029300512) réussissent sur `c599a68686f4e12acd993fc8778694fbdfff394e`. Le moteur Windows passe de 118 à **305 tests réussis**, avec neuf échecs et un test ignoré : les nouvelles opérations NT de publication et de synchronisation fonctionnent, mais les fixtures et le profil présentent les problèmes détaillés ci-dessous.
+
+Le [job macOS ARM 114146684051](https://github.com/QrCommunication/library-manager/actions/runs/38029300631/job/114146684051) réussit entièrement. Son ZIP CI a été téléchargé et comparé au digest GitHub `3c6df02175b49d5cd8e9d2128358c675fea786ceace2e1fd7edad4b45621973b` ; ses sept empreintes et ses licences correspondent. Son rapport confirme les neuf attestations de signature, équipe, tickets et Gatekeeper, avec notarisation DMG `Accepted`. Ce checkpoint précède les dernières corrections Windows ; il ne constitue pas l’archive de livraison finale.
+
+Les correctifs de régression suivants préservent les contrôles de production :
+
+- Le test d’ACL du répertoire utilise une politique dédiée sous `cfg(test)` ; le contrôleur public des fichiers continue à rejeter un répertoire. Les douze tests de l’adaptateur compilent pour Windows GNU et Clippy réussit.
+- La fixture `mountinfo` encode les antislashs, espaces, tabulations et sauts de ligne, sans modifier le parseur strict. Sept tests ciblés de fixture/import/indexation réussissent.
+- `lock_profile` applique la politique privée héritante après acquisition et contrôle d’identité du verrou. Une seconde instance rejetée ne modifie plus l’ACL du propriétaire actif. Trois tests de verrouillage réussissent, dont conservation des permissions, accès aux jobs et récupération par le propriétaire suivant.
+- La sélection GVFS distingue le nom logique MTP et son chemin physique dans la fixture portable, en conservant les contrôles de fichier. La sonde Windows utilise des snapshots Storage CIM groupés ; son délai maximal et ses validations strictes restent conservés. Les 22 tests Devices sur l’hôte et Clippy réussissent ; les tests PowerShell et d’inventaire réels de la CI établissent leur résultat natif.
 
 Voir [le guide utilisateur](USER_GUIDE.md), [le plan de livraison 0.2.1](RELEASE_0.2.1_PLAN.md) et [les environnements et commandes de construction](BUILD.md). Le plan distingue la construction, la signature, la notarisation et la vérification des paquets effectivement publiés.
 

@@ -868,10 +868,17 @@ enum PrivateAccess {
     ReadWrite,
     SqliteFile,
     SqliteDirectory,
+    #[cfg(test)]
+    Directory,
 }
 
 fn private_access_matches(file: &File, policy: PrivateAccess) -> Result<bool> {
-    let directory = matches!(policy, PrivateAccess::SqliteDirectory);
+    let directory = match policy {
+        PrivateAccess::SqliteDirectory => true,
+        #[cfg(test)]
+        PrivateAccess::Directory => true,
+        _ => false,
+    };
     let read_only = matches!(policy, PrivateAccess::ReadOnly);
     verify_kind(file, directory)?;
     let basic: FILE_BASIC_INFO = info(file, FileBasicInfo)?;
@@ -1502,13 +1509,18 @@ mod tests {
         let path = temporary.path().join("private");
         let created = open_dir(&path, true, AccessPolicy::Private).unwrap();
         let expected = identity(&created).unwrap();
-        assert!(is_private_read_write(&created).unwrap());
+        // Mutable-file validation must still reject a directory handle.
+        assert!(matches!(
+            is_private_read_write(&created),
+            Err(AppError::InvalidInput(_))
+        ));
+        assert!(private_access_matches(&created, PrivateAccess::Directory).unwrap());
         drop(created);
         let read_handle = open_dir(&path, false, AccessPolicy::Private).unwrap();
         for _ in 0..2 {
             sync_directory(&read_handle).unwrap();
             assert_eq!(identity(&read_handle).unwrap(), expected);
-            assert!(is_private_read_write(&read_handle).unwrap());
+            assert!(private_access_matches(&read_handle, PrivateAccess::Directory).unwrap());
         }
     }
 }
