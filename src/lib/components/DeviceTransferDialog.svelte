@@ -12,7 +12,7 @@
     profiles: readonly OptimizationProfile[];
     initialDeviceId?: string | null;
     onClose(): void;
-    onQueued?(job: Job): void;
+    onQueued?(job: Job, deviceId: string): void;
     onNotify?(message: string): void;
   }
 
@@ -63,7 +63,7 @@
       if (!disposed) busy = false;
     }
     if (disposed) return;
-    onQueued?.(queued);
+    onQueued?.(queued, id);
     onNotify?.(`${$t(`jobs.${queued.kind}`)} · ${$t(`jobs.${queued.status}`)}`);
     onClose();
   }

@@ -210,17 +210,45 @@ impl BookRepository {
         kind: &str,
         review_job_id: Option<&str>,
     ) -> Result<Book> {
+        let mut connection = self.database.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = self.update_audited_in_transaction(
+            &transaction,
+            book,
+            expected_revision,
+            file,
+            kind,
+            review_job_id,
+        )?;
+        transaction.commit()?;
+        Ok(updated)
+    }
+
+    /// Join the caller's transaction so metadata, review and job completion share one commit.
+    #[allow(clippy::too_many_arguments)] // Explicit audited inputs plus the caller-owned transaction.
+    pub(crate) fn update_audited_in_transaction(
+        &self,
+        connection: &Connection,
+        book: &Book,
+        expected_revision: u64,
+        file: Option<StoredFile>,
+        kind: &str,
+        review_job_id: Option<&str>,
+    ) -> Result<Book> {
+        if connection.is_autocommit() {
+            return Err(AppError::Conflict(
+                "Audited update requires a transaction".into(),
+            ));
+        }
         validate_id(kind)?;
         if let Some(id) = review_job_id {
             validate_id(id)?;
         }
-        let mut connection = self.database.connect()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut before = audit_snapshot(&transaction, &book.id)?;
+        let mut before = audit_snapshot(connection, &book.id)?;
         if before.book.revision != expected_revision || book.revision != expected_revision {
             return Err(AppError::RevisionConflict);
         }
-        let reviews = proposal_records(&transaction, &book.id)?;
+        let reviews = proposal_records(connection, &book.id)?;
         if let Some(id) = review_job_id {
             let target = reviews
                 .iter()
@@ -236,7 +264,7 @@ impl BookRepository {
             }
             require_pending_review(&target.result, expected_revision)?;
         }
-        let updated = persist_book(&transaction, book, expected_revision)?;
+        let updated = persist_book(connection, book, expected_revision)?;
         if let Some(file) = file {
             validate_file(&file)?;
             if file.file.book_id != book.id {
@@ -244,9 +272,9 @@ impl BookRepository {
                     "A variant belongs to a different book".into(),
                 ));
             }
-            insert_file(&transaction, &file)?;
+            insert_file(connection, &file)?;
         }
-        let mut after = audit_snapshot(&transaction, &book.id)?;
+        let mut after = audit_snapshot(connection, &book.id)?;
         let changed = !same_bibliographic_metadata(&before.book, &updated);
         for record in reviews {
             let explicit = review_job_id == Some(record.id.as_str());
@@ -289,10 +317,9 @@ impl BookRepository {
                 .reviews
                 .push(review_snapshot(&record.id, &record.result)?);
             after.reviews.push(review_snapshot(&record.id, &result)?);
-            write_review_result(&transaction, &record.id, &result)?;
+            write_review_result(connection, &record.id, &result)?;
         }
-        insert_operation(&transaction, kind, Some(&before), &after)?;
-        transaction.commit()?;
+        insert_operation(connection, kind, Some(&before), &after)?;
         Ok(updated)
     }
 
@@ -306,7 +333,7 @@ impl BookRepository {
         validate_book(book)?;
         let mut connection = self.database.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let before = audit_snapshot(&transaction, &book.id)?;
+        let mut before = audit_snapshot(&transaction, &book.id)?;
         if before.book.revision != expected_revision || book.revision != expected_revision {
             return Err(AppError::RevisionConflict);
         }
@@ -382,7 +409,21 @@ impl BookRepository {
                 return Err(AppError::Conflict("The managed file changed during organization".into()));
             }
         }
-        let after = audit_snapshot(&transaction, &book.id)?;
+        let mut after = audit_snapshot(&transaction, &book.id)?;
+        for record in proposal_records(&transaction, &book.id)? {
+            if review_state(&record.result) != Some("pending")
+                || record.result["review"]["reviewRevision"].as_u64() != Some(expected_revision)
+            {
+                continue;
+            }
+            let mut result = record.result.clone();
+            result["review"]["reviewRevision"] = JsonValue::from(updated.revision);
+            before
+                .reviews
+                .push(review_snapshot(&record.id, &record.result)?);
+            after.reviews.push(review_snapshot(&record.id, &result)?);
+            write_review_result(&transaction, &record.id, &result)?;
+        }
         insert_operation(&transaction, "organization", Some(&before), &after)?;
         transaction.commit()?;
         Ok(updated)
@@ -750,26 +791,51 @@ impl BookRepository {
         confidence: Option<f64>,
         expected_revision: u64,
     ) -> Result<()> {
+        let mut connection = self.database.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.set_metadata_status_in_transaction(
+            &transaction,
+            id,
+            status,
+            confidence,
+            expected_revision,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Return the revision actually committed by the caller, never an inferred later revision.
+    pub(crate) fn set_metadata_status_in_transaction(
+        &self,
+        connection: &Connection,
+        id: &str,
+        status: MetadataStatus,
+        confidence: Option<f64>,
+        expected_revision: u64,
+    ) -> Result<Book> {
+        if connection.is_autocommit() {
+            return Err(AppError::Conflict(
+                "Metadata publication requires a transaction".into(),
+            ));
+        }
         validate_id(id)?;
         validate_range(confidence, 0.0, 1.0, "metadata confidence")?;
         if expected_revision == 0 || expected_revision >= i64::MAX as u64 {
             return Err(AppError::InvalidInput("Invalid book revision".into()));
         }
-        let mut connection = self.database.connect()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current = get_book(&transaction, id)?;
+        let current = get_book(connection, id)?;
         if current.revision != expected_revision {
             return Err(AppError::RevisionConflict);
         }
         if current.metadata_status != status || current.metadata_confidence != confidence {
-            let changed = transaction.execute(
+            let changed = connection.execute(
                 "UPDATE books SET metadata_status=?1, metadata_confidence=?2, revision=revision+1, updated_at=?3 WHERE id=?4 AND revision=?5",
                 params![status.as_str(), confidence, now(), id, expected_revision as i64],
             )?;
-            require_changed(&transaction, id, changed)?;
+            require_changed(connection, id, changed)?;
+            rebase_pending_reviews(connection, id, current.revision, current.revision + 1)?;
         }
-        transaction.commit()?;
-        Ok(())
+        get_book(connection, id)
     }
 
     pub fn save_progress(&self, id: &str, location: &str, progress: f64) -> Result<()> {
@@ -2778,6 +2844,222 @@ mod tests {
         );
         assert_eq!(repository.get("book", &[])?, book);
         assert_eq!(review_job_result(&database, "review-job")?, original);
+        assert!(repository.operations()?.is_empty());
+        Ok(())
+    }
+
+    fn reviewed_relocation_fixture() -> Result<(
+        tempfile::TempDir,
+        Database,
+        BookRepository,
+        Book,
+        Vec<StoredFile>,
+    )> {
+        let (temporary, database, repository) = fixture()?;
+        let book = repository.insert(
+            "book",
+            metadata("Title", &["Author"], None, &[], "en"),
+            &[file(
+                "variant",
+                "book",
+                'b',
+                BookFormat::Mobi,
+                FileVariant::Converted,
+                120,
+            )],
+            None,
+        )?;
+        seed_review_job(&database, "pending-job", &book, false)?;
+        let mut relocated = repository.files(&book.id)?;
+        relocated[0].relative_path = "books/Author/Title - organized.mobi".into();
+        Ok((temporary, database, repository, book, relocated))
+    }
+
+    #[test]
+    fn transaction_helpers_roll_back_book_review_and_audit_with_their_caller() -> Result<()> {
+        let (_temporary, database, repository, book, _) = reviewed_relocation_fixture()?;
+        let original = review_job_result(&database, "pending-job")?;
+        let mut connection = database.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let status = repository.set_metadata_status_in_transaction(
+            &transaction,
+            &book.id,
+            MetadataStatus::NeedsReview,
+            Some(0.8),
+            book.revision,
+        )?;
+        assert_eq!(status.revision, book.revision + 1);
+        let stored: String = transaction.query_row(
+            "SELECT result_json FROM jobs WHERE id='pending-job'",
+            [],
+            |row| row.get(0),
+        )?;
+        let result: JsonValue = serde_json::from_str(&stored)?;
+        assert_eq!(result["review"]["reviewRevision"], status.revision);
+        let mut edited = status;
+        edited.notes = "Personal note within the publication transaction".into();
+        let updated = repository.update_audited_in_transaction(
+            &transaction,
+            &edited,
+            edited.revision,
+            None,
+            "personalUpdate",
+            None,
+        )?;
+        assert_eq!(updated.revision, book.revision + 2);
+        transaction.rollback()?;
+        assert_eq!(repository.get(&book.id, &[])?, book);
+        assert_eq!(review_job_result(&database, "pending-job")?, original);
+        assert!(repository.operations()?.is_empty());
+        assert!(
+            repository
+                .set_metadata_status_in_transaction(
+                    &connection,
+                    &book.id,
+                    MetadataStatus::NeedsReview,
+                    Some(0.8),
+                    book.revision,
+                )
+                .is_err()
+        );
+        assert!(
+            repository
+                .update_audited_in_transaction(
+                    &connection,
+                    &book,
+                    book.revision,
+                    None,
+                    "personalUpdate",
+                    None,
+                )
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn status_publication_reanchors_existing_reviews_and_returns_actual_revision() -> Result<()> {
+        let (_temporary, database, repository, book, _) = reviewed_relocation_fixture()?;
+        let legacy = seed_review_job(&database, "legacy-job", &book, true)?;
+        let mut connection = database.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = repository.set_metadata_status_in_transaction(
+            &transaction,
+            &book.id,
+            MetadataStatus::NeedsReview,
+            Some(0.8),
+            book.revision,
+        )?;
+        let unchanged = repository.set_metadata_status_in_transaction(
+            &transaction,
+            &book.id,
+            MetadataStatus::NeedsReview,
+            Some(0.8),
+            changed.revision,
+        )?;
+        assert_eq!(changed, unchanged);
+        transaction.commit()?;
+        assert_eq!(repository.get(&book.id, &[])?, changed);
+        let result = review_job_result(&database, "pending-job")?;
+        assert_eq!(result["review"]["sourceRevision"], book.revision);
+        assert_eq!(result["review"]["reviewRevision"], changed.revision);
+        assert_eq!(review_job_result(&database, "legacy-job")?, legacy);
+        Ok(())
+    }
+
+    #[test]
+    fn organization_reanchors_pending_review_and_undo_keeps_it_applicable() -> Result<()> {
+        let (_temporary, database, repository, book, relocated) = reviewed_relocation_fixture()?;
+        let legacy = seed_review_job(&database, "legacy-job", &book, true)?;
+        let original = review_job_result(&database, "pending-job")?;
+        let organized = repository.relocate_files_audited(&book, book.revision, &relocated)?;
+        let result = review_job_result(&database, "pending-job")?;
+        assert_eq!(result["review"]["reviewRevision"], organized.revision);
+        assert_eq!(result["proposal"], original["proposal"]);
+        assert_eq!(result["review"]["sourceRevision"], book.revision);
+        require_pending_review(&result, organized.revision)?;
+        assert_eq!(review_job_result(&database, "legacy-job")?, legacy);
+        let operation = repository.operations()?.remove(0);
+        repository.undo_audited(&operation.id)?;
+        let restored = repository.get(&book.id, &[])?;
+        let result = review_job_result(&database, "pending-job")?;
+        assert_eq!(result["review"]["state"], "pending");
+        assert_eq!(result["review"]["reviewRevision"], restored.revision);
+        assert_eq!(result["review"]["sourceRevision"], book.revision);
+        assert_eq!(review_job_result(&database, "legacy-job")?, legacy);
+        let mut reviewed = restored.clone();
+        reviewed.metadata_status = MetadataStatus::Verified;
+        repository.update_audited_with_review(
+            &reviewed,
+            restored.revision,
+            None,
+            "metadataUpdate",
+            Some("pending-job"),
+        )?;
+        assert_eq!(
+            review_job_result(&database, "pending-job")?["review"]["state"],
+            "applied"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn organized_book_can_apply_its_existing_metadata_proposal() -> Result<()> {
+        let (_temporary, database, repository, book, relocated) = reviewed_relocation_fixture()?;
+        let organized = repository.relocate_files_audited(&book, book.revision, &relocated)?;
+        let mut reviewed = organized.clone();
+        reviewed.title = "Proposed title".into();
+        reviewed.metadata_status = MetadataStatus::Verified;
+        let applied = repository.update_audited_with_review(
+            &reviewed,
+            organized.revision,
+            None,
+            "metadataUpdate",
+            Some("pending-job"),
+        )?;
+        assert_eq!(applied.title, "Proposed title");
+        let result = review_job_result(&database, "pending-job")?;
+        assert_eq!(result["review"]["state"], "applied");
+        assert_eq!(result["review"]["sourceRevision"], book.revision);
+        assert_eq!(result["review"]["resolvedRevision"], applied.revision);
+        Ok(())
+    }
+
+    #[test]
+    fn organization_undo_refuses_a_review_changed_after_its_commit() -> Result<()> {
+        let (_temporary, database, repository, book, relocated) = reviewed_relocation_fixture()?;
+        let organized = repository.relocate_files_audited(&book, book.revision, &relocated)?;
+        let operation = repository.operations()?.remove(0);
+        let mut result = review_job_result(&database, "pending-job")?;
+        result["review"]["state"] = JsonValue::from("dismissed");
+        database.connect()?.execute(
+            "UPDATE jobs SET result_json=? WHERE id='pending-job'",
+            [result.to_string()],
+        )?;
+        assert!(matches!(
+            repository.undo_audited(&operation.id),
+            Err(AppError::Conflict(_))
+        ));
+        assert_eq!(repository.get(&book.id, &[])?, organized);
+        assert_eq!(repository.files(&book.id)?, relocated);
+        assert_eq!(repository.operations()?[0].status, OperationStatus::Applied);
+        Ok(())
+    }
+
+    #[test]
+    fn organization_review_and_paths_roll_back_if_audit_insert_fails() -> Result<()> {
+        let (_temporary, database, repository, book, relocated) = reviewed_relocation_fixture()?;
+        let files = repository.files(&book.id)?;
+        let result = review_job_result(&database, "pending-job")?;
+        database.connect()?.execute_batch("CREATE TRIGGER reject_organization BEFORE INSERT ON operations WHEN NEW.kind='organization' BEGIN SELECT RAISE(ABORT,'fixture audit failure'); END;")?;
+        assert!(
+            repository
+                .relocate_files_audited(&book, book.revision, &relocated)
+                .is_err()
+        );
+        assert_eq!(repository.get(&book.id, &[])?, book);
+        assert_eq!(repository.files(&book.id)?, files);
+        assert_eq!(review_job_result(&database, "pending-job")?, result);
         assert!(repository.operations()?.is_empty());
         Ok(())
     }

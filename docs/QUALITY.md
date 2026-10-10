@@ -12,8 +12,12 @@
 | Façade de fichiers sécurisés | Huit tests réussis |
 | Stockage géré | 12 tests réussis |
 | Transfert | 11 tests réussis |
-| Manager | 26 tests réussis |
-| Service de bibliothèque | 24 tests réussis |
+| Tâches persistantes Jobs | 20 tests réussis, dont la publication atomique et les rollbacks |
+| Repository de livres | 31 tests réussis |
+| Manager | 29 tests réussis |
+| Service de bibliothèque | 29 tests réussis |
+| Enrichissement | 23 tests réussis |
+| Paramètres | Quatre tests réussis |
 | Conversion | 12 tests réussis, dont les conversions natives libmobi sur l’hôte Linux |
 | Appareils | 19 tests réussis |
 | Inventaire EPUB | Cinq tests réussis, avec lecture par fichier ouvert, limites et sources remplacées |
@@ -21,7 +25,7 @@
 | Interface | 53 tests réussis ; contrôle TypeScript/Svelte sans erreur ni avertissement |
 | Compilation croisée Windows | Neuf tests spécifiques compilés, **non exécutés** sur Windows |
 
-Ces suites ciblées portent sur les modifications du portage et leurs contrats ; leurs comptes ne sont pas à additionner pour annoncer une suite globale. L’exécution complète après les derniers ports reste en cours à cet état de la documentation. La compilation croisée ne prouve ni l’exécution des tests Windows, ni le comportement de sa GUI ou de ses installateurs.
+Ces suites ciblées portent sur le portage, les gardes métier et la publication atomique des analyses ; leurs comptes ne sont pas à additionner pour annoncer une suite globale. L’exécution complète après les derniers ports reste en cours à cet état de la documentation. La compilation croisée ne prouve ni l’exécution des tests Windows, ni le comportement de sa GUI ou de ses installateurs.
 
 ### Parcours natif local du catalogue
 
@@ -31,9 +35,17 @@ Le scénario vérifie les actions de métadonnées indisponibles sans fournisseu
 
 Cette preuve porte sur un **binaire local figé avant les derniers ports**. Elle ne porte pas sur le futur binaire final de CI, ne valide pas Windows ou macOS et ne doit pas être présentée comme un rapport de livraison publique. La validation native du binaire final reste à effectuer.
 
+### Baseline native CI R4 : défaut de cache reproduit
+
+Le scénario catalogue a été étendu pour vérifier l’accès à une proposition après une édition personnelle et son annulation, sans rechargement ni remontage de l’interface. La baseline utilise le binaire du DEB CI [e351629](https://github.com/QrCommunication/library-manager/commit/e3516290fcc0d3c988e9ef56959a715f52551690), SHA-256 `3d0270511da701bc8c6dca96abac6dc5bc70d38a85292b23eb795a91a3266252`, dans un profil synthétique neuf et un conteneur sans réseau externe.
+
+Les cinq premiers contrôles réussissent. Après l’édition officielle des notes et du favori, le livre est à la révision 2 et sa proposition reste durablement `pending`, avec `sourceRevision: 1` et `reviewRevision: 2`. Pourtant, après dix secondes, le DOM affiche deux cartes et zéro bouton **Examiner** sur les cartes, sans chargement en cours. Le bouton global reste visible. Le rapport R4 conserve l’échec `pendingReviewLibraryCacheStaleAfterPersonalEdit` ; le contrôle de validation sans différence et son contrôle imbriqué d’édition personnelle échouent sur cette même cause. Les étapes suivantes d’annulation personnelle et de retrait du catalogue ne sont pas atteintes.
+
+Cette baseline établit un défaut de cache de l’interface malgré un réancrage correct de la proposition persistée. Les sources ont été corrigées pour actualiser les tâches et leurs résultats lorsque la bibliothèque change. Le nouveau parcours natif sur le binaire final doit encore réussir avant de déclarer ce défaut résolu à l’exécution. La baseline indique zéro appel API payant et zéro écriture sur appareil physique ; elle n’est pas un rapport de livraison réussi.
+
 ### CI et paquets restant à valider
 
-Le checkpoint Linux incluant le correctif de calcul des empreintes [efd58c7](https://github.com/QrCommunication/library-manager/commit/efd58c7) a réussi. Ce checkpoint précède les derniers changements du portage ; il ne remplace pas la CI du commit final. Les paquets Windows et macOS, les parcours natifs finaux et la signature/notarisation macOS restent à valider. Aucune notarisation accomplie n’est revendiquée dans ce compte rendu.
+Le checkpoint Linux incluant le correctif de calcul des empreintes [efd58c7](https://github.com/QrCommunication/library-manager/commit/efd58c7) a réussi. Ce checkpoint précède les derniers changements du portage ; il ne remplace pas la CI du commit final. La CI finale Windows et macOS, leurs paquets, le parcours natif final après correction du cache et la signature/notarisation macOS restent à valider. Aucune notarisation accomplie n’est revendiquée dans ce compte rendu.
 
 Voir [le guide utilisateur](USER_GUIDE.md), [le plan de livraison 0.2.1](RELEASE_0.2.1_PLAN.md) et [les environnements et commandes de construction](BUILD.md). Le plan distingue la construction, la signature, la notarisation et la vérification des paquets effectivement publiés.
 

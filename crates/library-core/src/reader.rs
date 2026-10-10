@@ -481,7 +481,9 @@ mod tests {
     use super::*;
     use crate::{BookFile, BookMetadata, Database, ReadStatus, StoredFile};
     use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
-    use std::{collections::BTreeMap, fs};
+    use std::collections::BTreeMap;
+    #[cfg(unix)]
+    use std::fs;
     use tempfile::TempDir;
 
     fn png() -> Vec<u8> {

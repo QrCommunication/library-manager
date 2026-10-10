@@ -45,6 +45,8 @@ jobs:
             target: x86_64-apple-darwin
             bundles: app,dmg
     env:
+      # Keep Cargo's cache pruning away from Autotools' libmobi/tests directory.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/cargo
       CARGO_BUILD_JOBS: '2'
       CARGO_TERM_COLOR: always
       PYTHONUTF8: '1'
@@ -81,7 +83,8 @@ jobs:
       - name: Cache Rust build dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: '. -> target'
+          workspaces: '. -> target/cargo'
+          prefix-key: v1-isolated-rust
           key: ${{ matrix.target }}
           cache-on-failure: true
 
@@ -147,6 +150,24 @@ jobs:
               if os.environ['PACKAGE_PLATFORM'] == 'macos':
                   stream.write('MACOSX_DEPLOYMENT_TARGET=13.0\n')
           PY
+
+      - name: Fingerprint the native sidecar compiler
+        id: sidecar-compiler
+        run: |
+          python - <<'PY'
+          import hashlib, os, subprocess
+          from pathlib import Path
+          compiler = str(Path(os.environ['LIBRARY_MANAGER_MSYS2_ROOT']) / 'ucrt64/bin/gcc.exe') if os.environ['PACKAGE_PLATFORM'] == 'windows' else 'cc'
+          version = subprocess.check_output([compiler, '--version'])
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as stream:
+              stream.write(f"sha256={hashlib.sha256(version).hexdigest()}\n")
+          PY
+
+      - name: Cache the separately validated native MOBI engine
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/libmobi-${{ matrix.target }}
+          key: libmobi-v1-${{ matrix.target }}-${{ steps.sidecar-compiler.outputs.sha256 }}-${{ hashFiles('src-tauri/build.rs', 'vendor/libmobi-0.12/**') }}
 
       - name: Select a private canonical macOS temporary directory
         if: runner.os == 'macOS'
@@ -311,7 +332,7 @@ jobs:
               if result.returncode:
                   raise SystemExit('macOS signature, notarization or Gatekeeper verification failed; sensitive output is withheld')
               return result
-          bundle = Path('target') / os.environ['PACKAGE_TARGET'] / 'release/bundle'
+          bundle = Path(os.environ['CARGO_TARGET_DIR']) / os.environ['PACKAGE_TARGET'] / 'release/bundle'
           apps, dmgs = list(bundle.glob('macos/*.app')), list(bundle.glob('dmg/*.dmg'))
           if len(apps) != 1 or len(dmgs) != 1:
               raise SystemExit('Expected exactly one application and one disk image')
@@ -356,7 +377,7 @@ jobs:
           destination = Path('artifacts')
           destination.mkdir(exist_ok=True)
           target, version, system, arch, mode = (os.environ[name] for name in ('PACKAGE_TARGET', 'PACKAGE_VERSION', 'PACKAGE_PLATFORM', 'PACKAGE_ARCH', 'SIGNING_MODE'))
-          bundle = Path('target') / target / 'release/bundle'
+          bundle = Path(os.environ['CARGO_TARGET_DIR']) / target / 'release/bundle'
           prefix = f'library-manager_{version}_{system}_{arch}_{mode}'
           assets = []
           if system == 'windows':

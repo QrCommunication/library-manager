@@ -321,7 +321,20 @@ mod tests {
         let (directory, service) = fixture();
         assert!(SettingsService::new(service.database.clone(), Path::new("relative")).is_err());
         let link = directory.path().join("redirect");
+        #[cfg(unix)]
         std::os::unix::fs::symlink(&service.library_root, &link).unwrap();
+        #[cfg(windows)]
+        {
+            // Directory junctions exercise the same refusal without requiring
+            // the privileged Windows symbolic-link creation capability.
+            let output = std::process::Command::new("cmd.exe")
+                .args(["/D", "/C", "mklink", "/J"])
+                .arg(&link)
+                .arg(&service.library_root)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "junction fixture creation failed");
+        }
         assert!(SettingsService::new(service.database.clone(), &link).is_err());
         let missing = directory.path().join("missing");
         assert!(SettingsService::new(service.database, &missing).is_err());

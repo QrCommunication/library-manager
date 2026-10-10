@@ -22,8 +22,11 @@ use uuid::Uuid;
 use crate::{
     AppError, Book, BookFile, BookFormat, BookMetadata, BookPage, BookPatch, BookQuery,
     BookRepository, ConversionReport, Converter, EpubDocument, FileVariant, LibraryFacets,
-    MetadataStatus, Operation, OptimizationReport, Result, Storage, StoredArtifact, StoredFile,
+    MetadataProposal, MetadataStatus, Operation, OptimizationReport, Result, Storage,
+    StoredArtifact, StoredFile,
     epub::inspect_for_import,
+    jobs::{ClaimedJob, JobService},
+    models::Job,
     optimizer,
     secure_fs::{AccessPolicy, SecureDir},
 };
@@ -54,6 +57,12 @@ struct UpdateContext<'a> {
     original_sha256: Option<&'a str>,
     inspected_file: Option<(&'a str, &'a str)>,
     review_job_id: Option<&'a str>,
+}
+
+struct PreparedUpdate {
+    book: Book,
+    file: Option<StoredFile>,
+    kind: &'static str,
 }
 
 impl LibraryService {
@@ -403,7 +412,188 @@ impl LibraryService {
             }
             self.read_verified_file(&file)?;
         }
-        let before_metadata = book_metadata(&before);
+        let prepared = self.prepare_update(&before, patch, &context)?;
+        if prepared.book == before && context.review_job_id.is_none() {
+            return Ok(self.decorate(before));
+        }
+        let result = self.check_cancelled().and_then(|()| {
+            self.repository.update_audited_with_review(
+                &prepared.book,
+                expected_revision,
+                prepared.file.clone(),
+                prepared.kind,
+                context.review_job_id,
+            )
+        });
+        match result {
+            Ok(book) => Ok(self.decorate(book)),
+            Err(error) => {
+                self.cleanup_uncommitted_variant(prepared.file.as_ref())?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Complete the book publication and its review receipt in the same SQLite
+    /// transaction. Notifications belong to the caller, after this gate drops.
+    #[allow(clippy::too_many_arguments)] // Explicit claim, admission and provenance are separate guards.
+    pub fn publish_enrichment(
+        &self,
+        jobs: &JobService,
+        claim: &ClaimedJob,
+        proposal: &MetadataProposal,
+        expected_revision: u64,
+        auto_apply: bool,
+        origin: &str,
+    ) -> Result<Job> {
+        let _guard = self
+            .gate
+            .lock()
+            .map_err(|_| invalid("Library operation is unavailable"))?;
+        self.check_cancelled()?;
+        if claim.cancellation.load(Ordering::Acquire) {
+            return Err(AppError::Cancelled);
+        }
+        if !matches!(origin, "manual" | "import" | "assistantReview")
+            || !proposal.confidence.is_finite()
+            || !(0.0..=1.0).contains(&proposal.confidence)
+            || proposal.patch.notes.is_some()
+            || proposal.patch.favorite.is_some()
+            || proposal.patch.rating.is_some()
+            || proposal.patch.read_status.is_some()
+            || (auto_apply && origin == "assistantReview")
+        {
+            return Err(invalid("Invalid bibliographic enrichment publication"));
+        }
+        // Bind the publication to the persisted human/job scope, rather than
+        // accepting a forged copy of ClaimedJob's public payload fields.
+        let payload = jobs.payload(&claim.job.id)?;
+        if payload != claim.payload
+            || payload.get("id").and_then(serde_json::Value::as_str)
+                != Some(proposal.book_id.as_str())
+            || payload
+                .get("origin")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("manual")
+                != origin
+        {
+            return Err(AppError::Conflict(
+                "Enrichment publication does not match its job".into(),
+            ));
+        }
+        let before = self.repository.get(&proposal.book_id, &[])?;
+        if before.revision != expected_revision {
+            return Err(AppError::RevisionConflict);
+        }
+        // Every publication is still bound to the registered immutable original.
+        // Stream its hash so a manually reviewed large source retains support.
+        let original = self
+            .repository
+            .files(&before.id)?
+            .into_iter()
+            .find(|file| file.file.variant == FileVariant::Original)
+            .ok_or_else(|| AppError::NotFound("Book original".into()))?;
+        let original_path = self.storage.resolve(&original.relative_path)?;
+        if fs::metadata(&original_path)?.len() != original.file.size_bytes
+            || !Storage::hash_file(&original_path)?.eq_ignore_ascii_case(&original.file.sha256)
+        {
+            return Err(AppError::Conflict(
+                "The registered book original changed".into(),
+            ));
+        }
+        let obsolete = origin == "import" && before.metadata_status == MetadataStatus::Verified;
+        // Normalize and validate even proposals that require human review, while
+        // preparing EPUB bytes only when admission permits automatic application.
+        apply_patch(before.clone(), &proposal.patch)?;
+        let prepared = if auto_apply && !obsolete {
+            Some(self.prepare_update(
+                &before,
+                &proposal.patch,
+                &UpdateContext {
+                    enrichment: Some((MetadataStatus::Verified, proposal.confidence)),
+                    ..UpdateContext::default()
+                },
+            )?)
+        } else {
+            None
+        };
+        let publication = self.check_cancelled().and_then(|()| {
+            jobs.complete_atomically(claim, |connection| {
+                let published = if let Some(prepared) = &prepared {
+                    if prepared.book == before && prepared.file.is_none() {
+                        self.repository.set_metadata_status_in_transaction(
+                            connection,
+                            &before.id,
+                            MetadataStatus::Verified,
+                            Some(proposal.confidence),
+                            expected_revision,
+                        )?
+                    } else {
+                        self.repository.update_audited_in_transaction(
+                            connection,
+                            &prepared.book,
+                            expected_revision,
+                            prepared.file.clone(),
+                            prepared.kind,
+                            None,
+                        )?
+                    }
+                } else if obsolete {
+                    self.repository.set_metadata_status_in_transaction(
+                        connection,
+                        &before.id,
+                        before.metadata_status,
+                        before.metadata_confidence,
+                        expected_revision,
+                    )?
+                } else {
+                    self.repository.set_metadata_status_in_transaction(
+                        connection,
+                        &before.id,
+                        MetadataStatus::NeedsReview,
+                        Some(proposal.confidence),
+                        expected_revision,
+                    )?
+                };
+                let state = if obsolete {
+                    "obsolete"
+                } else if prepared.is_some() {
+                    "applied"
+                } else {
+                    "pending"
+                };
+                let mut review = serde_json::json!({
+                    "state": state,
+                    "sourceRevision": expected_revision,
+                    "reviewRevision": published.revision,
+                });
+                if state != "pending" {
+                    review["resolvedRevision"] = serde_json::json!(published.revision);
+                }
+                Ok((
+                    (),
+                    serde_json::json!({"proposal": proposal, "review": review}),
+                ))
+            })
+        });
+        match publication {
+            Ok(((), completed)) => Ok(completed),
+            Err(error) => {
+                self.cleanup_uncommitted_variant(
+                    prepared.as_ref().and_then(|update| update.file.as_ref()),
+                )?;
+                Err(error)
+            }
+        }
+    }
+
+    fn prepare_update(
+        &self,
+        before: &Book,
+        patch: &BookPatch,
+        context: &UpdateContext<'_>,
+    ) -> Result<PreparedUpdate> {
+        let before_metadata = book_metadata(before);
         let mut updated = apply_patch(before.clone(), patch)?;
         let metadata_changed = book_metadata(&updated) != before_metadata;
         if let Some((status, confidence)) = context.enrichment {
@@ -413,25 +603,26 @@ impl LibraryService {
             updated.metadata_status = MetadataStatus::Verified;
             updated.metadata_confidence = None;
         }
-        if updated == before && context.review_job_id.is_none() {
-            return Ok(self.decorate(before));
-        }
-        let work = WorkDirectory::new()?;
         let mut catalog_only = false;
         let file = if metadata_changed {
+            let work = WorkDirectory::new()?;
             match self
-                .source_epub(id)
+                .source_epub(&before.id)
                 .and_then(|file| self.read_verified_file(&file))
             {
-                Ok(bytes) => {
-                    match self.normalized_variant(id, &book_metadata(&updated), &bytes, &work) {
-                        Ok(file) => file,
-                        Err(_) => {
-                            catalog_only = true;
-                            None
-                        }
+                Ok(bytes) => match self.normalized_variant(
+                    &before.id,
+                    &book_metadata(&updated),
+                    &bytes,
+                    &work,
+                ) {
+                    Ok(file) => file,
+                    Err(error @ AppError::Cancelled) => return Err(error),
+                    Err(_) => {
+                        catalog_only = true;
+                        None
                     }
-                }
+                },
                 Err(AppError::Unsupported(_)) => None,
                 Err(error) => return Err(error),
             }
@@ -448,14 +639,46 @@ impl LibraryService {
         } else {
             "personalUpdate"
         };
-        self.check_cancelled()?;
-        Ok(self.decorate(self.repository.update_audited_with_review(
-            &updated,
-            expected_revision,
+        Ok(PreparedUpdate {
+            book: updated,
             file,
             kind,
-            context.review_job_id,
-        )?))
+        })
+    }
+
+    fn cleanup_uncommitted_variant(&self, file: Option<&StoredFile>) -> Result<()> {
+        let Some(file) = file else {
+            return Ok(());
+        };
+        if file.file.variant == FileVariant::Original {
+            return Err(invalid(
+                "An original cannot be a publication cleanup target",
+            ));
+        }
+        match self.repository.file_by_id(&file.file.id) {
+            Ok(_) => return Ok(()), // A committed/reused artifact is never removed.
+            Err(AppError::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        self.read_verified_file(file)?;
+        let path = self.storage.resolve(&file.relative_path)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| invalid("Managed variant needs a directory"))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| invalid("Managed variant needs a name"))?;
+        let directory = SecureDir::open(parent, false, AccessPolicy::Private)?;
+        let artifact = directory.open_regular(name)?;
+        let identity = crate::secure_fs::identity(&artifact)?;
+        drop(artifact);
+        if !directory.remove_if_identity(name, identity)? {
+            return Err(AppError::Conflict(
+                "Uncommitted enrichment variant was replaced".into(),
+            ));
+        }
+        directory.sync()?;
+        Ok(())
     }
 
     fn read_verified_file(&self, file: &StoredFile) -> Result<Vec<u8>> {
@@ -751,7 +974,10 @@ impl LibraryService {
                 .iter()
                 .any(|existing| existing.file.id == file.file.id),
             Err(AppError::NotFound(_)) => false,
-            Err(error) => return Err(error),
+            Err(error) => {
+                self.cleanup_uncommitted_variant(Some(&file))?;
+                return Err(error);
+            }
         };
         Ok((!already_linked).then_some(file))
     }
@@ -1307,6 +1533,308 @@ mod tests {
             )),
         );
         (directory, service)
+    }
+
+    fn enrichment_claim(
+        directory: &TempDir,
+        book: &Book,
+        origin: &str,
+    ) -> (Database, JobService, ClaimedJob, MetadataProposal) {
+        let database = Database::new(&directory.path().join("database")).unwrap();
+        let jobs = JobService::new(database.clone());
+        jobs.enqueue(crate::JobKind::Enrich, serde_json::json!({"id":book.id,"bookIds":[book.id],"origin":origin,"baselineRevision":book.revision})).unwrap();
+        let claim = jobs.claim_next(1).unwrap().unwrap();
+        let proposal = MetadataProposal {
+            book_id: book.id.clone(),
+            patch: BookPatch {
+                title: Some("Reviewed edition".into()),
+                ..BookPatch::default()
+            },
+            confidence: 0.91,
+            model_id: "offline-fixture".into(),
+            ..MetadataProposal::default()
+        };
+        (database, jobs, claim, proposal)
+    }
+
+    fn managed_file_paths(root: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        for entry in fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files.extend(managed_file_paths(&path));
+            } else {
+                files.push(path);
+            }
+        }
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn enrichment_publication_reopens_manual_verified_review_and_notifies_after_gate_release() {
+        let (directory, service) = fixture();
+        let imported = service.import(&write_epub(&directory, false)).unwrap().book;
+        let verified = service
+            .update(
+                &imported.id,
+                &BookPatch {
+                    title: Some("Human verified".into()),
+                    ..BookPatch::default()
+                },
+                imported.revision,
+            )
+            .unwrap();
+        let (database, jobs, claim, proposal) = enrichment_claim(&directory, &verified, "manual");
+        let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_count = callbacks.clone();
+        let gate = service.gate.clone();
+        let jobs = jobs.with_event_callback(Arc::new(move |job| {
+            assert!(gate.try_lock().is_ok());
+            assert_eq!(job.status, crate::JobStatus::Completed);
+            callback_count.fetch_add(1, Ordering::Relaxed);
+        }));
+        let completed = service
+            .publish_enrichment(&jobs, &claim, &proposal, verified.revision, false, "manual")
+            .unwrap();
+        let book = service.get(&verified.id, &[]).unwrap();
+        assert_eq!(book.title, "Human verified");
+        assert_eq!(book.metadata_status, MetadataStatus::NeedsReview);
+        assert_eq!(completed.status, crate::JobStatus::Completed);
+        assert_eq!(completed.progress, 1.0);
+        let result = completed.result.as_ref().unwrap();
+        assert_eq!(result["review"]["state"], "pending");
+        assert_eq!(result["review"]["sourceRevision"], verified.revision);
+        assert_eq!(result["review"]["reviewRevision"], book.revision);
+        assert_eq!(callbacks.load(Ordering::Relaxed), 0);
+        let reopened = JobService::new(database);
+        assert_eq!(
+            reopened.get(&completed.id).unwrap().result,
+            completed.result
+        );
+        jobs.notify_committed(&completed);
+        assert_eq!(callbacks.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            service.publish_enrichment(&jobs, &claim, &proposal, book.revision, false, "manual"),
+            Err(AppError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn enrichment_publication_auto_applies_epub_and_receipt_together() {
+        let (directory, service) = fixture();
+        let book = service.import(&write_epub(&directory, false)).unwrap().book;
+        let originals = service.repository.files(&book.id).unwrap();
+        let original = originals
+            .iter()
+            .find(|file| file.file.variant == FileVariant::Original)
+            .unwrap();
+        let original_bytes = service.storage.read(&original.relative_path).unwrap();
+        let fingerprint = EpubDocument::from_bytes(&original_bytes, "fixture")
+            .unwrap()
+            .text_fingerprint()
+            .unwrap();
+        let (_, jobs, claim, proposal) = enrichment_claim(&directory, &book, "manual");
+        let completed = service
+            .publish_enrichment(&jobs, &claim, &proposal, book.revision, true, "manual")
+            .unwrap();
+        let updated = service.get(&book.id, &[]).unwrap();
+        assert_eq!(updated.title, "Reviewed edition");
+        assert_eq!(updated.metadata_status, MetadataStatus::Verified);
+        assert_eq!(
+            service.storage.read(&original.relative_path).unwrap(),
+            original_bytes
+        );
+        let normalized = service
+            .repository
+            .files(&book.id)
+            .unwrap()
+            .into_iter()
+            .find(|file| file.file.variant == FileVariant::Normalized)
+            .unwrap();
+        let epub = EpubDocument::from_bytes(
+            &service.storage.read(&normalized.relative_path).unwrap(),
+            "fixture",
+        )
+        .unwrap();
+        assert_eq!(epub.metadata.title, "Reviewed edition");
+        assert_eq!(epub.text_fingerprint().unwrap(), fingerprint);
+        let result = completed.result.unwrap();
+        assert_eq!(result["review"]["state"], "applied");
+        assert_eq!(result["review"]["sourceRevision"], book.revision);
+        assert_eq!(result["review"]["reviewRevision"], updated.revision);
+        assert_eq!(result["review"]["resolvedRevision"], updated.revision);
+        assert!(
+            service
+                .operations()
+                .unwrap()
+                .iter()
+                .any(|operation| operation.kind == "metadataUpdate")
+        );
+    }
+
+    #[test]
+    fn enrichment_publication_failure_rolls_back_book_files_receipt_and_cleans_prepared_variant() {
+        let (directory, service) = fixture();
+        let book = service.import(&write_epub(&directory, false)).unwrap().book;
+        let (database, jobs, claim, proposal) = enrichment_claim(&directory, &book, "manual");
+        let before_files = service.repository.files(&book.id).unwrap();
+        let before_paths = managed_file_paths(&directory.path().join("library"));
+        let before_operations = service.operations().unwrap();
+        database.connect().unwrap().execute_batch("CREATE TRIGGER reject_enrichment_completion BEFORE UPDATE ON jobs WHEN NEW.status='completed' BEGIN SELECT RAISE(ABORT,'fixture publication failure'); END;").unwrap();
+        assert!(matches!(
+            service.publish_enrichment(&jobs, &claim, &proposal, book.revision, true, "manual"),
+            Err(AppError::Database(_))
+        ));
+        assert_eq!(service.get(&book.id, &[]).unwrap(), book);
+        assert_eq!(service.repository.files(&book.id).unwrap(), before_files);
+        assert_eq!(service.operations().unwrap(), before_operations);
+        assert_eq!(
+            managed_file_paths(&directory.path().join("library")),
+            before_paths
+        );
+        let failed_publication = jobs.get(&claim.job.id).unwrap();
+        assert_eq!(failed_publication.status, crate::JobStatus::Running);
+        assert!(failed_publication.result.is_none());
+        assert!(!claim.cancellation.load(Ordering::Acquire));
+        database
+            .connect()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_enrichment_completion")
+            .unwrap();
+        assert_eq!(
+            service
+                .publish_enrichment(&jobs, &claim, &proposal, book.revision, true, "manual")
+                .unwrap()
+                .status,
+            crate::JobStatus::Completed
+        );
+    }
+
+    #[test]
+    fn enrichment_publication_rejects_stale_cancelled_forged_and_personal_changes() {
+        let (directory, service) = fixture();
+        let book = service.import(&write_epub(&directory, false)).unwrap().book;
+        let (_, jobs, claim, mut proposal) = enrichment_claim(&directory, &book, "assistantReview");
+        let before_paths = managed_file_paths(&directory.path().join("library"));
+        assert!(matches!(
+            service.publish_enrichment(
+                &jobs,
+                &claim,
+                &proposal,
+                book.revision,
+                true,
+                "assistantReview"
+            ),
+            Err(AppError::InvalidInput(_))
+        ));
+        proposal.patch.favorite = Some(true);
+        assert!(matches!(
+            service.publish_enrichment(
+                &jobs,
+                &claim,
+                &proposal,
+                book.revision,
+                false,
+                "assistantReview"
+            ),
+            Err(AppError::InvalidInput(_))
+        ));
+        proposal.patch.favorite = None;
+        let mut forged = claim.clone();
+        forged.payload["origin"] = serde_json::json!("manual");
+        assert!(matches!(
+            service.publish_enrichment(&jobs, &forged, &proposal, book.revision, false, "manual"),
+            Err(AppError::Conflict(_))
+        ));
+        let changed = service
+            .update(
+                &book.id,
+                &BookPatch {
+                    favorite: Some(true),
+                    ..BookPatch::default()
+                },
+                book.revision,
+            )
+            .unwrap();
+        assert!(matches!(
+            service.publish_enrichment(
+                &jobs,
+                &claim,
+                &proposal,
+                book.revision,
+                false,
+                "assistantReview"
+            ),
+            Err(AppError::RevisionConflict)
+        ));
+        jobs.cancel(&claim.job.id).unwrap();
+        assert!(matches!(
+            service.publish_enrichment(
+                &jobs,
+                &claim,
+                &proposal,
+                changed.revision,
+                false,
+                "assistantReview"
+            ),
+            Err(AppError::Cancelled)
+        ));
+        assert_eq!(service.get(&book.id, &[]).unwrap(), changed);
+        assert_eq!(
+            managed_file_paths(&directory.path().join("library")),
+            before_paths
+        );
+    }
+
+    #[test]
+    fn enrichment_publication_preserves_verified_imports_and_rejects_changed_originals() {
+        let (directory, service) = fixture();
+        let imported = service.import(&write_epub(&directory, false)).unwrap().book;
+        let verified = service
+            .update(
+                &imported.id,
+                &BookPatch {
+                    title: Some("Human edition".into()),
+                    ..BookPatch::default()
+                },
+                imported.revision,
+            )
+            .unwrap();
+        let (_, jobs, claim, proposal) = enrichment_claim(&directory, &verified, "import");
+        let completed = service
+            .publish_enrichment(&jobs, &claim, &proposal, verified.revision, true, "import")
+            .unwrap();
+        assert_eq!(service.get(&verified.id, &[]).unwrap(), verified);
+        assert_eq!(completed.result.unwrap()["review"]["state"], "obsolete");
+        let (_, jobs, claim, proposal) = enrichment_claim(&directory, &verified, "manual");
+        let original = service
+            .repository
+            .files(&verified.id)
+            .unwrap()
+            .into_iter()
+            .find(|file| file.file.variant == FileVariant::Original)
+            .unwrap();
+        replace_fixture_bytes(
+            &service.storage.resolve(&original.relative_path).unwrap(),
+            b"changed original",
+        );
+        assert!(matches!(
+            service.publish_enrichment(
+                &jobs,
+                &claim,
+                &proposal,
+                verified.revision,
+                false,
+                "manual"
+            ),
+            Err(AppError::Conflict(_))
+        ));
+        assert_eq!(service.get(&verified.id, &[]).unwrap(), verified);
+        assert_eq!(
+            jobs.get(&claim.job.id).unwrap().status,
+            crate::JobStatus::Running
+        );
     }
 
     fn seed_pending_review(directory: &TempDir, book: &Book) -> Database {

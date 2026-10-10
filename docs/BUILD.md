@@ -37,6 +37,8 @@ MSYS2 **UCRT64** sert uniquement à compiler le moteur MOBI compagnon. Installer
 
 Le build-script invoque explicitement Bash, GCC, `ar`, `ranlib` et `objdump` de cette installation. Les variables `CC` et le `PATH` UCRT64 restent dans les processus de compilation du sidecar ; ils ne remplacent pas la toolchain MSVC de l’application Rust. zlib et les bibliothèques MinGW nécessaires sont liées statiquement.
 
+Le checkout Windows peut donner aux prérequis Autotools un horodatage plus récent que leurs fichiers générés. Pour construire l’archive distribuée sans lancer une régénération avec `aclocal-1.16`, `build.rs` passe à GNU Make `--old-file` pour ces sept entrées : `aclocal.m4`, `configure`, `config.h.in`, `Makefile.in`, `src/Makefile.in`, `tools/Makefile.in` et `tests/Makefile.in`. `AM_MAKEFLAGS` transmet les mêmes options aux sous-`make`, car `-o` n’est pas propagé automatiquement. La présence de chaque entrée est contrôlée ; les sources C, objets, `config.status` et Makefiles de sortie conservent leurs dépendances normales. Les fichiers vendor et les empreintes du build ne sont pas modifiés. Cette version de libmobi ne fournit pas `AM_MAINTAINER_MODE` : ajouter `--disable-maintainer-mode` ne remplace pas ce traitement.
+
 L’audit `objdump` exige un exécutable PE x86_64 et refuse les DLL redistribuables MSYS, MinGW ou zlib. Seuls les imports système autorisés passent ce contrôle. Le rapport `sidecar-dependencies.log` accompagne les artefacts Windows ; il ne remplace pas un essai d’installation ou de GUI.
 
 ### macOS
@@ -88,7 +90,23 @@ pnpm tauri build --ci --target aarch64-apple-darwin --bundles app,dmg -- --locke
 pnpm tauri build --ci --target x86_64-apple-darwin --bundles app,dmg -- --locked
 ```
 
-Sans cible explicite, les bundles sont sous `target/release/bundle/` ; avec `--target`, sous `target/<cible>/release/bundle/`. Le moteur MOBI est inclus comme exécutable compagnon, avec le suffixe `.exe` sous Windows. Distribuer le paquet complet avec les licences, jamais l’exécutable principal seul.
+Sans définir `CARGO_TARGET_DIR`, les commandes de développement ci-dessus gardent leurs chemins habituels : `target/release/bundle/` sans cible explicite, et `target/<cible>/release/bundle/` avec `--target`. Le moteur MOBI est inclus comme exécutable compagnon, avec le suffixe `.exe` sous Windows. Distribuer le paquet complet avec les licences, jamais l’exécutable principal seul.
+
+### Répertoires et caches en CI
+
+Les workflows [Linux](../.github/workflows/ci.yml) et [Windows/macOS](../.github/workflows/desktop.yml) définissent `CARGO_TARGET_DIR` sur `${{ github.workspace }}/target/cargo`. La signature, les contrôles et la collecte des bundles utilisent ce répertoire explicitement.
+
+| Sortie | Chemin en CI |
+| --- | --- |
+| Bundles Linux, sans `--target` | `target/cargo/release/bundle/` |
+| Bundles Windows/macOS, avec `--target` | `target/cargo/<cible>/release/bundle/` |
+| Compilation C et cache local du moteur MOBI | `target/libmobi-<cible>/` |
+| Sidecar préparé pour Tauri | `src-tauri/binaries/library-manager-mobitool-<cible>`, avec `.exe` sous Windows |
+
+Cette séparation évite que le nettoyage de `Swatinem/rust-cache` traite `libmobi-<cible>/tests` comme un profil Rust, puis tente d’ouvrir ses sous-répertoires inexistants `target` et `trybuild`. Le cache Rust vise seulement `target/cargo`, utilise le préfixe `v1-isolated-rust` et peut être sauvegardé même si le job échoue (`cache-on-failure: true`).
+
+Le cache C utilise une action distincte sur `target/libmobi-<cible>`. Sa clé combine la cible, le hash de la version réelle du compilateur et le hash de `src-tauri/build.rs` et des sources `vendor/libmobi-0.12`. Avant toute réutilisation, [build.rs](../src-tauri/build.rs) contrôle encore l’empreinte complète du build et le SHA-256 du moteur ; les options, `SOURCE_DATE_EPOCH` et les dépendances de la toolchain restent pris en compte. Ce cache C standard se sauvegarde sur succès du job. La configuration du cache et une fixture locale ne prouvent pas qu’un cache GitHub a effectivement été restauré : vérifier les logs du run concerné pour établir cette réutilisation.
+
 
 `desktop.yml` vérifie le commit demandé, la concordance des versions, l’architecture de l’application et du sidecar, les licences, l’exécution du sidecar et les SHA-256 des artefacts. Il exporte `package-report.json` et `SHA256SUMS`. Les noms des artefacts distinguent plateforme, architecture et mode de signature. Le workflow ne publie pas lui-même une release GitHub.
 

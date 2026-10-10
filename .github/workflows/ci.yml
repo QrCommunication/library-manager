@@ -28,6 +28,8 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
+      # Cargo cache pruning must not traverse the separately built Autotools tree.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/cargo
       CARGO_BUILD_JOBS: '2'
       CARGO_TERM_COLOR: always
       APPIMAGE_EXTRACT_AND_RUN: '1'
@@ -60,7 +62,9 @@ jobs:
       - name: Cache Rust build dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: '. -> target'
+          workspaces: '. -> target/cargo'
+          prefix-key: v1-isolated-rust
+          cache-on-failure: true
 
       - name: Install Linux build libraries
         run: |
@@ -68,6 +72,22 @@ jobs:
           sudo apt-get install --no-install-recommends -y \
             build-essential pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev \
             librsvg2-dev libssl-dev libdbus-1-dev patchelf rpm file curl ca-certificates
+
+      - name: Fingerprint the native sidecar compiler
+        id: sidecar-compiler
+        run: |
+          python3 - <<'PY'
+          import hashlib, os, subprocess
+          version = subprocess.check_output(['cc', '--version'])
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as stream:
+              stream.write(f"sha256={hashlib.sha256(version).hexdigest()}\n")
+          PY
+
+      - name: Cache the separately validated native MOBI engine
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/libmobi-x86_64-unknown-linux-gnu
+          key: libmobi-v1-x86_64-unknown-linux-gnu-${{ steps.sidecar-compiler.outputs.sha256 }}-${{ hashFiles('src-tauri/build.rs', 'vendor/libmobi-0.12/**') }}
 
       - name: Install locked dependencies
         run: |
@@ -105,7 +125,7 @@ jobs:
       - name: Collect packages and corresponding source
         run: |
           mkdir -p artifacts
-          find target/release/bundle -type f \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \) -exec cp -- '{}' artifacts/ \;
+          find "$CARGO_TARGET_DIR/release/bundle" -type f \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \) -exec cp -- '{}' artifacts/ \;
           python3 - <<'PY'
           from pathlib import Path
           import subprocess

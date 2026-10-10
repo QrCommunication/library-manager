@@ -18,6 +18,32 @@ const CONFIGURE_ARGUMENTS: &[&str] = &[
     "--with-libxml2=no",
     "--disable-encryption",
 ];
+// The release archive already supplies these generated Autotools inputs. Git checkout
+// timestamps must not trigger their regeneration with the maintainer's exact tool versions.
+const MAINTAINER_GENERATED_INPUTS: &[&str] = &[
+    "aclocal.m4",
+    "configure",
+    "config.h.in",
+    "Makefile.in",
+    "src/Makefile.in",
+    "tools/Makefile.in",
+    "tests/Makefile.in",
+];
+const WINDOWS_MAKE_SCRIPT: &str = r#"set -eu
+export PATH=/ucrt64/bin:/usr/bin
+source_dir=$(/usr/bin/cygpath -u "$LIBRARY_MANAGER_MOBI_SOURCE")
+build_dir=$(/usr/bin/cygpath -u "$LIBRARY_MANAGER_MOBI_BUILD")
+make_arguments=(-j2)
+maintainer_flags=
+for relative in "$@"; do
+    generated="$source_dir/$relative"
+    make_arguments+=("--old-file=$generated")
+    printf -v escaped '%q' "$generated"
+    maintainer_flags+=" --old-file=$escaped"
+done
+cd "$build_dir"
+exec /usr/bin/make "${make_arguments[@]}" "AM_MAKEFLAGS=$maintainer_flags"
+"#;
 const TOOLCHAIN_VARIABLES: &[&str] = &[
     "CC",
     "CFLAGS",
@@ -125,6 +151,13 @@ impl Toolchain {
                 )
             }
             Self::Windows { root } => {
+                for relative in MAINTAINER_GENERATED_INPUTS {
+                    if !source.join(relative).is_file() {
+                        return Err(io::Error::other(format!(
+                            "The libmobi release is missing generated Autotools input: {relative}"
+                        )));
+                    }
+                }
                 // Only these child processes use MinGW. Cargo and the application remain MSVC.
                 let configure = r#"set -eu
 export PATH=/ucrt64/bin:/usr/bin
@@ -151,16 +184,20 @@ exec /usr/bin/bash "$source_dir/configure" "$@" --host=x86_64-w64-mingw32 --with
                     directory,
                     "configure",
                 )?;
-                let make = r#"set -eu
-export PATH=/ucrt64/bin:/usr/bin
-build_dir=$(/usr/bin/cygpath -u "$LIBRARY_MANAGER_MOBI_BUILD")
-cd "$build_dir"
-exec /usr/bin/make -j2
-"#;
+                // --old-file freezes only distributed generated inputs; C sources, objects,
+                // config.status and output Makefiles retain their real dependency rules.
+                // GNU make does not forward -o to recursive make, so AM_MAKEFLAGS carries it.
                 run_logged(
                     windows_shell(root, source, directory)?
                         .env("SOURCE_DATE_EPOCH", &epoch)
-                        .args(["--noprofile", "--norc", "-c", make]),
+                        .args([
+                            "--noprofile",
+                            "--norc",
+                            "-c",
+                            WINDOWS_MAKE_SCRIPT,
+                            "libmobi-make",
+                        ])
+                        .args(MAINTAINER_GENERATED_INPUTS),
                     directory,
                     "make",
                 )
@@ -451,4 +488,86 @@ fn ensure_success(output: &Output, step: &str) -> io::Result<()> {
         "Embedded MOBI build step {step} failed ({}): {detail}",
         output.status
     )))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_generated_inputs_stay_frozen_in_recursive_make() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("libmobi-make-{}-{unique}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let source = root.join("release");
+        let build = root.join("build");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&build).unwrap();
+        for relative in MAINTAINER_GENERATED_INPUTS {
+            let path = source.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "release-generated input").unwrap();
+        }
+        fs::write(source.join("source.c"), "int fixture(void) { return 0; }\n").unwrap();
+        let source_name = source.to_str().unwrap();
+        fs::write(build.join("Makefile"), format!(
+            "all: recurse\nMakefile: {source_name}/aclocal.m4\n{source_name}/aclocal.m4: FORCE\n\t@echo unexpected-maintainer >&2; false\nrecurse:\n\t$(MAKE) $(AM_MAKEFLAGS) -f child.mk all\n.PHONY: all recurse FORCE\n"
+        )).unwrap();
+        fs::write(build.join("child.mk"), format!(
+            "all: object.o\nchild.mk: {source_name}/src/Makefile.in\n{source_name}/src/Makefile.in: FORCE\n\t@echo unexpected-maintainer >&2; false\nobject.o: {source_name}/source.c\n\tcc -c {source_name}/source.c -o object.o\n.PHONY: all FORCE\n"
+        )).unwrap();
+        let red = Command::new("/usr/bin/make")
+            .arg("-j2")
+            .current_dir(&build)
+            .output()
+            .unwrap();
+        assert!(!red.status.success());
+        assert!(String::from_utf8_lossy(&red.stderr).contains("unexpected-maintainer"));
+        // Cygpath is the only Windows-specific operation; identity conversion lets native
+        // GNU make exercise the production argument propagation and real C compilation.
+        let script = WINDOWS_MAKE_SCRIPT.replace("/usr/bin/cygpath -u", "/usr/bin/printf %s");
+        let green = Command::new("/usr/bin/bash")
+            .args(["--noprofile", "--norc", "-c", &script, "libmobi-make"])
+            .args(MAINTAINER_GENERATED_INPUTS)
+            .env("LIBRARY_MANAGER_MOBI_SOURCE", &source)
+            .env("LIBRARY_MANAGER_MOBI_BUILD", &build)
+            .current_dir(&build)
+            .output()
+            .unwrap();
+        assert!(
+            green.status.success(),
+            "{}",
+            String::from_utf8_lossy(&green.stderr)
+        );
+        assert!(build.join("object.o").is_file());
+        for relative in MAINTAINER_GENERATED_INPUTS {
+            assert_eq!(
+                fs::read_to_string(source.join(relative)).unwrap(),
+                "release-generated input"
+            );
+        }
+        // An ordinary invalid C edit must still fail; only maintainer inputs are frozen.
+        fs::write(source.join("source.c"), "invalid C fixture syntax\n").unwrap();
+        fs::remove_file(build.join("object.o")).unwrap();
+        let invalid = Command::new("/usr/bin/bash")
+            .args(["--noprofile", "--norc", "-c", &script, "libmobi-make"])
+            .args(MAINTAINER_GENERATED_INPUTS)
+            .env("LIBRARY_MANAGER_MOBI_SOURCE", &source)
+            .env("LIBRARY_MANAGER_MOBI_BUILD", &build)
+            .current_dir(&build)
+            .output()
+            .unwrap();
+        assert!(!invalid.status.success());
+        assert!(!String::from_utf8_lossy(&invalid.stderr).contains("unexpected-maintainer"));
+    }
 }

@@ -647,6 +647,71 @@ def undo_catalogue_operation(driver, operation_id, report):
     require(result["status"] == "reverted", "catalogueUndoFailed")
 
 
+def pending_review_library_access(driver, book, report, phase):
+    """Observe App's live cache without reload/remount after a library mutation."""
+    def ready():
+        state = driver.execute("""
+const cover=[...document.querySelectorAll('.book-card .book-cover')].find(node=>node.getAttribute('aria-label')===arguments[0]);
+const card=cover?.closest('.book-card');
+const global=[...document.querySelectorAll('button')].find(node=>node.textContent.trim()==='Examiner les propositions');
+const visible=node=>!!node&&node.getBoundingClientRect().height>0&&!node.disabled;
+return {cards:document.querySelectorAll('.book-card').length,
+reviewActions:document.querySelectorAll('.review-action').length,
+targetReviewVisible:visible(card?.querySelector('.review-action')),
+globalReviewVisible:visible(global),busy:document.querySelector('main section.page')?.getAttribute('aria-busy')};
+""", [book["title"]])
+        report.setdefault("pendingReviewCache", {})[phase] = state
+        return state if (state["cards"] == 2 and state["reviewActions"] == 1
+                         and state["targetReviewVisible"] and state["globalReviewVisible"]
+                         and state["busy"] == "false") else False
+
+    driver.wait(ready, "pendingReviewLibraryCacheStaleAfter" + phase, 10)
+    require(driver.execute("const button=[...document.querySelectorAll('button')].find(node=>node.textContent.trim()==='Examiner les propositions');if(!button||button.disabled)return false;button.click();return true;"), "pendingGlobalReviewActionMissing")
+    driver.wait(lambda: (state if (state := title_field(driver)) and state["value"] == book["title"] else False), "pendingGlobalReviewOpenedWrongBook", 10)
+    driver.wait(lambda: driver.execute("return !!document.querySelector('section[aria-labelledby=metadata-proposal-title] button.button.primary:not(:disabled)');"), "pendingGlobalReviewNotApplicable", 10)
+    report["pendingReviewCache"][phase]["globalOpenedExpectedBook"] = True
+
+
+def pending_personal_review_smoke(driver, original, job_id, report):
+    """A personal edit and its official undo must keep the last proposal reachable."""
+    with checked(report, "pendingReviewRemainsReachableAfterPersonalEditAndUndo"):
+        before = driver.invoke("book_get", {"id": original["id"]})
+        before_files = driver.invoke("book_files", {"id": original["id"]})
+        source_revision = next(job["result"]["review"]["sourceRevision"] for job in driver.invoke("jobs_list") if job["id"] == job_id)
+        operation_ids = {operation["id"] for operation in driver.invoke("operations_list")}
+        updated = driver.invoke("book_update", {"id": original["id"], "patch": {
+            "notes": "Synthetic personal cache note", "favorite": not before["favorite"]},
+            "expectedRevision": before["revision"]})
+        require(updated["revision"] > before["revision"], "pendingPersonalEditRevisionDidNotAdvance")
+        driver.wait(lambda: (state if (state := title_field(driver)) and state["notes"] == "Synthetic personal cache note" else False), "pendingPersonalUpdateDidNotRefreshPanel", 10)
+        review = next(job["result"]["review"] for job in driver.invoke("jobs_list") if job["id"] == job_id)
+        require(review["state"] == "pending" and review["sourceRevision"] == source_revision
+                and review["reviewRevision"] == updated["revision"], "pendingPersonalReviewNotRebased")
+        click(driver, ".drawer-header button", "pendingPersonalPanelCloseMissing")
+        pending_review_library_access(driver, updated, report, "PersonalEdit")
+        operations = [operation for operation in driver.invoke("operations_list")
+                      if operation["id"] not in operation_ids and operation["reversible"]]
+        require(len(operations) == 1, "pendingPersonalUndoOperationAmbiguous")
+        undone = driver.invoke("operation_undo", {"id": operations[0]["id"]})
+        require(undone["status"] == "reverted", "pendingPersonalUndoFailed")
+        restored = driver.invoke("book_get", {"id": original["id"]})
+        require(restored["revision"] > updated["revision"]
+                and restored["notes"] == before["notes"] and restored["favorite"] == before["favorite"], "pendingPersonalUndoDidNotRestoreFields")
+        driver.wait(lambda: (state if (state := title_field(driver)) and state["notes"] == before["notes"] else False), "pendingPersonalUndoDidNotRefreshPanel", 10)
+        review = next(job["result"]["review"] for job in driver.invoke("jobs_list") if job["id"] == job_id)
+        require(review["state"] == "pending" and review["sourceRevision"] == source_revision
+                and review["reviewRevision"] == restored["revision"], "pendingUndoReviewNotRebased")
+        require(driver.invoke("book_files", {"id": original["id"]}) == before_files,
+                "pendingPersonalEditOrUndoChangedFiles")
+        click(driver, ".drawer-header button", "pendingUndoPanelCloseMissing")
+        pending_review_library_access(driver, restored, report, "Undo")
+        report["pendingReviewCache"].update({"sourceRevisionPreserved": True,
+                                            "reviewRevisionRebasedTwice": True,
+                                            "personalFieldsRestored": True, "activeFilesUnchanged": True,
+                                            "withoutReloadOrRemount": True})
+        return restored
+
+
 def catalogue_actions_smoke(driver, binary, profile, report):
     """All writes and fixture SQL are confined to a new synthetic profile."""
     with checked(report, "freshSyntheticCatalogueActionsProfile"):
@@ -751,9 +816,7 @@ def catalogue_actions_smoke(driver, binary, profile, report):
             fields = driver.execute("return document.querySelectorAll('.metadata-review .proposal-field').length;")
             require((fields > 0) if index == 0 else (fields == 0), "catalogueReviewDifferencePresentationWrong")
             if index == 1:
-                before = driver.invoke("book_update", {"id": original["id"], "patch": {"notes": "Synthetic personal note"}, "expectedRevision": before["revision"]})
-                driver.wait(lambda: (state if (state := title_field(driver)) and state["notes"] == "Synthetic personal note" else False), "personalUpdateDidNotRefreshPanel")
-                driver.wait(lambda: driver.execute("return !!document.querySelector('section[aria-labelledby=metadata-proposal-title] button.button.primary:not(:disabled)');"), "personalUpdateHidPendingProposal")
+                before = pending_personal_review_smoke(driver, original, fixture_jobs[index]["id"], report)
             click(driver, "section[aria-labelledby=metadata-proposal-title] button.button.primary", "catalogueReviewApplyMissing")
             applied = driver.wait(lambda: (current if (current := driver.invoke("book_get", {"id": original["id"]}))["revision"] > before["revision"] and current["metadataStatus"] == "verified" else False), "catalogueReviewNotPersisted")
             require(applied["title"] == ("Catalogue fixture reviewed title" if index == 0 else original["title"]), "catalogueReviewPatchMismatch")

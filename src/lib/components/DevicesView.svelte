@@ -11,6 +11,7 @@
     devices: Device[];
     selectedBookIds: string[];
     refreshVersion: number;
+    transferReceipts?: readonly { deviceId: string; job: Job }[];
     onDevicesChange(devices: Device[]): void;
     onNotify(message: string): void;
     onError(error: unknown): void;
@@ -24,7 +25,7 @@
     onClearSelection?(): void;
     onOpenSettings?(): void;
   }
-  let { devices, selectedBookIds, refreshVersion, onDevicesChange, onNotify, onError, metadataReady = false,
+  let { devices, selectedBookIds, refreshVersion, transferReceipts = [], onDevicesChange, onNotify, onError, metadataReady = false,
     metadataDisabledReason = null, transferReady = false, onOpenAssistant, onVerifySelected,
     onTransferSelected, onRemoveSelected, onClearSelection, onOpenSettings }: Props = $props();
   let pairDialog: HTMLDialogElement;
@@ -196,19 +197,28 @@
   }
   function applyJobs(jobs: Job[]): void {
     const latest = { ...inventories };
-    const updatedReceipts = Object.fromEntries(Object.entries(receipts).map(([id, previous]) => [id, jobs.find((job) => job.id === previous.id) ?? previous]));
-    for (const job of [...jobs].sort((left, right) => left.updatedAt.localeCompare(right.updatedAt))) {
-      if (job.kind === 'deviceIndex' && record(job.result) && typeof job.result.deviceId === 'string') {
-        const id = job.result.deviceId;
-        const previousReceipt = updatedReceipts[id];
-        if (!previousReceipt || job.updatedAt >= previousReceipt.updatedAt) updatedReceipts[id] = job;
+    const updatedReceipts = { ...receipts };
+    for (const job of [...jobs].sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.updatedAt.localeCompare(right.updatedAt))) {
+      if (job.kind === 'deviceIndex' || job.kind === 'transfer') {
+        const captured = transferReceipts.find((receipt) => receipt.job.id === job.id)?.deviceId;
+        const publicTarget = record(job.result) && typeof job.result.deviceId === 'string' ? job.result.deviceId : null;
+        const knownTarget = Object.entries(updatedReceipts).find(([, receipt]) => receipt.id === job.id)?.[0];
+        const id = captured ?? publicTarget ?? knownTarget;
+        if (id && (!captured || !publicTarget || captured === publicTarget) && devices.some((device) => device.id === id)) {
+          const previousReceipt = updatedReceipts[id];
+          if (!previousReceipt || (previousReceipt.id === job.id
+            ? job.updatedAt >= previousReceipt.updatedAt
+            : job.createdAt > previousReceipt.createdAt || (job.createdAt === previousReceipt.createdAt && job.updatedAt >= previousReceipt.updatedAt))) {
+            updatedReceipts[id] = job;
+          }
+        }
       }
       const snapshot = parseInventory(job);
       if (!snapshot || devices.some((device) => device.id === snapshot.deviceId && device.transport === 'usb')) continue;
       const previousInventory = latest[snapshot.deviceId];
       if (!previousInventory || snapshot.updatedAt >= previousInventory.updatedAt) latest[snapshot.deviceId] = snapshot;
       const previous = updatedReceipts[snapshot.deviceId];
-      if (!previous || (terminal(previous) && job.updatedAt >= previous.updatedAt)) updatedReceipts[snapshot.deviceId] = job;
+      if (!previous || (terminal(previous) && job.createdAt >= previous.createdAt && job.updatedAt >= previous.updatedAt)) updatedReceipts[snapshot.deviceId] = job;
     }
     inventories = latest;
     receipts = updatedReceipts;
@@ -248,6 +258,12 @@
   $effect(() => {
     void refreshVersion;
     untrack(() => { void refreshJobs(); });
+  });
+  $effect(() => {
+    const accepted = transferReceipts;
+    untrack(() => {
+      if (!disposed && accepted.length) applyJobs(accepted.map((receipt) => receipt.job));
+    });
   });
   onDestroy(() => {
     disposed = true;

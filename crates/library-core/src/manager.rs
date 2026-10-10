@@ -40,6 +40,12 @@ const INDEX_PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 const MAX_INDEX_BOOKS: usize = 500;
 const MAX_INDEX_RESULT_BYTES: usize = 768 * 1024;
 
+#[derive(Debug)]
+enum DispatchOutcome {
+    PendingCompletion(Value),
+    Committed(Box<Job>),
+}
+
 #[derive(Clone)]
 pub struct LibraryManager {
     pub library: LibraryService,
@@ -581,35 +587,56 @@ impl LibraryManager {
                 _ = cancelled(claim.cancellation.clone()) => Err(AppError::Cancelled),
             }
         };
+        self.settle_dispatch(&claim, outcome);
+    }
+
+    fn settle_dispatch(&self, claim: &ClaimedJob, outcome: Result<DispatchOutcome>) {
         match outcome {
-            Ok(result) if !claim.cancellation.load(Ordering::Acquire) => {
-                let _ = self.jobs.complete(&claim, result);
+            Ok(DispatchOutcome::Committed(job)) => {
+                // Atomic completion retires the claim token. Its true value means
+                // terminal publication here, rather than cancellation of the commit.
+                self.jobs.notify_committed(&job);
+                if let Some(result) = &job.result {
+                    let reason = if result["review"]["state"] == "applied" {
+                        "enrichment"
+                    } else {
+                        "metadataReview"
+                    };
+                    if let Some(id) = result["proposal"]["bookId"].as_str() {
+                        self.library_changed(vec![id.to_owned()], reason);
+                    }
+                }
             }
-            Ok(_) | Err(AppError::Cancelled) => {
+            Ok(DispatchOutcome::PendingCompletion(result))
+                if !claim.cancellation.load(Ordering::Acquire) =>
+            {
+                let _ = self.jobs.complete(claim, result);
+            }
+            Ok(DispatchOutcome::PendingCompletion(_)) | Err(AppError::Cancelled) => {
                 let _ = self.jobs.cancel(&claim.job.id);
             }
             Err(error) => {
                 let public = job_public_error(claim.job.kind, &error);
                 match public.code {
                     ErrorCode::ProviderNotConfigured | ErrorCode::SecretStoreUnavailable => {
-                        let _ = self.jobs.wait_for_configuration(&claim, public);
+                        let _ = self.jobs.wait_for_configuration(claim, public);
                     }
                     ErrorCode::NetworkUnavailable | ErrorCode::RateLimited => {
-                        let _ = self.jobs.wait_for_network(&claim, public);
+                        let _ = self.jobs.wait_for_network(claim, public);
                     }
                     _ => {
-                        let _ = self.jobs.fail(&claim, public);
+                        let _ = self.jobs.fail(claim, public);
                     }
                 }
             }
         }
     }
 
-    async fn dispatch(&self, claim: &ClaimedJob) -> Result<Value> {
+    async fn dispatch(&self, claim: &ClaimedJob) -> Result<DispatchOutcome> {
         check_cancelled(claim)?;
-        match claim.job.kind {
+        let result = match claim.job.kind {
             JobKind::Import => self.import_job(claim).await,
-            JobKind::Enrich => self.enrich_job(claim).await,
+            JobKind::Enrich => return self.enrich_job(claim).await,
             JobKind::Optimize => {
                 let payload: OptimizePayload = decode(&claim.payload)?;
                 let library = self
@@ -688,7 +715,8 @@ impl LibraryManager {
                 }
                 Ok(result)
             }
-        }
+        };
+        result.map(DispatchOutcome::PendingCompletion)
     }
     async fn import_job(&self, claim: &ClaimedJob) -> Result<Value> {
         let payload: ImportPayload = decode(&claim.payload)?;
@@ -813,7 +841,7 @@ impl LibraryManager {
         }
         Ok(!self.jobs.has_enrichment_for_book(&book.id)?)
     }
-    async fn enrich_job(&self, claim: &ClaimedJob) -> Result<Value> {
+    async fn enrich_job(&self, claim: &ClaimedJob) -> Result<DispatchOutcome> {
         let payload: EnrichPayload = decode(&claim.payload)?;
         if !matches!(
             payload.origin.as_str(),
@@ -823,7 +851,9 @@ impl LibraryManager {
         }
         let mut settings = self.settings.get()?;
         if payload.origin == "import" && !settings.auto_enrich {
-            return Ok(json!({"skipped":"autoEnrichmentDisabled","bookId":payload.id}));
+            return Ok(DispatchOutcome::PendingCompletion(
+                json!({"skipped":"autoEnrichmentDisabled","bookId":payload.id}),
+            ));
         }
         settings = self.configured_settings()?;
         if matches!(payload.origin.as_str(), "manual" | "assistantReview") {
@@ -847,75 +877,35 @@ impl LibraryManager {
         baseline: u64,
         automatic_allowed: bool,
         outcome: crate::enrichment::EnrichmentOutcome,
-    ) -> Result<Value> {
+    ) -> Result<DispatchOutcome> {
         check_cancelled(claim)?;
-        // Serialize proofs before changing the book; they remain intact in both review states.
-        let proposal = serde_json::to_value(&outcome.proposal)?;
-        let (review, reason) = if outcome.auto_applicable
+        let auto_apply = outcome.auto_applicable
             && automatic_allowed
             && outcome.expected_revision == baseline
-        {
-            let library = self
-                .library
-                .clone()
-                .with_cancellation(claim.cancellation.clone());
-            let id = payload.id.clone();
-            let patch = outcome.proposal.patch;
-            let applied = blocking(move || {
-                library.apply_enrichment(
-                    &id,
-                    &patch,
-                    outcome.expected_revision,
-                    MetadataStatus::Verified,
-                    outcome.proposal.confidence,
-                )
-            })
-            .await?;
-            (
-                json!({"state":"applied", "sourceRevision":outcome.expected_revision,
-                        "reviewRevision":applied.revision, "resolvedRevision":applied.revision}),
-                "enrichment",
+            && enrichment_may_apply(
+                &self.repository.get(&payload.id, &[])?,
+                baseline,
+                &payload.origin,
+            );
+        let library = self
+            .library
+            .clone()
+            .with_cancellation(claim.cancellation.clone());
+        let jobs = self.jobs.clone();
+        let claim = claim.clone();
+        let origin = payload.origin.clone();
+        let completed = blocking(move || {
+            library.publish_enrichment(
+                &jobs,
+                &claim,
+                &outcome.proposal,
+                outcome.expected_revision,
+                auto_apply,
+                &origin,
             )
-        } else {
-            let current = self.repository.get(&payload.id, &[])?;
-            if current.revision != outcome.expected_revision {
-                return Err(AppError::RevisionConflict);
-            }
-            if payload.origin == "import" && current.metadata_status == MetadataStatus::Verified {
-                // A recovered import must not reopen metadata already validated by its owner.
-                (
-                    json!({"state":"obsolete", "sourceRevision":outcome.expected_revision,
-                        "reviewRevision":current.revision,"resolvedRevision":current.revision}),
-                    "metadataReview",
-                )
-            } else {
-                let status_changes = current.metadata_status != MetadataStatus::NeedsReview
-                    || current.metadata_confidence != Some(outcome.proposal.confidence);
-                check_cancelled(claim)?;
-                self.repository.set_metadata_status_if_revision(
-                    &payload.id,
-                    MetadataStatus::NeedsReview,
-                    Some(outcome.proposal.confidence),
-                    outcome.expected_revision,
-                )?;
-                // The CAS increments only on a status/confidence change. A later read could
-                // observe somebody else's revision and incorrectly admit this old proposal.
-                let revision = outcome.expected_revision + u64::from(status_changes);
-                (
-                    json!({"state":"pending", "sourceRevision":outcome.expected_revision,
-                        "reviewRevision":revision}),
-                    "metadataReview",
-                )
-            }
-        };
-        let result = json!({"proposal":proposal,"review":review});
-        // The book commit has succeeded. Do not turn it into a failed/retryable application
-        // if the separate job write fails. execute_claim still attempts final publication.
-        if let Err(error) = self.jobs.update_result(claim, result.clone()) {
-            eprintln!("Enrichment result publication failed: {}", error.code());
-        }
-        self.library_changed(vec![payload.id.clone()], reason);
-        Ok(result)
+        })
+        .await?;
+        Ok(DispatchOutcome::Committed(Box::new(completed)))
     }
     async fn index_job(&self, claim: &ClaimedJob) -> Result<Value> {
         let payload: DevicePayload = decode(&claim.payload)?;
@@ -1734,6 +1724,190 @@ mod tests {
         }
     }
 
+    fn settle_test_publication(
+        manager: &LibraryManager,
+        claim: &ClaimedJob,
+        outcome: DispatchOutcome,
+    ) -> Value {
+        let DispatchOutcome::Committed(job) = outcome else {
+            panic!("Expected an atomic publication");
+        };
+        let result = job.result.clone().unwrap();
+        manager.settle_dispatch(claim, Ok(DispatchOutcome::Committed(job)));
+        result
+    }
+
+    #[tokio::test]
+    async fn committed_enrichment_notifies_once_with_durable_book_and_job_and_survives_callback_cancel()
+     {
+        let (_directory, mut manager, events, source) = fixture();
+        let book = manager.library.import(&source).unwrap().book;
+        let job = manager.enqueue_enrichment(&book, "manual").unwrap();
+        let claim = manager.jobs.claim_next(1).unwrap().unwrap();
+        let payload: EnrichPayload = decode(&claim.payload).unwrap();
+        let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_count = callbacks.clone();
+        let repository = manager.repository.clone();
+        let jobs = manager.jobs.clone();
+        manager.jobs = manager
+            .jobs
+            .clone()
+            .with_event_callback(Arc::new(move |job| {
+                assert_eq!(job.status, JobStatus::Completed);
+                let current = repository.get(&job.book_ids[0], &[]).unwrap();
+                assert_eq!(current.title, "Proposed title");
+                assert_eq!(current.metadata_status, MetadataStatus::Verified);
+                assert_eq!(jobs.get(&job.id).unwrap(), *job);
+                assert_eq!(
+                    job.result.as_ref().unwrap()["review"]["reviewRevision"],
+                    current.revision
+                );
+                assert_eq!(jobs.cancel(&job.id).unwrap().status, JobStatus::Completed);
+                callback_count.fetch_add(1, Ordering::Relaxed);
+            }));
+        events.lock().unwrap().clear();
+        let outcome = manager
+            .publish_enrichment(
+                &claim,
+                &payload,
+                book.revision,
+                true,
+                proposed_outcome(&book, true),
+            )
+            .await
+            .unwrap();
+        assert!(claim.cancellation.load(Ordering::Acquire));
+        assert_eq!(callbacks.load(Ordering::Relaxed), 0);
+        assert!(events.lock().unwrap().is_empty());
+        manager.settle_dispatch(&claim, Ok(outcome));
+        assert_eq!(callbacks.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            manager.jobs.get(&job.id).unwrap().status,
+            JobStatus::Completed
+        );
+        let changes: Vec<_> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, _)| name == "library:changed")
+            .cloned()
+            .collect();
+        assert_eq!(
+            changes,
+            vec![(
+                "library:changed".to_owned(),
+                json!({"bookIds":[book.id],"reason":"enrichment"})
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn personal_progress_between_atomic_commit_and_notification_keeps_pending_review_rebased()
+    {
+        let (_directory, manager, events, source) = fixture();
+        let book = manager.library.import(&source).unwrap().book;
+        let job = manager.enqueue_enrichment(&book, "manual").unwrap();
+        let claim = manager.jobs.claim_next(1).unwrap().unwrap();
+        let payload: EnrichPayload = decode(&claim.payload).unwrap();
+        let outcome = manager
+            .publish_enrichment(
+                &claim,
+                &payload,
+                book.revision,
+                true,
+                proposed_outcome(&book, false),
+            )
+            .await
+            .unwrap();
+        let pending = manager.book_get(&book.id).unwrap();
+        assert_eq!(
+            manager.jobs.get(&job.id).unwrap().status,
+            JobStatus::Completed
+        );
+        manager
+            .repository
+            .save_progress(&book.id, "section:0", 0.4)
+            .unwrap();
+        let current = manager.book_get(&book.id).unwrap();
+        assert!(current.revision > pending.revision);
+        let rebased = manager.jobs.get(&job.id).unwrap();
+        assert_eq!(
+            rebased.result.as_ref().unwrap()["review"]["state"],
+            "pending"
+        );
+        assert_eq!(
+            rebased.result.as_ref().unwrap()["review"]["sourceRevision"],
+            book.revision
+        );
+        assert_eq!(
+            rebased.result.as_ref().unwrap()["review"]["reviewRevision"],
+            current.revision
+        );
+        events.lock().unwrap().clear();
+        manager.settle_dispatch(&claim, Ok(outcome));
+        assert_eq!(manager.jobs.get(&job.id).unwrap(), rebased);
+        assert_eq!(manager.book_get(&book.id).unwrap(), current);
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(name, _)| name == "job:updated")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(name, _)| name == "library:changed")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_or_stale_enrichment_claim_cannot_publish_a_book_or_completion() {
+        let (_directory, manager, _events, source) = fixture();
+        let book = manager.library.import(&source).unwrap().book;
+        let job = manager.enqueue_enrichment(&book, "manual").unwrap();
+        let claim = manager.jobs.claim_next(1).unwrap().unwrap();
+        let payload: EnrichPayload = decode(&claim.payload).unwrap();
+        let mut stale = claim.clone();
+        stale.attempt += 1;
+        assert!(matches!(
+            manager
+                .publish_enrichment(
+                    &stale,
+                    &payload,
+                    book.revision,
+                    true,
+                    proposed_outcome(&book, true)
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        assert_eq!(manager.book_get(&book.id).unwrap(), book);
+        assert_eq!(
+            manager.jobs.get(&job.id).unwrap().status,
+            JobStatus::Running
+        );
+        manager.jobs.cancel(&job.id).unwrap();
+        let outcome = manager
+            .publish_enrichment(
+                &claim,
+                &payload,
+                book.revision,
+                true,
+                proposed_outcome(&book, true),
+            )
+            .await;
+        assert!(matches!(&outcome, Err(AppError::Cancelled)));
+        manager.settle_dispatch(&claim, outcome);
+        assert_eq!(manager.book_get(&book.id).unwrap(), book);
+        let cancelled = manager.jobs.get(&job.id).unwrap();
+        assert_eq!(cancelled.status, JobStatus::Cancelled);
+        assert!(cancelled.result.is_none());
+    }
+
     #[tokio::test]
     async fn manual_analysis_of_verified_book_publishes_pending_review_and_can_be_consumed() {
         let (_directory, manager, events, source) = fixture();
@@ -1758,6 +1932,7 @@ mod tests {
             .publish_enrichment(&claim, &payload, book.revision, true, outcome)
             .await
             .unwrap();
+        let result = settle_test_publication(&manager, &claim, result);
         let published = manager.book_get(&book.id).unwrap();
         assert_eq!(published.title, "Human title");
         assert_eq!(published.metadata_status, MetadataStatus::NeedsReview);
@@ -1769,7 +1944,6 @@ mod tests {
             manager.jobs.get(&job.id).unwrap().result,
             Some(result.clone())
         );
-        manager.jobs.complete(&claim, result).unwrap();
         let reviewed = manager
             .book_review(&book.id, &job.id, &BookPatch::default(), published.revision)
             .unwrap();
@@ -1801,6 +1975,7 @@ mod tests {
             .publish_enrichment(&claim, &payload, book.revision, true, outcome)
             .await
             .unwrap();
+        let result = settle_test_publication(&manager, &claim, result);
         let applied = manager.book_get(&book.id).unwrap();
         assert_eq!(applied.title, "Proposed title");
         assert_eq!(applied.metadata_status, MetadataStatus::Verified);
@@ -1839,6 +2014,7 @@ mod tests {
             )
             .await
             .unwrap();
+        let result = settle_test_publication(&manager, &claim, result);
         assert_eq!(manager.book_get(&verified.id).unwrap(), verified);
         assert_eq!(result["review"]["state"], "obsolete");
         assert_eq!(result["review"]["sourceRevision"], verified.revision);
@@ -1888,6 +2064,7 @@ mod tests {
             )
             .await
             .unwrap();
+        let result = settle_test_publication(&manager, &claim, result);
         assert_eq!(result["review"]["state"], "pending");
         assert_eq!(manager.book_get(&book.id).unwrap().title, book.title);
         let current = manager.book_get(&book.id).unwrap();

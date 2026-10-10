@@ -1779,27 +1779,27 @@ mod tests {
     #[test]
     fn readonly_probe_has_a_bounded_deadline_and_output() {
         let start = std::time::Instant::now();
-        assert!(
+        assert!(matches!(
             run_probe(
                 Path::new("/bin/sleep"),
                 &["5"],
                 start + std::time::Duration::from_millis(30)
-            )
-            .is_err()
-        );
+            ),
+            Err(AppError::Unsupported(message)) if message == "Mounted volume probe timed out"
+        ));
         assert!(start.elapsed() < std::time::Duration::from_secs(2));
-        assert!(
+        assert!(matches!(
             run_probe(
-                Path::new("/usr/bin/head"),
-                &["-c", "4194305", "/dev/zero"],
+                Path::new("/bin/sh"),
+                &["-c", "printf '%4194305s' ''"],
                 std::time::Instant::now() + PROBE_TIMEOUT
-            )
-            .is_err()
-        );
+            ),
+            Err(AppError::Unsupported(message)) if message == "Mounted volume probe limit exceeded"
+        ));
         assert_eq!(
             run_probe(
-                Path::new("/bin/printf"),
-                &["[]"],
+                Path::new("/bin/sh"),
+                &["-c", "printf '[]'"],
                 std::time::Instant::now() + PROBE_TIMEOUT
             )
             .unwrap(),

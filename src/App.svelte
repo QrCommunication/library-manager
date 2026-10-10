@@ -19,6 +19,7 @@
   import { defaultQuery } from './lib/contracts';
   import type { AppBootstrap, AppError, Book, BookQuery, Device, Job, OptimizationProfile, Provider, RemoveBooksResult, Settings } from './lib/contracts';
   import { setLanguage, t } from './lib/i18n';
+  import { createRequestScheduler } from './lib/request-scheduler';
   import { isMetadataReady, metadataDisabledReason as getMetadataDisabledReason, MAX_SELECTED_BOOKS } from './lib/selection-capabilities';
 
   type View = 'library' | 'devices' | 'chat' | 'activity' | 'settings';
@@ -45,6 +46,7 @@
   let capabilitiesGeneration = 0;
   let transferRequest = $state<{ bookIds: string[]; initialDeviceId: string | null } | null>(null);
   let removeBookIds = $state<string[] | null>(null);
+  let transferTargets = $state<Record<string, string>>({});
   let startupBusy = $state(true);
   let importing = $state(false);
   let choosingBooks = $state(false);
@@ -68,9 +70,48 @@
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
   let destroyed = false;
   const unlisteners: UnlistenFn[] = [];
+  let jobEventSequence = 0;
+  const jobEventVersions = new Map<string, number>();
+
+  function mergeJobSnapshot(snapshot: Job[], startedAtSequence: number): boolean {
+    if (destroyed) return false;
+    let updatedDuringRead = false;
+    const merged = new Map(jobs.map((job) => [job.id, job]));
+    for (const job of snapshot) {
+      const existing = merged.get(job.id);
+      // A database snapshot may resolve/rebase a review without changing the
+      // job timestamp. Prefer it unless a later event updated the same job.
+      if ((jobEventVersions.get(job.id) ?? 0) > startedAtSequence) {
+        updatedDuringRead = true;
+        continue;
+      }
+      if (existing && existing.updatedAt > job.updatedAt) continue;
+      merged.set(job.id, job);
+    }
+    jobs = [...merged.values()];
+    return updatedDuringRead;
+  }
+
+  const jobRequests = createRequestScheduler<void, { jobs: Job[]; startedAtSequence: number }>({
+    load: async () => {
+      const startedAtSequence = jobEventSequence;
+      return { jobs: await request('jobs_list', undefined), startedAtSequence };
+    },
+    onStart: () => undefined,
+    onSuccess: ({ jobs: snapshot, startedAtSequence }) => {
+      if (mergeJobSnapshot(snapshot, startedAtSequence)) jobRequests.refresh();
+    },
+    onError: reportError,
+    onSettled: () => undefined,
+    queryDelayMs: 0,
+  });
 
   const connectedDevice = $derived(devices.find((device) => device.connected) ?? null);
   const transferReady = $derived(devices.some((device) => device.connected && device.writable));
+  const transferReceipts = $derived(jobs.flatMap((job) => {
+    const deviceId = transferTargets[job.id];
+    return job.kind === 'transfer' && deviceId ? [{ deviceId, job }] : [];
+  }));
   const metadataReady = $derived(isMetadataReady(bootstrap?.settings, providers));
   const metadataDisabledReason = $derived(getMetadataDisabledReason(bootstrap?.settings, providers));
   const activeJobCount = $derived(jobs.filter((job) => job.status === 'queued' || job.status === 'running').length);
@@ -166,6 +207,14 @@
     removeBookIds = ids;
   }
 
+  function acceptTransfer(job: Job, deviceId: string): void {
+    if (destroyed || job.kind !== 'transfer' || !deviceId) return;
+    // Keep the human-confirmed target through view changes; job updates replace
+    // the receipt's status/result without inventing a public backend payload.
+    transferTargets = { ...transferTargets, [job.id]: deviceId };
+    updateJob(job);
+  }
+
   function acceptRemoval(result: RemoveBooksResult): void {
     if (destroyed) return;
     const removed = new Set(result.removedBookIds);
@@ -190,6 +239,7 @@
   }
 
   async function loadBootstrap(): Promise<void> {
+    const startedAtSequence = jobEventSequence;
     startupBusy = true;
     error = null;
     try {
@@ -197,7 +247,7 @@
       if (destroyed) return;
       bootstrap = result;
       devices = result.devices;
-      jobs = result.pendingJobs;
+      mergeJobSnapshot(result.pendingJobs, startedAtSequence);
       applySettings(result.settings);
       await refreshCapabilities();
     } catch (cause: unknown) {
@@ -255,7 +305,12 @@
   function updateJob(job: Job): void {
     if (destroyed) return;
     const previous = jobs.find((candidate) => candidate.id === job.id);
+    jobEventVersions.set(job.id, ++jobEventSequence);
     jobs = [...jobs.filter((candidate) => candidate.id !== job.id), job];
+    if (!previous && job.kind === 'transfer' && !['completed', 'failed', 'cancelled'].includes(job.status)) {
+      // Let the device view adopt an accepted transfer before its completion.
+      refreshVersion += 1;
+    }
     if (previous?.status !== job.status && ['completed', 'failed', 'cancelled'].includes(job.status)) {
       refreshVersion += 1;
       if (job.error) reportError(job.error);
@@ -272,11 +327,16 @@
   }
 
   onMount(() => {
+    jobRequests.setQuery(undefined);
     void loadBootstrap();
     document.addEventListener('keydown', focusSearch);
     if (isNative() || preview) {
       void Promise.allSettled([
-        subscribe('library:changed', () => { if (!destroyed) refreshVersion += 1; }),
+        subscribe('library:changed', () => {
+          if (destroyed) return;
+          refreshVersion += 1;
+          jobRequests.refresh();
+        }),
         subscribe('devices:changed', (event) => { if (!destroyed) devices = event.devices; }),
         subscribe('job:updated', (event) => updateJob(event.job)),
       ]).then((results) => {
@@ -299,6 +359,7 @@
     destroyed = true;
     importGeneration += 1;
     capabilitiesGeneration += 1;
+    jobRequests.dispose();
     if (toastTimer) clearTimeout(toastTimer);
     if (typeof document !== 'undefined') document.removeEventListener('keydown', focusSearch);
     void Promise.allSettled(unlisteners.map((unlisten) => Promise.resolve().then(unlisten)));
@@ -406,7 +467,7 @@
         />
       {:else if activeView === 'devices'}
         <DevicesView
-          {devices} {selectedBookIds} {refreshVersion}
+          {devices} {selectedBookIds} {refreshVersion} {transferReceipts}
           {metadataReady} {metadataDisabledReason} {transferReady}
           onOpenAssistant={openAssistant} onVerifySelected={verifySelectedBooks}
           onTransferSelected={transferSelectedBooks} onOpenSettings={() => navigate('settings')}
@@ -442,7 +503,7 @@
 {#if transferRequest}
   <DeviceTransferDialog bookIds={transferRequest.bookIds} {devices} {profiles}
     initialDeviceId={transferRequest.initialDeviceId} onClose={() => { transferRequest = null; }}
-    onQueued={updateJob} onNotify={notify} />
+    onQueued={acceptTransfer} onNotify={notify} />
 {/if}
 
 {#if removeBookIds}

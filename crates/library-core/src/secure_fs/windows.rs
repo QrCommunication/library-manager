@@ -36,15 +36,15 @@ use windows_sys::Win32::{
         SetKernelObjectSecurity, TOKEN_QUERY, TOKEN_USER, TokenUser,
     },
     Storage::FileSystem::{
-        DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+        CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
         FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO,
         FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
         FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_ID_INFO,
         FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
         FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, FileBasicInfo,
         FileDispositionInfo, FileIdInfo, FileRenameInfo, FileStandardInfo,
-        GetFileInformationByHandleEx, GetFileType, READ_CONTROL, ReOpenFile, SYNCHRONIZE,
-        SetFileInformationByHandle, WRITE_DAC, WRITE_OWNER,
+        GetFileInformationByHandleEx, GetFileType, OPEN_EXISTING, READ_CONTROL, ReOpenFile,
+        SYNCHRONIZE, SetFileInformationByHandle, WRITE_DAC, WRITE_OWNER,
     },
     System::Threading::{GetCurrentProcess, OpenProcessToken},
 };
@@ -340,18 +340,46 @@ fn verify_kind(file: &File, directory: bool) -> Result<()> {
     Ok(())
 }
 
+/// Resolve only a validated drive/UNC root through the DOS namespace. Applying
+/// OBJ_DONT_REPARSE here rejects the drive alias itself on Windows 10. Every
+/// caller-supplied filesystem component is opened separately by open_native.
+fn open_root(root: &OsStr) -> Result<File> {
+    let wide: Vec<u16> = root.encode_wide().chain([0]).collect();
+    // SAFETY: root is constructed from a validated path prefix only, the
+    // nul-terminated buffer lives through the call, and no creation is allowed.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error().into());
+    }
+    // SAFETY: successful CreateFileW transfers one owned handle to File.
+    let file = unsafe { File::from_raw_handle(handle) };
+    verify_kind(&file, true)?;
+    identity(&file)?;
+    Ok(file)
+}
+
 pub(super) fn open_dir(path: &Path, create: bool, policy: AccessPolicy) -> Result<File> {
     let mut components = path.components();
     let root = match components.next() {
         Some(Component::Prefix(prefix)) => match prefix.kind() {
             Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => {
-                format!("\\??\\{}:\\", drive as char)
+                format!("\\\\?\\{}:\\", drive as char)
             }
             Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
                 super::validate_component(server)?;
                 super::validate_component(share)?;
                 format!(
-                    "\\??\\UNC\\{}\\{}\\",
+                    "\\\\?\\UNC\\{}\\{}\\",
                     server.to_string_lossy(),
                     share.to_string_lossy()
                 )
@@ -374,15 +402,7 @@ pub(super) fn open_dir(path: &Path, create: bool, policy: AccessPolicy) -> Resul
         ));
     }
     // Pin each ancestor against rename/deletion; never change its permissions.
-    let mut directory = open_native(
-        null_mut(),
-        OsStr::new(&root),
-        true,
-        FILE_OPEN,
-        FILE_GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        None,
-    )?;
+    let mut directory = open_root(OsStr::new(&root))?;
     let components: Vec<_> = components
         .filter(|part| !matches!(part, Component::CurDir))
         .collect();
@@ -967,6 +987,31 @@ pub(super) fn sync_directory(parent: &File) -> Result<()> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn current_drive_root_opens_through_its_dos_alias() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let current = std::env::current_dir().unwrap();
+        let drive = match current.components().next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => drive,
+                _ => panic!("The native suite must run on a local drive"),
+            },
+            _ => panic!("The native suite must have an absolute current directory"),
+        };
+        let root = format!("{}:\\", drive as char);
+        let expected = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&root)
+            .unwrap();
+        let directory = open_dir(Path::new(&root), false, AccessPolicy::Shared).unwrap();
+        assert_eq!(identity(&directory).unwrap(), identity(&expected).unwrap());
+        let verbatim_root = format!("\\\\?\\{}:\\", drive as char);
+        let verbatim = open_dir(Path::new(&verbatim_root), false, AccessPolicy::Shared).unwrap();
+        assert_eq!(identity(&verbatim).unwrap(), identity(&expected).unwrap());
+    }
 
     #[test]
     fn windows_time_uses_real_epoch_and_retains_subsecond_precision() {

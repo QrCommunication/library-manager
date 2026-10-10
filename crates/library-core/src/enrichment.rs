@@ -865,7 +865,37 @@ mod tests {
     use crate::database::Database;
     use crate::models::{BookFile, BookMetadata};
     use std::collections::BTreeMap;
-    use std::os::unix::fs::PermissionsExt;
+
+    fn replace_inspection_fixture_bytes(path: &std::path::Path, bytes: &[u8]) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            use crate::secure_fs::{self, AccessPolicy, SecureDir};
+            use std::io::Write;
+
+            // Keep the immutable original intact; the damaged fixture replaces
+            // its directory entry and retains the same private readonly policy.
+            let retained = path.with_file_name(format!(
+                "retained-inspection-original-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::rename(path, retained).unwrap();
+            let parent =
+                SecureDir::open(path.parent().unwrap(), false, AccessPolicy::Private).unwrap();
+            let mut replacement = parent
+                .create_new(path.file_name().unwrap(), AccessPolicy::Private)
+                .unwrap();
+            replacement.write_all(bytes).unwrap();
+            replacement.sync_all().unwrap();
+            secure_fs::make_private(&replacement, true).unwrap();
+            assert!(secure_fs::is_private_read_only(&replacement).unwrap());
+        }
+    }
 
     fn book() -> Book {
         Book {
@@ -1572,8 +1602,7 @@ mod tests {
         let last = changed.len() - 1;
         changed[last] ^= 1;
         let path = storage.resolve(&path).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        std::fs::write(path, changed).unwrap();
+        replace_inspection_fixture_bytes(&path, &changed);
         assert!(matches!(
             inspect_book(&repository, &storage, &book),
             Err(AppError::Conflict(_))
@@ -1663,8 +1692,7 @@ mod tests {
         let mut corrupted = original_bytes;
         corrupted[0] ^= 1;
         let original_path = storage.resolve(&original.relative_path).unwrap();
-        std::fs::set_permissions(&original_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        std::fs::write(original_path, corrupted).unwrap();
+        replace_inspection_fixture_bytes(&original_path, &corrupted);
         assert_eq!(
             storage.read(&derived.relative_path).unwrap(),
             epub_bytes("CONVERTED EDITION CONTENT")

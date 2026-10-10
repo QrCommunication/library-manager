@@ -329,6 +329,69 @@ impl JobService {
         })
     }
 
+    /// Commit the enrichment's business mutation and terminal result in one transaction.
+    /// The caller holds its library gate; change must use this connection without
+    /// reopening the queue or starting a nested transaction. Notify only after releasing
+    /// that gate, so observers never run under publication locks.
+    pub(crate) fn complete_atomically<T>(
+        &self,
+        claim: &ClaimedJob,
+        change: impl FnOnce(&Connection) -> Result<(T, Value)>,
+    ) -> Result<(T, Job)> {
+        validate_id(&claim.job.id)?;
+        let mut tokens = self.tokens()?;
+        let mut connection = self.database.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (mut job, mut envelope) = decode(load(&transaction, &claim.job.id)?)?;
+        if job.status == JobStatus::Cancelled || claim.cancellation.load(Ordering::Acquire) {
+            return Err(AppError::Cancelled);
+        }
+        let current_token = tokens.get(&job.id).is_some_and(|(attempt, token)| {
+            *attempt == claim.attempt && Arc::ptr_eq(token, &claim.cancellation)
+        });
+        if job.kind != JobKind::Enrich
+            || claim.job.kind != JobKind::Enrich
+            || job.status != JobStatus::Running
+            || envelope.attempt != claim.attempt
+            || !current_token
+        {
+            return Err(AppError::Conflict(
+                "The enrichment job attempt is no longer running".into(),
+            ));
+        }
+        let (value, result) = change(&transaction)?;
+        validate_value(&result, MAX_RESULT_BYTES)?;
+        // Shutdown may signal the cooperative token directly without entering cancel().
+        if claim.cancellation.load(Ordering::Acquire) {
+            return Err(AppError::Cancelled);
+        }
+        job.status = JobStatus::Completed;
+        job.progress = 1.0;
+        job.result = Some(result);
+        job.error = None;
+        job.message.clear();
+        envelope.message.clear();
+        envelope.next_retry_at = None;
+        job.updated_at = timestamp();
+        save(&transaction, &job, &envelope)?;
+        transaction.commit()?;
+        // The registry remains locked until commit; a stale worker cannot remove a
+        // newer attempt's token or cancel a terminal publication through cancel().
+        if tokens.get(&job.id).is_some_and(|(attempt, token)| {
+            *attempt == claim.attempt && Arc::ptr_eq(token, &claim.cancellation)
+        }) && let Some((_, token)) = tokens.remove(&job.id)
+        {
+            token.store(true, Ordering::Release);
+        }
+        drop(tokens);
+        Ok((value, job))
+    }
+
+    /// Emit a committed publication after the caller has released its library gate.
+    pub(crate) fn notify_committed(&self, job: &Job) {
+        self.notify(job);
+    }
+
     pub fn fail(&self, claim: &ClaimedJob, error: PublicError) -> Result<Job> {
         let error = safe_error(error)?;
         self.update_claimed(claim, |job, _| {
@@ -832,6 +895,248 @@ mod tests {
     }
     fn network_error() -> PublicError {
         public_error(ErrorCode::NetworkUnavailable, "Network unavailable", true)
+    }
+
+    fn publication_probe(service: &JobService) {
+        service
+            .database
+            .connect()
+            .unwrap()
+            .execute("CREATE TABLE publication_probe(value TEXT NOT NULL)", [])
+            .unwrap();
+    }
+
+    fn published_values(service: &JobService) -> Vec<String> {
+        let connection = service.database.connect().unwrap();
+        let mut statement = connection
+            .prepare("SELECT value FROM publication_probe ORDER BY rowid")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn atomic_enrichment_publishes_business_change_and_terminal_result_durably() {
+        let (_directory, service) = queue();
+        publication_probe(&service);
+        let job = service
+            .enqueue(JobKind::Enrich, json!({"bookId":"book"}))
+            .unwrap();
+        let claim = service.claim_next(1).unwrap().unwrap();
+        service
+            .update_progress(&claim, 0.7, "Publishing metadata")
+            .unwrap();
+        service.database.connect().unwrap().execute(
+            "UPDATE jobs SET error_json=?2,payload_json=json_set(payload_json,'$.nextRetryAt',?3) WHERE id=?1",
+            params![job.id, serde_json::to_string(&network_error()).unwrap(), timestamp()],
+        ).unwrap();
+        let result = json!({"proposal":{"bookId":"book","patch":{"title":"Verified title"}},"review":{"state":"applied","sourceRevision":1,"reviewRevision":2,"resolvedRevision":2}});
+        let (value, completed) = service
+            .complete_atomically(&claim, |connection| {
+                assert!(!connection.is_autocommit());
+                connection.execute(
+                    "INSERT INTO publication_probe VALUES('metadata-and-history')",
+                    [],
+                )?;
+                Ok(("book-revision-2", result.clone()))
+            })
+            .unwrap();
+        assert_eq!(value, "book-revision-2");
+        assert_eq!(completed.status, JobStatus::Completed);
+        assert_eq!(completed.progress, 1.0);
+        assert_eq!(completed.result, Some(result));
+        assert_eq!(completed.error, None);
+        assert!(completed.message.is_empty());
+        assert!(claim.cancellation.load(Ordering::Acquire));
+        assert!(!service.tokens().unwrap().contains_key(&job.id));
+        let (_, envelope) =
+            decode(load(&service.database.connect().unwrap(), &job.id).unwrap()).unwrap();
+        assert!(envelope.message.is_empty());
+        assert!(envelope.next_retry_at.is_none());
+        let reopened = JobService::new(service.database.clone());
+        assert_eq!(reopened.get(&job.id).unwrap(), completed);
+        assert_eq!(published_values(&reopened), ["metadata-and-history"]);
+        assert_eq!(reopened.recover().unwrap(), 0);
+        assert_eq!(reopened.cancel(&job.id).unwrap(), completed);
+    }
+
+    #[test]
+    fn atomic_publication_rejects_stale_cancelled_foreign_and_non_enrich_claims_before_mutation() {
+        for case in [
+            "stale-attempt",
+            "cancelled-job",
+            "cancelled-token",
+            "foreign-token",
+            "other-kind",
+            "queued",
+        ] {
+            let (_directory, service) = queue();
+            publication_probe(&service);
+            let kind = if case == "other-kind" {
+                JobKind::Import
+            } else {
+                JobKind::Enrich
+            };
+            let job = service.enqueue(kind, json!({"bookId":"book"})).unwrap();
+            let mut claim = service.claim_next(1).unwrap().unwrap();
+            match case {
+                "stale-attempt" => claim.attempt += 1,
+                "cancelled-job" => {
+                    service.cancel(&job.id).unwrap();
+                }
+                "cancelled-token" => claim.cancellation.store(true, Ordering::Release),
+                "foreign-token" => claim.cancellation = Arc::new(AtomicBool::new(false)),
+                "queued" => {
+                    service.recover().unwrap();
+                    claim.cancellation = Arc::new(AtomicBool::new(false));
+                }
+                _ => {}
+            }
+            let before = service.get(&job.id).unwrap();
+            let mut called = false;
+            let result = service.complete_atomically(&claim, |connection| {
+                called = true;
+                connection.execute("INSERT INTO publication_probe VALUES('forbidden')", [])?;
+                Ok(((), json!({})))
+            });
+            assert!(result.is_err(), "{case}");
+            assert!(!called, "{case}");
+            assert!(published_values(&service).is_empty(), "{case}");
+            assert_eq!(service.get(&job.id).unwrap(), before, "{case}");
+        }
+    }
+
+    #[test]
+    fn atomic_publication_rolls_back_business_changes_on_closure_or_invalid_result() {
+        let (_directory, service) = queue();
+        publication_probe(&service);
+        let job = service
+            .enqueue(JobKind::Enrich, json!({"bookId":"book"}))
+            .unwrap();
+        let claim = service.claim_next(1).unwrap().unwrap();
+        service
+            .update_result(&claim, json!({"intermediate":"retained"}))
+            .unwrap();
+        let before = service.get(&job.id).unwrap();
+        let result = service.complete_atomically(&claim, |connection| {
+            connection.execute("INSERT INTO publication_probe VALUES('rolled-back')", [])?;
+            Err::<((), Value), _>(AppError::RevisionConflict)
+        });
+        assert!(matches!(result, Err(AppError::RevisionConflict)));
+        for invalid in [
+            json!({"text":"x".repeat(MAX_RESULT_BYTES)}),
+            json!({"apiKey":"synthetic-secret"}),
+        ] {
+            assert!(
+                service
+                    .complete_atomically(&claim, |connection| {
+                        connection
+                            .execute("INSERT INTO publication_probe VALUES('rolled-back')", [])?;
+                        Ok(((), invalid))
+                    })
+                    .is_err()
+            );
+        }
+        assert!(published_values(&service).is_empty());
+        assert_eq!(service.get(&job.id).unwrap(), before);
+        assert!(!claim.cancellation.load(Ordering::Acquire));
+        assert!(service.tokens().unwrap().contains_key(&job.id));
+    }
+
+    #[test]
+    fn atomic_publication_rolls_back_business_changes_when_terminal_job_write_fails() {
+        let (_directory, service) = queue();
+        publication_probe(&service);
+        let job = service
+            .enqueue(JobKind::Enrich, json!({"bookId":"book"}))
+            .unwrap();
+        let claim = service.claim_next(1).unwrap().unwrap();
+        let before = service.get(&job.id).unwrap();
+        service.database.connect().unwrap().execute_batch(
+            "CREATE TRIGGER reject_terminal_publication BEFORE UPDATE ON jobs WHEN NEW.status='completed' BEGIN SELECT RAISE(ABORT,'synthetic publication failure'); END;",
+        ).unwrap();
+        assert!(
+            service
+                .complete_atomically(&claim, |connection| {
+                    connection
+                        .execute("INSERT INTO publication_probe VALUES('rolled-back')", [])?;
+                    Ok(((), json!({"review":{"state":"pending"}})))
+                })
+                .is_err()
+        );
+        assert!(published_values(&service).is_empty());
+        assert_eq!(service.get(&job.id).unwrap(), before);
+        assert!(!claim.cancellation.load(Ordering::Acquire));
+        assert!(service.tokens().unwrap().contains_key(&job.id));
+    }
+
+    #[test]
+    fn atomic_publication_rolls_back_if_cooperative_cancellation_arrives_during_change() {
+        let (_directory, service) = queue();
+        publication_probe(&service);
+        let job = service
+            .enqueue(JobKind::Enrich, json!({"bookId":"book"}))
+            .unwrap();
+        let claim = service.claim_next(1).unwrap().unwrap();
+        let before = service.get(&job.id).unwrap();
+        let result = service.complete_atomically(&claim, |connection| {
+            connection.execute("INSERT INTO publication_probe VALUES('rolled-back')", [])?;
+            claim.cancellation.store(true, Ordering::Release);
+            Ok(((), json!({})))
+        });
+        assert!(matches!(result, Err(AppError::Cancelled)));
+        assert!(published_values(&service).is_empty());
+        assert_eq!(service.get(&job.id).unwrap(), before);
+    }
+
+    #[test]
+    fn atomic_publication_notifies_only_explicitly_after_database_and_token_locks_are_released() {
+        let (_directory, service) = queue();
+        publication_probe(&service);
+        let tokens = service.tokens.clone();
+        let database = service.database.clone();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let service = service.with_event_callback(Arc::new(move |job| {
+            assert!(tokens.try_lock().is_ok());
+            let mut connection = database.connect().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert_eq!(
+                decode(load(&transaction, &job.id).unwrap()).unwrap().0,
+                *job
+            );
+            if job.status == JobStatus::Completed {
+                assert_eq!(
+                    transaction
+                        .query_row("SELECT COUNT(*) FROM publication_probe", [], |row| row
+                            .get::<_, i64>(0))
+                        .unwrap(),
+                    1
+                );
+            }
+            transaction.commit().unwrap();
+            captured.lock().unwrap().push(job.status);
+        }));
+        let job = service
+            .enqueue(JobKind::Enrich, json!({"bookId":"book"}))
+            .unwrap();
+        let claim = service.claim_next(1).unwrap().unwrap();
+        events.lock().unwrap().clear();
+        let (_, completed) = service
+            .complete_atomically(&claim, |connection| {
+                connection.execute("INSERT INTO publication_probe VALUES('committed')", [])?;
+                Ok(((), json!({"review":{"state":"pending"}})))
+            })
+            .unwrap();
+        assert!(events.lock().unwrap().is_empty());
+        service.notify_committed(&completed);
+        assert_eq!(*events.lock().unwrap(), [JobStatus::Completed]);
+        assert_eq!(service.get(&job.id).unwrap(), completed);
     }
 
     #[test]
