@@ -42,7 +42,10 @@ for relative in "$@"; do
     maintainer_flags+=" --old-file=$escaped"
 done
 cd "$build_dir"
-exec /usr/bin/make "${make_arguments[@]}" "AM_MAKEFLAGS=$maintainer_flags"
+# Libtool -static only freezes Libtool libraries; -all-static reaches the compiler.
+# Name zlib's real archive explicitly so an import library cannot win -lz resolution.
+exec /usr/bin/make "${make_arguments[@]}" "AM_MAKEFLAGS=$maintainer_flags" \
+    "TOOLS_STATIC=-all-static" "LIBZ_LDFLAGS=/ucrt64/lib/libz.a"
 "#;
 const TOOLCHAIN_VARIABLES: &[&str] = &[
     "CC",
@@ -493,6 +496,128 @@ fn ensure_success(output: &Output, step: &str) -> io::Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    // This ELF counterpart proves Libtool semantics; Windows CI audits the real PE imports.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn windows_link_policy_avoids_external_shared_zlib() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("libmobi-static-{}-{unique}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let manifest = env::var_os("CARGO_MANIFEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| env::current_dir().unwrap().join("src-tauri"));
+        let source = manifest.parent().unwrap().join("vendor/libmobi-0.12");
+        let output = Command::new(source.join("configure"))
+            .args(CONFIGURE_ARGUMENTS)
+            .arg("--with-zlib=no")
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Competing libraries expose different results, proving which bytes the linker used.
+        fs::write(root.join("dynamic.c"), "int qa_value(void) { return 1; }\n").unwrap();
+        fs::write(root.join("archive.c"), "int qa_value(void) { return 2; }\n").unwrap();
+        fs::write(
+            root.join("main.c"),
+            "int qa_value(void); int main(void) { return qa_value() != 2; }\n",
+        )
+        .unwrap();
+        for arguments in [
+            vec!["-shared", "-fPIC", "dynamic.c", "-o", "libz.so"],
+            vec!["-c", "archive.c", "-o", "archive.o"],
+            vec!["-c", "main.c", "-o", "main.o"],
+        ] {
+            assert!(
+                Command::new("cc")
+                    .args(arguments)
+                    .current_dir(&root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        assert!(
+            Command::new("ar")
+                .args(["rcs", "libz.a", "archive.o"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let linker = format!(
+            "all:\n\t/bin/sh ./libtool --mode=link cc $(TOOLS_STATIC) -L{} main.o $(LIBZ_LDFLAGS) -o fixture\n",
+            root.display()
+        );
+        fs::write(root.join("fixture.mk"), &linker).unwrap();
+        let red = Command::new("make")
+            .args([
+                "-f",
+                "fixture.mk",
+                "TOOLS_STATIC=-static",
+                "LIBZ_LDFLAGS=-lz",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            red.status.success(),
+            "{}",
+            String::from_utf8_lossy(&red.stderr)
+        );
+        assert!(
+            !Command::new(root.join("fixture"))
+                .env("LD_LIBRARY_PATH", &root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        // Use the production make script, changing only OS path conversion and the
+        // fixture archive location. The effective Libtool/GCC link remains real.
+        fs::write(root.join("Makefile"), linker).unwrap();
+        let script = WINDOWS_MAKE_SCRIPT
+            .replace("/usr/bin/cygpath -u", "/usr/bin/printf %s")
+            .replace("/ucrt64/lib/libz.a", root.join("libz.a").to_str().unwrap());
+        let green = Command::new("/usr/bin/bash")
+            .args(["--noprofile", "--norc", "-c", &script, "libmobi-make"])
+            .env("LIBRARY_MANAGER_MOBI_SOURCE", &source)
+            .env("LIBRARY_MANAGER_MOBI_BUILD", &root)
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            green.status.success(),
+            "{}",
+            String::from_utf8_lossy(&green.stderr)
+        );
+        assert!(
+            Command::new(root.join("fixture"))
+                .env_remove("LD_LIBRARY_PATH")
+                .status()
+                .unwrap()
+                .success()
+        );
+        // The compiler must really receive -static, rather than Libtool consuming it.
+        assert!(
+            String::from_utf8_lossy(&green.stdout)
+                .lines()
+                .any(|line| line.contains("libtool: link:") && line.contains("-static"))
+        );
+    }
 
     #[test]
     fn release_generated_inputs_stay_frozen_in_recursive_make() {

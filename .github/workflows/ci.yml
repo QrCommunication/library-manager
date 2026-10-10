@@ -3,15 +3,6 @@ name: Linux checks and packages
 on:
   push:
     branches: [main]
-    # Documentation-only pushes do not rebuild packages; bundled notices always do.
-    paths:
-      - '**'
-      - '!docs/**'
-      - 'docs/THIRD_PARTY_NOTICES.md'
-      - '!README*.md'
-      - '!CHANGELOG.md'
-      - '!CONTRIBUTING.md'
-      - '!SECURITY.md'
   pull_request:
   workflow_dispatch:
 
@@ -91,7 +82,7 @@ jobs:
 
       - name: Install locked dependencies
         run: |
-          pnpm install --frozen-lockfile
+          pnpm install --frozen-lockfile --force --ignore-scripts
           cargo fetch --locked
 
       - name: Check and build the interface

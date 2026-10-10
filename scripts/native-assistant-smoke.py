@@ -489,6 +489,9 @@ def smoke(driver, binary, profile, report):
                                         "configuredOfflineQueueCoveredByCatalogueMode": True}
 
         with checked(report, "selectedBookChipOpensFreshBookPanel"):
+            # Configuration readiness does not imply that the selected-book
+            # scheduler has resolved its debounced book_get requests.
+            driver.wait(lambda: driver.execute("return [...document.querySelectorAll('.selected-book-list .source-chip')].some(n=>n.textContent.includes(arguments[0]) && !n.disabled);", [book["title"]]), "selectedBookChipDidNotLoad")
             require(driver.execute("const node=[...document.querySelectorAll('.selected-book-list .source-chip')].find(n=>n.textContent.includes(arguments[0])); if(!node)return false; node.click(); return true;", [book["title"]]), "selectedBookChipMissing")
             driver.wait(lambda: (state if (state := title_field(driver)) and state["value"] == book["title"] and state["notes"] == remote_notes else False), "selectedChipOpenedWrongOrStaleBook")
             click(driver, ".drawer-header button", "selectedBookPanelCloseMissing")

@@ -3,14 +3,6 @@ name: Native Windows and macOS packages
 on:
   push:
     branches: [main]
-    paths:
-      - '**'
-      - '!docs/**'
-      - 'docs/THIRD_PARTY_NOTICES.md'
-      - '!README*.md'
-      - '!CHANGELOG.md'
-      - '!CONTRIBUTING.md'
-      - '!SECURITY.md'
   workflow_dispatch:
 
 permissions:
@@ -188,7 +180,7 @@ jobs:
 
       - name: Install locked dependencies
         run: |
-          pnpm install --frozen-lockfile
+          pnpm install --frozen-lockfile --force --ignore-scripts
           cargo fetch --locked
 
       - name: Check the interface and native workspace

@@ -35,11 +35,11 @@ Installer la toolchain Rust **MSVC x64**, les outils C++ Microsoft et les prére
 
 MSYS2 **UCRT64** sert uniquement à compiler le moteur MOBI compagnon. Installer `make`, `mingw-w64-ucrt-x86_64-gcc` et `mingw-w64-ucrt-x86_64-zlib`, puis définir `LIBRARY_MANAGER_MSYS2_ROOT` sur le chemin Windows absolu de cette installation. La CI utilise le chemin réel retourné par l’action MSYS2, sans supposer un emplacement fixe.
 
-Le build-script invoque explicitement Bash, GCC, `ar`, `ranlib` et `objdump` de cette installation. Les variables `CC` et le `PATH` UCRT64 restent dans les processus de compilation du sidecar ; ils ne remplacent pas la toolchain MSVC de l’application Rust. zlib et les bibliothèques MinGW nécessaires sont liées statiquement.
+Le build-script invoque explicitement Bash, GCC, `ar`, `ranlib` et `objdump` de cette installation. Les variables `CC` et le `PATH` UCRT64 restent dans les processus de compilation du sidecar ; ils ne remplacent pas la toolchain MSVC de l’application Rust. Pour la liaison, `build.rs` impose `TOOLS_STATIC=-all-static` et `LIBZ_LDFLAGS=/ucrt64/lib/libz.a`. Le premier transmet la liaison entièrement statique au compilateur via Libtool ; `-static` seul ne fige que les bibliothèques gérées par Libtool. Le second désigne l’archive zlib explicitement, au lieu de laisser `-lz` sélectionner une DLL disponible. Le chemin `/ucrt64` appartient au shell MSYS2 du sidecar, pas à une installation Linux.
 
 Le checkout Windows peut donner aux prérequis Autotools un horodatage plus récent que leurs fichiers générés. Pour construire l’archive distribuée sans lancer une régénération avec `aclocal-1.16`, `build.rs` passe à GNU Make `--old-file` pour ces sept entrées : `aclocal.m4`, `configure`, `config.h.in`, `Makefile.in`, `src/Makefile.in`, `tools/Makefile.in` et `tests/Makefile.in`. `AM_MAKEFLAGS` transmet les mêmes options aux sous-`make`, car `-o` n’est pas propagé automatiquement. La présence de chaque entrée est contrôlée ; les sources C, objets, `config.status` et Makefiles de sortie conservent leurs dépendances normales. Les fichiers vendor et les empreintes du build ne sont pas modifiés. Cette version de libmobi ne fournit pas `AM_MAINTAINER_MODE` : ajouter `--disable-maintainer-mode` ne remplace pas ce traitement.
 
-L’audit `objdump` exige un exécutable PE x86_64 et refuse les DLL redistribuables MSYS, MinGW ou zlib. Seuls les imports système autorisés passent ce contrôle. Le rapport `sidecar-dependencies.log` accompagne les artefacts Windows ; il ne remplace pas un essai d’installation ou de GUI.
+L’audit `objdump` exige un exécutable PE x86_64 et refuse les DLL redistribuables MSYS, MinGW ou zlib. Seuls les imports système autorisés passent ce contrôle. Le rapport `sidecar-dependencies.log` accompagne les artefacts Windows ; il ne remplace pas un essai d’installation ou de GUI. Deux tests de fixture Libtool ont réussi sur Linux : ils contrôlent les arguments et le choix effectif de la bibliothèque statique face à une bibliothèque partagée concurrente. Ces deux tests ne constituent pas une exécution du sidecar Windows ; la CI doit encore auditer les imports du véritable PE et valider les paquets natifs.
 
 ### macOS
 
@@ -50,7 +50,7 @@ Installer les outils de ligne de commande Xcode et construire séparément sur I
 Depuis le dépôt, sur la plateforme native :
 
 ```sh
-pnpm install --frozen-lockfile
+pnpm install --frozen-lockfile --force --ignore-scripts
 cargo fetch --locked
 pnpm check
 pnpm test
@@ -174,6 +174,12 @@ Une réussite doit être établie par un rapport complet `status: passed` corres
 
 ## Notices et données
 
-Le générateur de notices utilise les dépendances verrouillées, `cargo metadata --locked --offline`, le graphe pnpm actif et les sources locales. Les limites d’inventaire sont documentées dans [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Une dépendance recensée pour toutes les plateformes n’est pas nécessairement embarquée dans chaque binaire. Inclure les licences de l’application, de libmobi et les notices tierces dans les paquets.
+Le générateur de notices utilise `cargo metadata --locked --offline`, le graphe pnpm verrouillé obtenu par `pnpm list --depth Infinity --json --lockfile-only`, les sources locales et libmobi embarqué. L’inventaire est l’union des dépendances accessibles pour toutes les plateformes, y compris leurs paquets optionnels ; il ne dépend plus des seuls paquets actifs sur l’hôte. Les anciens restes du store pnpm absents de ce graphe sont exclus.
+
+Préparer les sources avec `pnpm install --frozen-lockfile --force --ignore-scripts` et `cargo fetch --locked` avant le contrôle. `--force` installe aussi les dépendances optionnelles étrangères à l’architecture hôte, tandis que `--ignore-scripts` interdit leurs scripts d’installation. Les lockfiles restent inchangés. Avec les paquets déjà présents dans le store, l’installation pnpm peut ajouter `--offline` ; cette option exige que toutes les sources nécessaires aient été téléchargées auparavant.
+
+`python3 scripts/third-party-notices.py --check` compare les notices canoniques sans télécharger de fichiers ni exécuter de scripts de dépendances. Une source ou notice nécessaire absente provoque un échec ; préparer l’union complète permet un contrôle déterministe et hors ligne sur chaque runner. Le snapshot canonique courant recense **701 paquets et 67 limitations d’inventaire des sources**, consignées dans [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Ces limitations restent visibles même lorsque le contrôle réussit ; les comptes évoluent avec les dépendances verrouillées.
+
+Une dépendance recensée pour toutes les plateformes n’est pas nécessairement embarquée dans chaque binaire. Inclure les licences de l’application, de libmobi et les notices tierces dans les paquets.
 
 Le workspace sépare `library-core` de la coque Tauri ; les tests du noyau ne nécessitent pas d’écran. Ne jamais ajouter de livres privés ni de clés aux fixtures publiques. Voir [BLUEPRINT.md](BLUEPRINT.md), [IPC.md](IPC.md), [METADATA_POLICY.md](METADATA_POLICY.md) et [DEVICE_PROTOCOL.md](DEVICE_PROTOCOL.md) pour les contrats du produit.

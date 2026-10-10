@@ -1,8 +1,8 @@
 # Qualité et validations de Library Manager
 
-## Version 0.2.1 — préparation et validations partielles
+## Version 0.2.1 — validations Linux et portage natif en cours
 
-État au 10 octobre 2026 : les actions groupées communes, la revue persistante des propositions et le retrait réversible du catalogue sont en cours de livraison, avec le portage natif Windows et macOS. Les preuves ci-dessous couvrent des périmètres distincts ; elles ne constituent pas encore une validation globale du commit final ni des installateurs distribués. Les résultats historiques des versions publiées restent conservés dans les sections suivantes.
+État au 10 octobre 2026 : les actions groupées communes, la revue persistante des propositions et le retrait réversible du catalogue sont en cours de livraison, avec le portage natif Windows et macOS. Les sources du commit `69641a0` ont réussi leur validation globale Docker, la CI Linux et les parcours natifs Linux général, assistant et catalogue. Des corrections supplémentaires du générateur de notices et de la liaison du moteur Windows sont validées localement ; leur CI sur le prochain commit reste attendue. Les installateurs Windows/macOS, la notarisation et la publication publique ne sont pas encore validés. Les résultats historiques des versions publiées restent conservés dans les sections suivantes.
 
 ### Sources actuelles : tests ciblés et analyse statique
 
@@ -25,15 +25,30 @@
 | Interface | 53 tests réussis ; contrôle TypeScript/Svelte sans erreur ni avertissement |
 | Compilation croisée Windows | Neuf tests spécifiques compilés, **non exécutés** sur Windows |
 
-Ces suites ciblées portent sur le portage, les gardes métier et la publication atomique des analyses ; leurs comptes ne sont pas à additionner pour annoncer une suite globale. L’exécution complète après les derniers ports reste en cours à cet état de la documentation. La compilation croisée ne prouve ni l’exécution des tests Windows, ni le comportement de sa GUI ou de ses installateurs.
+Ces suites ciblées portent sur le portage, les gardes métier et la publication atomique des analyses ; leurs comptes ne sont pas à additionner pour annoncer une suite globale. Le résultat global après les derniers ports figure ci-dessous. La compilation croisée ne prouve ni l’exécution des tests Windows, ni le comportement de sa GUI ou de ses installateurs.
 
-### Parcours natif local du catalogue
+### Validation globale Docker du commit poussé
+
+Le snapshot source exact [69641a07cf2602bb193e06c91b090f1be25e4846](https://github.com/QrCommunication/library-manager/commit/69641a07cf2602bb193e06c91b090f1be25e4846) a terminé sa validation globale Docker avec un code de sortie zéro. Le journal `final-workspace.log` conserve les résultats suivants :
+
+| Contrôle global | Résultat |
+| --- | --- |
+| Compilation du workspace | Réussie |
+| Moteur `library-core` | 315 tests réussis, aucun échec ; un test réseau volontairement ignoré |
+| Coque Tauri | Huit tests réussis, aucun échec |
+| Analyse statique Rust | Clippy workspace, toutes cibles, avec `-D warnings`, réussi |
+| Format Rust | `cargo fmt --all -- --check` réussi |
+| Notices tierces du snapshot `69641a0` | Sept autotests réussis ; ancien inventaire de 647 paquets et 43 avertissements vérifié sur Linux. Le nouvel inventaire commun aux plateformes est décrit ci-dessous |
+
+Cette preuve globale porte sur le snapshot exact dans cet environnement Linux Docker. La CI Linux et les parcours du binaire issu de ce commit sont également réussis, comme décrit ci-dessous. Les changements ultérieurs des notices et de la liaison Windows exigent une nouvelle CI ; aucune signature ou notarisation macOS n’est déduite de ces résultats.
+
+### Historique : parcours natif local du catalogue avant portage
 
 Le scénario `scripts/native-assistant-smoke.py --catalogue-actions` a réussi **huit contrôles sur huit** dans un profil synthétique neuf et un conteneur Linux sans réseau externe. Le rapport local `native-catalogue-report.json` conserve l’empreinte du binaire exécuté : `004a5c9c23cc21040068d0abaf9c339f34096a0af77e380cd073ebac95c34056`.
 
 Le scénario vérifie les actions de métadonnées indisponibles sans fournisseur dans les huit vues, leur activation avec une configuration synthétique et la création de deux analyses hors ligne. Il vérifie ensuite la validation durable d’une proposition avec changements et d’une proposition déjà identique, puis le retrait de deux livres, leur absence après redémarrage, la répétition idempotente du reçu et la restauration par les commandes officielles avec les fichiers conservés. Les propositions sont préparées uniquement dans la fixture marquée, application arrêtée. Le rapport indique zéro appel API payant et zéro écriture sur appareil physique.
 
-Cette preuve porte sur un **binaire local figé avant les derniers ports**. Elle ne porte pas sur le futur binaire final de CI, ne valide pas Windows ou macOS et ne doit pas être présentée comme un rapport de livraison publique. La validation native du binaire final reste à effectuer.
+Cette preuve porte sur un **binaire local figé avant les derniers ports**. Elle ne porte pas sur le futur binaire final de CI, ne valide pas Windows ou macOS et ne doit pas être présentée comme un rapport de livraison publique. Les parcours réussis du binaire CI `69641a0` sont documentés ci-dessous ; ils ne transforment pas ce rapport local antérieur en preuve du commit final de livraison.
 
 ### Baseline native CI R4 : défaut de cache reproduit
 
@@ -41,11 +56,36 @@ Le scénario catalogue a été étendu pour vérifier l’accès à une proposit
 
 Les cinq premiers contrôles réussissent. Après l’édition officielle des notes et du favori, le livre est à la révision 2 et sa proposition reste durablement `pending`, avec `sourceRevision: 1` et `reviewRevision: 2`. Pourtant, après dix secondes, le DOM affiche deux cartes et zéro bouton **Examiner** sur les cartes, sans chargement en cours. Le bouton global reste visible. Le rapport R4 conserve l’échec `pendingReviewLibraryCacheStaleAfterPersonalEdit` ; le contrôle de validation sans différence et son contrôle imbriqué d’édition personnelle échouent sur cette même cause. Les étapes suivantes d’annulation personnelle et de retrait du catalogue ne sont pas atteintes.
 
-Cette baseline établit un défaut de cache de l’interface malgré un réancrage correct de la proposition persistée. Les sources ont été corrigées pour actualiser les tâches et leurs résultats lorsque la bibliothèque change. Le nouveau parcours natif sur le binaire final doit encore réussir avant de déclarer ce défaut résolu à l’exécution. La baseline indique zéro appel API payant et zéro écriture sur appareil physique ; elle n’est pas un rapport de livraison réussi.
+Cette baseline établit un défaut de cache de l’interface malgré un réancrage correct de la proposition persistée. Les sources ont été corrigées pour actualiser les tâches et leurs résultats lorsque la bibliothèque change. Le parcours catalogue R5 du binaire CI `69641a0` réussit désormais le contrôle `pendingReviewRemainsReachableAfterPersonalEditAndUndo`, ainsi que les étapes suivantes de retrait et de restauration. La correction du cache est donc prouvée à l’exécution sur ce binaire Linux ; les prochains paquets restent soumis à leur propre validation. La baseline indique zéro appel API payant et zéro écriture sur appareil physique ; elle n’est pas un rapport de livraison réussi.
+
+### Parcours natifs du binaire CI `69641a0`
+
+Les rapports locaux suivants utilisent tous le binaire Linux produit par la CI du commit `69641a07cf2602bb193e06c91b090f1be25e4846`, SHA-256 `abc65b87bc671477f9b0418d0ed064b0f232074913d4c4e309c40304e9c341a1`. Les parcours général, assistant et catalogue s’exécutent dans des profils synthétiques distincts et des conteneurs sans réseau externe.
+
+| Rapport local | Résultat et périmètre |
+| --- | --- |
+| `native-general-69641a0.log` | Dix contrôles réussis : import, déduplication, conversion TXT/EPUB et MOBI, lecteur/progression, optimisation Xteink, révisions et annulation, paramètres/langue et bibliothèque rendue |
+| `native-assistant-69641a0-wait-report.json` | Dix contrôles réussis : sélection de 33 livres, retour bibliothèque conservant filtre/tri, ouverture d’une fiche fraîche, brouillon/focus préservés pendant 64 événements en 3 302 ms, permission consommée pour une seule demande et annulations officielles |
+| `native-r5-69641a0.log` | Neuf contrôles réussis : configuration et file d’analyses hors ligne, validation durable avec ou sans différence, accès à la revue après édition personnelle et annulation, retrait idempotent puis restauration du catalogue et conservation des fichiers |
+| `crosspoint-receipt-021-r4.json` | Quatre contrôles réussis avec le vrai transport HTTP sur un réseau Docker interne privé ; aucune liseuse physique utilisée |
+
+Le premier essai assistant échouait dans la fixture : l’indication de configuration était visible avant que les titres des 33 boutons sélectionnés soient chargés. La reproduction sur le même binaire montre les boutons sans titre cible à 9 ms, puis le titre et la fiche fraîche à environ 328 ms. Le scénario attend désormais le bouton cible activé, sans délai fixe ni assouplissement du contrôle. La relance complète sur un profil neuf réussit les dix contrôles.
+
+Ces rapports indiquent zéro appel API payant et zéro écriture sur appareil physique. Le scénario assistant neuf ne contient aucune proposition terminée : sa revue est explicitement non exercée, et la preuve correspondante vient du scénario catalogue. Les échanges CrossPoint restent une preuve du transport réel contre une fixture privée, sans preuve de firmware ou de matériel physique.
+
+### Notices communes aux plateformes et liaison du moteur Windows
+
+Après le checkpoint `69641a0`, le générateur recense l’union du graphe verrouillé pnpm avec `--lockfile-only`. L’installation verrouillée avec `--force --ignore-scripts` fournit les sources optionnelles de toutes les plateformes ; une source absente ou une identité de paquet divergente provoque un échec. Aucun paquet optionnel n’est exclu silencieusement. La génération canonique et son contrôle strict réussissent dans Docker avec **701 paquets et 67 avertissements d’inventaire des sources**, consignés dans [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Ces avertissements ne signifient pas que 67 dépendances sont distribuées sans licence.
+
+Les **treize autotests** du générateur réussissent, notamment l’indépendance du graphe à la plateforme Linux/macOS, le refus d’une source optionnelle manquante et la résolution explicite du lanceur `pnpm.cmd` Windows. Cette dernière vérification simule le chemin de lancement Windows ; elle ne remplace pas son exécution native dans la CI Windows. Les versions et fichiers de verrouillage restent identiques.
+
+Deux tests ciblés de `build.rs` réussissent sur l’hôte Linux avec libtool : la sélection du vrai fichier d’archive statique et le refus d’une DLL comme entrée de liaison statique. La correction vise l’échec Windows relatif à `zlib1.dll` ; son succès natif Windows reste à confirmer.
 
 ### CI et paquets restant à valider
 
-Le checkpoint Linux incluant le correctif de calcul des empreintes [efd58c7](https://github.com/QrCommunication/library-manager/commit/efd58c7) a réussi. Ce checkpoint précède les derniers changements du portage ; il ne remplace pas la CI du commit final. La CI finale Windows et macOS, leurs paquets, le parcours natif final après correction du cache et la signature/notarisation macOS restent à valider. Aucune notarisation accomplie n’est revendiquée dans ce compte rendu.
+La [CI Linux 38025145928](https://github.com/QrCommunication/library-manager/actions/runs/38025145928) du commit `69641a0` a réussi et produit les paquets utilisés par les parcours ci-dessus. La [CI native 38025145921](https://github.com/QrCommunication/library-manager/actions/runs/38025145921) a échoué : les notices différaient selon les sources optionnelles installées sur macOS, et la liaison Windows nécessitait une archive statique plutôt que `zlib1.dll`. Les corrections de ces deux causes sont présentes dans les sources locales et leurs tests ciblés réussissent ; les jobs natifs du nouveau commit restent attendus.
+
+Sur le checkpoint macOS ARM de cette CI, 316 tests du moteur et six tests Tauri réussissent, ainsi que l’analyse statique. Ce résultat intermédiaire ne prouve pas la construction finale, la signature, la notarisation ou le parcours graphique macOS. Les installateurs Windows/macOS et les téléchargements publics de la 0.2.1 restent à valider ; aucune notarisation accomplie ni validation matérielle Windows n’est revendiquée.
 
 Voir [le guide utilisateur](USER_GUIDE.md), [le plan de livraison 0.2.1](RELEASE_0.2.1_PLAN.md) et [les environnements et commandes de construction](BUILD.md). Le plan distingue la construction, la signature, la notarisation et la vérification des paquets effectivement publiés.
 

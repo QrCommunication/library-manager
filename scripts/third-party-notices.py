@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build-only, deterministic notices from locked Cargo and installed JS sources."""
+"""Build-only, deterministic notices from locked Cargo and all-platform JS sources."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -179,45 +180,69 @@ def cargo_dependencies(root: Path) -> list[Dependency]:
     return dependencies
 
 
-def installed_js_roots(root: Path) -> list[Path]:
-    """Read pnpm's active dependency graph; virtual-store leftovers are not dependencies."""
+def pnpm_inventory_command() -> list[str] | str:
+    """Resolve PATH/PATHEXT once; run only the fixed inventory operation.
+
+    Windows batch shims require cmd.exe. Its /s outer quotes preserve a quoted
+    executable path with spaces, /d disables AutoRun, and /v:off disables delayed
+    expansion. A raw Windows command line avoids Python's argv-to-C-runtime
+    escaping, which is not cmd.exe's quoting grammar. No project path, package
+    metadata or caller-supplied argument enters that command line.
+    """
+    executable = shutil.which("pnpm")
+    if not executable:
+        raise RuntimeError("The pinned pnpm executable is missing from PATH")
+    arguments = ["list", "--depth", "Infinity", "--json", "--lockfile-only"]
+    if Path(executable).suffix.lower() not in {".cmd", ".bat"}:
+        return [executable, *arguments]
+    # Percent expansion remains active even inside cmd.exe quotes. Refuse an
+    # ambiguous executable path rather than invoking a different expanded tool.
+    if any(character in executable for character in '%"\r\n\0'):
+        raise RuntimeError("The pnpm batch executable path cannot be quoted safely")
+    command_processor = shutil.which("cmd.exe")
+    if not command_processor:
+        raise RuntimeError("The Windows command processor is unavailable for pnpm")
+    launcher = subprocess.list2cmdline([command_processor])
+    return f'{launcher} /d /v:off /s /c ""{executable}" {" ".join(arguments)}"'
+
+
+def locked_js_roots(root: Path) -> list[Path]:
+    """Read every reachable locked package, including foreign optional binaries.
+
+    Host-filtered pnpm inventories differ on Linux, macOS and Windows. Sources
+    must first be prepared with frozen-lockfile/force/ignore-scripts; checking
+    never downloads packages, executes their scripts, or accepts missing notices.
+    """
     modules = (root / "node_modules").resolve()
     if not modules.is_dir():
-        raise RuntimeError("Install the locked JS dependencies with pnpm before generating notices")
+        raise RuntimeError("Install all-platform locked JS sources with pnpm install --frozen-lockfile --force --ignore-scripts before generating notices")
+    command = pnpm_inventory_command()
     try:
-        process = subprocess.run(["pnpm", "list", "--depth", "Infinity", "--json"], cwd=root, capture_output=True, text=True, check=False, timeout=180)
+        process = subprocess.run(command, cwd=root, capture_output=True, text=True, check=False, timeout=180)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise RuntimeError("pnpm dependency inventory is unavailable; install the pinned pnpm build tool") from error
     if process.returncode or len(process.stdout) > MAX_DEPENDENCY_METADATA_BYTES:
-        raise RuntimeError("pnpm could not provide the installed dependency graph")
+        raise RuntimeError("pnpm could not provide the locked dependency graph")
     try:
         projects = json.loads(process.stdout)
     except json.JSONDecodeError as error:
         raise RuntimeError("pnpm returned malformed dependency inventory") from error
     if not isinstance(projects, list) or len(projects) != 1 or not isinstance(projects[0], dict) or projects[0].get("path") != str(root.resolve()):
         raise RuntimeError("pnpm dependency inventory does not describe this project")
-    pending: list[tuple[dict, bool]] = []
+    pending: list[dict] = []
 
     def enqueue_children(package: dict) -> None:
-        try:
-            manifest = json.loads((Path(package["path"]) / "package.json").read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as error:
-            raise RuntimeError("An installed JS package has unreadable metadata") from error
-        if not isinstance(manifest, dict) or not isinstance(manifest.get("optionalDependencies", {}), dict):
-            raise RuntimeError("An installed JS package has invalid optional dependency metadata")
-        optional_names = set(manifest.get("optionalDependencies", {}))
         for field_name in ("dependencies", "devDependencies", "optionalDependencies"):
             children = package.get(field_name, {})
             if not isinstance(children, dict) or any(not isinstance(child, dict) for child in children.values()):
                 raise RuntimeError("pnpm dependency inventory has invalid child metadata")
-            # pnpm reports transitive optional dependencies in its dependencies map.
-            pending.extend((child, field_name == "optionalDependencies" or name in optional_names) for name, child in children.items())
+            pending.extend(children.values())
 
     enqueue_children(projects[0])
     paths: set[Path] = set()
     visited = 0
     while pending:
-        package, optional = pending.pop()
+        package = pending.pop()
         visited += 1
         if visited > MAX_DEPENDENCY_GRAPH_NODES:
             raise RuntimeError("pnpm dependency graph exceeds the inventory limit")
@@ -229,17 +254,25 @@ def installed_js_roots(root: Path) -> list[Path]:
             package_root.relative_to(modules)
         except ValueError as error:
             raise RuntimeError("pnpm dependency package is outside node_modules") from error
-        if not (package_root / "package.json").is_file():
-            if optional:
-                continue
-            raise RuntimeError("A required pnpm dependency is missing; install the locked dependencies")
+        manifest_path = package_root / "package.json"
+        if not manifest_path.is_file():
+            raise RuntimeError("A locked pnpm dependency source is missing; prepare all platforms with pnpm install --frozen-lockfile --force --ignore-scripts")
+        try:
+            if manifest_path.stat().st_size > MAX_DEPENDENCY_METADATA_BYTES:
+                raise ValueError("manifest size")
+            manifest_path.resolve(strict=True).relative_to(package_root)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError) as error:
+            raise RuntimeError("A locked JS package has unreadable or unsafe metadata") from error
+        if not isinstance(manifest, dict) or not isinstance(package.get("from"), str) or not isinstance(package.get("version"), str) or manifest.get("name") != package["from"] or manifest.get("version") != package["version"]:
+            raise RuntimeError("An installed JS source does not match its locked name and version")
         paths.add(package_root)
         enqueue_children(package)
     return sorted(paths)
 
 
 def js_dependencies(root: Path) -> list[Dependency]:
-    pending = installed_js_roots(root)
+    pending = locked_js_roots(root)
     seen: set[Path] = set()
     packages: dict[tuple[str, str], Dependency] = {}
     while pending:
@@ -313,8 +346,8 @@ def render(dependencies: list[Dependency]) -> str:
     texts = {hashlib.sha256(text.encode()).hexdigest(): text for dependency in dependencies for text in dependency.texts.values()}
     output = [
         "# Third-party notices", "",
-        "Generated by `python3 scripts/third-party-notices.py` from `cargo metadata --locked --offline`, the active installed pnpm dependency graph, and the bundled libmobi source. Unreachable virtual-store remnants are excluded. Run after installing the locked dependencies; `--check` verifies that this document is current without downloading notices.", "",
-        "The inventory includes build tools and dependencies resolved for other platforms. Their presence in this list does not mean that every package is included in each Linux binary. License declarations come from package metadata; original supplied notices and copyright statements are preserved below. Identical texts are shared by hash without replacing package-specific attribution. No build directory, user profile path, secret, or generation timestamp is added.", "",
+        "Generated by `python3 scripts/third-party-notices.py` from `cargo metadata --locked --offline`, the complete locked pnpm dependency graph (including optional packages for all platforms), and the bundled libmobi source. Unreachable virtual-store remnants are excluded. Prepare sources with `pnpm install --frozen-lockfile --force --ignore-scripts`; `--check` verifies that this document is current without downloading notices.", "",
+        "The inventory includes build tools and dependencies resolved for other platforms. Their presence in this list does not mean that every package is included in each application binary. License declarations come from package metadata; original supplied notices and copyright statements are preserved below. Identical texts are shared by hash without replacing package-specific attribution. No build directory, user profile path, secret, or generation timestamp is added.", "",
         "Library Manager itself is licensed under GPL-3.0-only; its complete application license is in `LICENSE`. Bundled libmobi is LGPL-3.0-or-later and its corresponding source remains in `vendor/`.", "",
         "## Dependency inventory", "",
         "| Ecosystem | Package | Version | Declared SPDX/license | Repository | Supplied notices |",
@@ -434,7 +467,7 @@ class GeneratorTests(unittest.TestCase):
                 (package / "package.json").write_text(json.dumps({"name": name, "version": "1.0", "license": "MIT"}), encoding="utf-8")
                 (package / "LICENSE").write_text("Copyright Holder\nMIT\n", encoding="utf-8")
             paths = [root / "node_modules" / name for name in REQUIRED_JS]
-            with patch.dict(js_dependencies.__globals__, {"installed_js_roots": lambda _: paths}):
+            with patch.dict(js_dependencies.__globals__, {"locked_js_roots": lambda _: paths}):
                 self.assertEqual(len(js_dependencies(root)), 2)
                 (root / "node_modules" / "svelte" / "LICENSE").unlink()
                 with self.assertRaises(RuntimeError):
@@ -445,7 +478,7 @@ class GeneratorTests(unittest.TestCase):
             root = Path(temporary).resolve()
             (root / "package.json").write_text("{}", encoding="utf-8")
             paths = {}
-            for name, version in [("svelte", "5.0"), ("@lucide/svelte", "1.0"), ("typescript", "7.0"), ("transitive", "2.0"), ("orphan", "0.1")]:
+            for name, version in [("svelte", "5.0"), ("@lucide/svelte", "1.0"), ("typescript", "7.0"), ("transitive", "2.0"), ("other-platform", "1.0"), ("orphan", "0.1")]:
                 package = root / "node_modules" / ".pnpm" / name.replace("/", "+") / "node_modules" / name
                 package.mkdir(parents=True)
                 metadata = {"name": name, "version": version, "license": "MIT"}
@@ -453,16 +486,96 @@ class GeneratorTests(unittest.TestCase):
                     metadata["optionalDependencies"] = {"other-platform": "1.0"}
                 (package / "package.json").write_text(json.dumps(metadata), encoding="utf-8")
                 (package / "LICENSE").write_text(f"Copyright {name} original holder\nMIT\n", encoding="utf-8")
-                paths[name] = {"path": str(package), "version": version}
-            alias = {**paths["typescript"], "from": "typescript", "dependencies": {"transitive": paths["transitive"], "other-platform": {"path": str(root / "node_modules" / "not-installed")}}}
-            graph = [{"path": str(root), "dependencies": {"svelte": paths["svelte"], "@lucide/svelte": paths["@lucide/svelte"]}, "devDependencies": {"@typescript/native": alias, "shared-peer": paths["typescript"]}, "optionalDependencies": {"other-platform": {"path": str(root / "node_modules" / "not-installed")}}}]
+                paths[name] = {"path": str(package), "from": name, "version": version}
+            alias = {**paths["typescript"], "from": "typescript", "dependencies": {"transitive": paths["transitive"], "other-platform": paths["other-platform"]}}
+            graph = [{"path": str(root), "dependencies": {"svelte": paths["svelte"], "@lucide/svelte": paths["@lucide/svelte"]}, "devDependencies": {"@typescript/native": alias, "shared-peer": paths["typescript"]}, "optionalDependencies": {"other-platform": paths["other-platform"]}}]
             result = subprocess.CompletedProcess([], 0, json.dumps(graph), "")
             with patch("subprocess.run", return_value=result) as command:
                 packages = js_dependencies(root)
-            command.assert_called_once_with(["pnpm", "list", "--depth", "Infinity", "--json"], cwd=root, capture_output=True, text=True, check=False, timeout=180)
-            self.assertEqual({(package.name, package.version) for package in packages}, {("svelte", "5.0"), ("@lucide/svelte", "1.0"), ("typescript", "7.0"), ("transitive", "2.0")})
+            command.assert_called_once_with(pnpm_inventory_command(), cwd=root, capture_output=True, text=True, check=False, timeout=180)
+            self.assertEqual({(package.name, package.version) for package in packages}, {("svelte", "5.0"), ("@lucide/svelte", "1.0"), ("typescript", "7.0"), ("transitive", "2.0"), ("other-platform", "1.0")})
             self.assertIn("Copyright transitive original holder", render(packages))
             self.assertNotIn("Copyright orphan original holder", render(packages))
+
+    def test_pnpm_inventory_resolves_the_posix_executable_without_a_shell(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "node_modules").mkdir()
+            result = subprocess.CompletedProcess([], 0, json.dumps([{"path": str(root)}]), "")
+            with patch("shutil.which", return_value="/tool bin/pnpm"), patch("subprocess.run", return_value=result) as run:
+                self.assertEqual(locked_js_roots(root), [])
+            self.assertEqual(run.call_args.args[0], ["/tool bin/pnpm", "list", "--depth", "Infinity", "--json", "--lockfile-only"])
+            self.assertNotIn("shell", run.call_args.kwargs)
+
+    def test_pnpm_inventory_uses_explicit_windows_batch_launcher_with_fixed_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "node_modules").mkdir()
+            result = subprocess.CompletedProcess([], 0, json.dumps([{"path": str(root)}]), "")
+            def executable(name):
+                return r"C:\Tool bin & cache\pnpm.CMD" if name == "pnpm" else r"C:\Windows\System32\cmd.exe"
+            with patch("shutil.which", side_effect=executable), patch("subprocess.run", return_value=result) as run:
+                self.assertEqual(locked_js_roots(root), [])
+            self.assertEqual(run.call_args.args[0], r'C:\Windows\System32\cmd.exe /d /v:off /s /c ""C:\Tool bin & cache\pnpm.CMD" list --depth Infinity --json --lockfile-only"')
+            self.assertNotIn(str(root), run.call_args.args[0])
+            self.assertNotIn("shell", run.call_args.kwargs)
+
+    def test_pnpm_inventory_refuses_missing_tools_and_expanding_windows_batch_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "node_modules").mkdir()
+            result = subprocess.CompletedProcess([], 0, json.dumps([{"path": str(root)}]), "")
+            for resolved in (None, r"C:\%UNTRUSTED%\pnpm.cmd", r'C:\bad"name\pnpm.cmd'):
+                with patch("shutil.which", return_value=resolved), patch("subprocess.run", return_value=result) as run, self.assertRaises(RuntimeError):
+                    locked_js_roots(root)
+                run.assert_not_called()
+
+    def test_locked_inventory_is_identical_for_linux_and_macos_native_graphs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "package.json").write_text("{}", encoding="utf-8")
+            packages = {}
+            for name in ["svelte", "@lucide/svelte", "native-linux", "native-darwin"]:
+                package = root / "node_modules" / name
+                package.mkdir(parents=True)
+                (package / "package.json").write_text(json.dumps({"name": name, "version": "1.0", "license": "MIT"}), encoding="utf-8")
+                (package / "LICENSE").write_text(f"Copyright {name} original holder\nMIT\n", encoding="utf-8")
+                packages[name] = {"path": str(package), "from": name, "version": "1.0"}
+            common = {name: packages[name] for name in REQUIRED_JS}
+            locked = [{"path": str(root), "dependencies": common, "optionalDependencies": {name: packages[name] for name in ("native-linux", "native-darwin")}}]
+            documents = []
+            for native in ("native-linux", "native-darwin"):
+                active = [{"path": str(root), "dependencies": common, "optionalDependencies": {native: packages[native]}}]
+                def inventory(command, **kwargs):
+                    graph = locked if "--lockfile-only" in command else active
+                    return subprocess.CompletedProcess(command, 0, json.dumps(graph), "")
+                with patch("subprocess.run", side_effect=inventory):
+                    documents.append(render(js_dependencies(root)))
+            self.assertEqual(documents[0], documents[1])
+            for native in ("native-linux", "native-darwin"):
+                self.assertIn(f"Copyright {native} original holder", documents[0])
+
+    def test_locked_inventory_refuses_missing_optional_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "package.json").write_text("{}", encoding="utf-8")
+            (root / "node_modules").mkdir()
+            graph = [{"path": str(root), "optionalDependencies": {"native-darwin": {"path": str(root / "node_modules" / "native-darwin"), "from": "native-darwin", "version": "1.0"}}}]
+            result = subprocess.CompletedProcess([], 0, json.dumps(graph), "")
+            with patch("subprocess.run", return_value=result), self.assertRaisesRegex(RuntimeError, "missing"):
+                locked_js_roots(root)
+
+    def test_locked_inventory_refuses_source_version_that_does_not_match_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "package.json").write_text("{}", encoding="utf-8")
+            package = root / "node_modules" / "native"
+            package.mkdir(parents=True)
+            (package / "package.json").write_text(json.dumps({"name": "native", "version": "9.0"}), encoding="utf-8")
+            graph = [{"path": str(root), "dependencies": {"native": {"path": str(package), "from": "native", "version": "1.0"}}}]
+            result = subprocess.CompletedProcess([], 0, json.dumps(graph), "")
+            with patch("subprocess.run", return_value=result), self.assertRaisesRegex(RuntimeError, "locked"):
+                locked_js_roots(root)
 
     def test_pnpm_graph_refuses_missing_required_packages_and_paths_outside_modules(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -473,7 +586,7 @@ class GeneratorTests(unittest.TestCase):
                 graph = [{"path": str(root), "dependencies": {"required": {"path": str(path)}}}]
                 result = subprocess.CompletedProcess([], 0, json.dumps(graph), "")
                 with patch("subprocess.run", return_value=result), self.assertRaises(RuntimeError):
-                    installed_js_roots(root)
+                    locked_js_roots(root)
 
 
 def main() -> int:
