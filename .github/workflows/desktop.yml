@@ -238,17 +238,48 @@ jobs:
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
           NOTARIZATION_METHOD: ${{ steps.signing.outputs.method }}
         run: |
           python - <<'PY'
-          import base64, json, os, secrets, shlex, subprocess, tempfile
+          import base64, binascii, json, os, secrets, shlex, subprocess, tempfile, threading
           from pathlib import Path
-          def execute(argv, data=None):
-              result = subprocess.run(argv, input=data, capture_output=True)
+          def execute(stage, argv, data=None, pass_fds=()):
+              print(f'Apple signing preparation stage: {stage}', flush=True)
+              try:
+                  result = subprocess.run(argv, input=data, capture_output=True, pass_fds=pass_fds, timeout=120)
+              except subprocess.TimeoutExpired:
+                  raise SystemExit(f'Apple signing preparation failed at {stage}: timeout; sensitive output is withheld') from None
+              except OSError:
+                  raise SystemExit(f'Apple signing preparation failed at {stage}: command unavailable; sensitive output is withheld') from None
               if result.returncode:
-                  raise SystemExit('Apple signing preparation failed; sensitive command output is withheld')
+                  raise SystemExit(f'Apple signing preparation failed at {stage}: exit {result.returncode}; sensitive output is withheld')
               return result.stdout
+          def export_compatible(openssl, material):
+              private_key = execute('normalize_private_key', [openssl, 'pkey'], material)
+              read_fd, write_fd = os.pipe()
+              write_errors = []
+              def feed_key():
+                  try:
+                      with os.fdopen(write_fd, 'wb') as stream:
+                          stream.write(private_key)
+                  except OSError:
+                      write_errors.append(True)
+              # Start the producer concurrently: keys larger than the pipe capacity
+              # must not block before OpenSSL starts consuming the inherited handle.
+              writer = threading.Thread(target=feed_key, daemon=True)
+              writer.start()
+              try:
+                  compatible = execute('export_compatible_pkcs12', [openssl, 'pkcs12', '-export', '-legacy',
+                      '-in', '/dev/stdin', '-inkey', f'/dev/fd/{read_fd}',
+                      '-passout', 'env:APPLE_CERTIFICATE_PASSWORD'], material, (read_fd,))
+              finally:
+                  os.close(read_fd)
+                  writer.join(timeout=5)
+              if writer.is_alive() or write_errors:
+                  raise SystemExit('Apple signing preparation failed at private_key_pipe: incomplete transfer; sensitive output is withheld')
+              return compatible
           def protected(path, value):
               fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
               with os.fdopen(fd, 'wb') as stream:
@@ -257,26 +288,35 @@ jobs:
           directory.chmod(0o700)
           keychain = directory / 'signing.keychain-db'
           password = secrets.token_hex(32)
-          previous = shlex.split(execute(['security', 'list-keychains', '-d', 'user']).decode())
+          previous = shlex.split(execute('list_previous_keychains', ['security', 'list-keychains', '-d', 'user']).decode())
           state = directory / 'state.json'
           protected(state, json.dumps({'directory': str(directory), 'keychain': str(keychain), 'previousKeychains': previous}).encode())
           with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as stream:
               stream.write(f'LIBRARY_MANAGER_APPLE_STATE={state}\n')
           original = directory / 'certificate.p12'
-          protected(original, base64.b64decode(''.join(os.environ['APPLE_CERTIFICATE'].split()), validate=True))
-          openssl = str(Path(execute(['brew', '--prefix', 'openssl@3']).decode().strip()) / 'bin/openssl')
-          # Re-export in memory to the PKCS12 format accepted by Apple's security utility.
-          material = execute([openssl, 'pkcs12', '-legacy', '-in', str(original), '-passin', 'env:APPLE_CERTIFICATE_PASSWORD', '-nodes'])
-          compatible = execute([openssl, 'pkcs12', '-export', '-legacy', '-passout', 'env:APPLE_CERTIFICATE_PASSWORD'], material)
+          try:
+              certificate_bytes = base64.b64decode(''.join(os.environ['APPLE_CERTIFICATE'].split()), validate=True)
+          except (binascii.Error, ValueError):
+              raise SystemExit('Apple signing preparation failed at decode_certificate: invalid base64; sensitive output is withheld') from None
+          protected(original, certificate_bytes)
+          openssl = str(Path(execute('locate_openssl', ['brew', '--prefix', 'openssl@3']).decode().strip()) / 'bin/openssl')
+          # OpenSSL must read the certificate and private key through independent
+          # streams: re-reading a single stdin reaches EOF. No decrypted key file.
+          material = execute('decode_pkcs12', [openssl, 'pkcs12', '-legacy', '-in', str(original), '-passin', 'env:APPLE_CERTIFICATE_PASSWORD', '-nodes'])
+          compatible = export_compatible(openssl, material)
           del material
           certificate = directory / 'compatible.p12'
           protected(certificate, compatible)
-          execute(['security', 'create-keychain', '-p', password, str(keychain)])
-          execute(['security', 'set-keychain-settings', '-lut', '7200', str(keychain)])
-          execute(['security', 'unlock-keychain', '-p', password, str(keychain)])
-          execute(['security', 'import', str(certificate), '-k', str(keychain), '-P', os.environ['APPLE_CERTIFICATE_PASSWORD'], '-T', '/usr/bin/codesign'])
-          execute(['security', 'set-key-partition-list', '-S', 'apple-tool:,apple:,codesign:', '-s', '-k', password, str(keychain)])
-          execute(['security', 'list-keychains', '-d', 'user', '-s', str(keychain), *previous])
+          execute('create_keychain', ['security', 'create-keychain', '-p', password, str(keychain)])
+          execute('configure_keychain', ['security', 'set-keychain-settings', '-lut', '7200', str(keychain)])
+          execute('unlock_keychain', ['security', 'unlock-keychain', '-p', password, str(keychain)])
+          execute('import_certificate', ['security', 'import', str(certificate), '-k', str(keychain), '-P', os.environ['APPLE_CERTIFICATE_PASSWORD'], '-T', '/usr/bin/codesign'])
+          execute('authorize_codesign', ['security', 'set-key-partition-list', '-S', 'apple-tool:,apple:,codesign:', '-s', '-k', password, str(keychain)])
+          identities = execute('validate_signing_identity', ['security', 'find-identity', '-v', '-p', 'codesigning', str(keychain)]).decode()
+          expected_identity = os.environ['APPLE_SIGNING_IDENTITY']
+          if not expected_identity or f'"{expected_identity}"' not in identities:
+              raise SystemExit('Apple signing preparation failed at validate_signing_identity: configured identity unavailable; sensitive output is withheld')
+          execute('activate_keychain', ['security', 'list-keychains', '-d', 'user', '-s', str(keychain), *previous])
           if os.environ['NOTARIZATION_METHOD'] == 'apiKey':
               api_key = directory / 'notarization.p8'
               protected(api_key, os.environ['APPLE_API_KEY_CONTENT'].encode())

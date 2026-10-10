@@ -43,9 +43,11 @@ for relative in "$@"; do
 done
 cd "$build_dir"
 # Libtool -static only freezes Libtool libraries; -all-static reaches the compiler.
-# Name zlib's real archive explicitly so an import library cannot win -lz resolution.
+# Keep -lz in Libtool's dependency_libs: an absolute .a in library LDFLAGS is
+# nested inside libmobi.a instead of propagated to the final executable. The
+# explicit UCRT64 search path and -all-static select the real static archive.
 exec /usr/bin/make "${make_arguments[@]}" "AM_MAKEFLAGS=$maintainer_flags" \
-    "TOOLS_STATIC=-all-static" "LIBZ_LDFLAGS=/ucrt64/lib/libz.a"
+    "TOOLS_STATIC=-all-static" "LIBZ_LDFLAGS=-L/ucrt64/lib -lz"
 "#;
 const TOOLCHAIN_VARIABLES: &[&str] = &[
     "CC",
@@ -591,7 +593,7 @@ mod tests {
         fs::write(root.join("Makefile"), linker).unwrap();
         let script = WINDOWS_MAKE_SCRIPT
             .replace("/usr/bin/cygpath -u", "/usr/bin/printf %s")
-            .replace("/ucrt64/lib/libz.a", root.join("libz.a").to_str().unwrap());
+            .replace("/ucrt64/lib", root.to_str().unwrap());
         let green = Command::new("/usr/bin/bash")
             .args(["--noprofile", "--norc", "-c", &script, "libmobi-make"])
             .env("LIBRARY_MANAGER_MOBI_SOURCE", &source)
@@ -617,6 +619,129 @@ mod tests {
                 .lines()
                 .any(|line| line.contains("libtool: link:") && line.contains("-static"))
         );
+    }
+
+    // The program depends on zlib only through libmobi, matching util.c's
+    // uncompress call. A direct main -> zlib fixture cannot detect a nested archive.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn windows_link_policy_resolves_zlib_through_libmobi() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "libmobi-transitive-static-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let manifest = env::var_os("CARGO_MANIFEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| env::current_dir().unwrap().join("src-tauri"));
+        let source = manifest.parent().unwrap().join("vendor/libmobi-0.12");
+        let output = Command::new(source.join("configure"))
+            .args(CONFIGURE_ARGUMENTS)
+            .arg("--with-zlib=no")
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let archive = Command::new("cc")
+            .arg("-print-file-name=libz.a")
+            .output()
+            .unwrap();
+        assert!(archive.status.success());
+        let archive = PathBuf::from(String::from_utf8(archive.stdout).unwrap().trim())
+            .canonicalize()
+            .expect("The link fixture requires the native static zlib development archive");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("tools")).unwrap();
+        fs::write(root.join("src/library.c"),
+            "#include <zlib.h>\nint fixture_mobi(void) { unsigned char out[1]; unsigned long length = 1; const unsigned char compressed[] = {120,156,3,0,0,0,0,1}; return uncompress(out, &length, compressed, sizeof compressed); }\n"
+        ).unwrap();
+        fs::write(
+            root.join("tools/main.c"),
+            "int fixture_mobi(void); int main(void) { return fixture_mobi(); }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Makefile"),
+            "all:\n\t$(MAKE) $(AM_MAKEFLAGS) -C src\n\t$(MAKE) $(AM_MAKEFLAGS) -C tools\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/Makefile"),
+            "all: libmobi.la\nlibmobi.lo: library.c\n\t/bin/sh ../libtool --mode=compile cc -c library.c -o libmobi.lo\nlibmobi.la: libmobi.lo\n\t/bin/sh ../libtool --mode=link cc -rpath $(CURDIR)/install $(LIBZ_LDFLAGS) libmobi.lo -o libmobi.la\n"
+        ).unwrap();
+        fs::write(root.join("tools/Makefile"),
+            "all: fixture\nmain.o: main.c\n\tcc -c main.c -o main.o\nfixture: main.o ../src/libmobi.la\n\t/bin/sh ../libtool --mode=link cc $(TOOLS_STATIC) main.o ../src/libmobi.la -o fixture\n"
+        ).unwrap();
+        // The former absolute LIBZ_LDFLAGS embeds libz.a as an archive member;
+        // Libtool drops its dependency record and the final executable cannot link.
+        let red = Command::new("make")
+            .args(["TOOLS_STATIC=-all-static"])
+            .arg(format!("LIBZ_LDFLAGS={}", archive.display()))
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(!red.status.success());
+        assert!(
+            String::from_utf8_lossy(&red.stderr).contains("undefined reference to `uncompress'")
+        );
+        let red_metadata = fs::read_to_string(root.join("src/libmobi.la")).unwrap();
+        assert!(red_metadata.contains("dependency_libs=''"));
+        fs::remove_file(root.join("src/libmobi.la")).unwrap();
+        let script = WINDOWS_MAKE_SCRIPT
+            .replace("/usr/bin/cygpath -u", "/usr/bin/printf %s")
+            .replace("/ucrt64/lib", archive.parent().unwrap().to_str().unwrap());
+        let green = Command::new("/usr/bin/bash")
+            .args(["--noprofile", "--norc", "-c", &script, "libmobi-make"])
+            .env("LIBRARY_MANAGER_MOBI_SOURCE", &source)
+            .env("LIBRARY_MANAGER_MOBI_BUILD", &root)
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            green.status.success(),
+            "{}",
+            String::from_utf8_lossy(&green.stderr)
+        );
+        let metadata = fs::read_to_string(root.join("src/libmobi.la")).unwrap();
+        assert!(
+            metadata
+                .lines()
+                .any(|line| line.starts_with("dependency_libs=") && line.contains("-lz"))
+        );
+        let members = Command::new("ar")
+            .args(["t", "src/.libs/libmobi.a"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(members.status.success());
+        assert!(
+            !String::from_utf8_lossy(&members.stdout)
+                .lines()
+                .any(|line| line == "libz.a")
+        );
+        assert!(
+            Command::new(root.join("tools/fixture"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let dynamic = Command::new("readelf")
+            .args(["-d", "tools/fixture"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(dynamic.status.success());
+        assert!(!String::from_utf8_lossy(&dynamic.stdout).contains("NEEDED"));
     }
 
     #[test]

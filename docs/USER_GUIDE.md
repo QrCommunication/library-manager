@@ -12,7 +12,7 @@ Vous pouvez activer ou désactiver l’enrichissement automatique des imports et
 
 ## Importer et sélectionner des livres
 
-Importez des fichiers depuis l’ordinateur, ou ouvrez l’inventaire d’une liseuse connectée pour importer les livres absents du catalogue local. L’import depuis un appareil conserve ses fichiers sur la carte. Suivez ses résultats dans **Activité** : fichiers importés, doublons et éventuels refus.
+Importez des fichiers depuis l’ordinateur, ou ouvrez **Liseuses**, puis l’inventaire d’une liseuse connectée pour importer les livres absents du catalogue local. L’import depuis un appareil conserve ses fichiers sur la carte. Suivez ses résultats dans **Activité** : fichiers importés, doublons et éventuels refus.
 
 La recherche, les filtres et le tri permettent de préparer une sélection dans les vues par couvertures, tableau ou groupes, ainsi que dans les vues consacrées aux livres des appareils. Cochez **1 à 200 livres** pour utiliser la barre d’actions commune :
 
@@ -20,7 +20,7 @@ La recherche, les filtres et le tri permettent de préparer une sélection dans 
 | --- | --- |
 | **Vérifier les métadonnées** | Lance les analyses de la sélection. Les livres ayant déjà une analyse active ne sont pas ajoutés une seconde fois. Consultez ensuite l’activité et les propositions disponibles. |
 | **Assistant** | Ouvre une conversation sur les livres cochés. Le bouton de choix des livres permet de revenir à la bibliothèque. |
-| **Transférer** | Choisissez un appareil connecté accessible en écriture, un profil d’optimisation, puis confirmez l’envoi. La tâche apparaît dans l’activité. |
+| **Envoyer à la liseuse** | Dans **Préparer l’envoi**, choisissez un appareil connecté accessible en écriture. Si vous cochez **Optimiser avant l’envoi**, choisissez le profil d’optimisation, puis confirmez l’envoi. La tâche apparaît dans l’activité. |
 | **Retirer de la bibliothèque** | Confirmez le retrait du catalogue local. Les fichiers originaux, les variantes et les copies sur les appareils sont conservés. |
 
 Les livres présents uniquement sur un appareil doivent être importés pour disposer d’une fiche locale et des actions qui l’exigent. Un badge de présence sur une liseuse ne signifie pas, à lui seul, qu’un fichier a été importé dans la bibliothèque locale.

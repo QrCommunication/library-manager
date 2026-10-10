@@ -35,11 +35,11 @@ Installer la toolchain Rust **MSVC x64**, les outils C++ Microsoft et les prére
 
 MSYS2 **UCRT64** sert uniquement à compiler le moteur MOBI compagnon. Installer `make`, `mingw-w64-ucrt-x86_64-gcc` et `mingw-w64-ucrt-x86_64-zlib`, puis définir `LIBRARY_MANAGER_MSYS2_ROOT` sur le chemin Windows absolu de cette installation. La CI utilise le chemin réel retourné par l’action MSYS2, sans supposer un emplacement fixe.
 
-Le build-script invoque explicitement Bash, GCC, `ar`, `ranlib` et `objdump` de cette installation. Les variables `CC` et le `PATH` UCRT64 restent dans les processus de compilation du sidecar ; ils ne remplacent pas la toolchain MSVC de l’application Rust. Pour la liaison, `build.rs` impose `TOOLS_STATIC=-all-static` et `LIBZ_LDFLAGS=/ucrt64/lib/libz.a`. Le premier transmet la liaison entièrement statique au compilateur via Libtool ; `-static` seul ne fige que les bibliothèques gérées par Libtool. Le second désigne l’archive zlib explicitement, au lieu de laisser `-lz` sélectionner une DLL disponible. Le chemin `/ucrt64` appartient au shell MSYS2 du sidecar, pas à une installation Linux.
+Le build-script invoque explicitement Bash, GCC, `ar`, `ranlib` et `objdump` de cette installation. Les variables `CC` et le `PATH` UCRT64 restent dans les processus de compilation du sidecar ; ils ne remplacent pas la toolchain MSVC de l’application Rust. Pour la liaison, `build.rs` impose `TOOLS_STATIC=-all-static` et `LIBZ_LDFLAGS=-L/ucrt64/lib -lz`. Le premier transmet la liaison entièrement statique au compilateur via Libtool ; `-static` seul ne fige que les bibliothèques gérées par Libtool. Le second conserve `-lz` dans les dépendances transitives de `libmobi.la` ; le lien final avec `-all-static` sélectionne l’archive UCRT64. Passer directement `/ucrt64/lib/libz.a` dans les flags de la bibliothèque imbrique cette archive dans `libmobi.a`, perd la dépendance et laisse `uncompress` non résolu au lien de l’exécutable. Le chemin `/ucrt64` appartient au shell MSYS2 du sidecar, pas à une installation Linux.
 
 Le checkout Windows peut donner aux prérequis Autotools un horodatage plus récent que leurs fichiers générés. Pour construire l’archive distribuée sans lancer une régénération avec `aclocal-1.16`, `build.rs` passe à GNU Make `--old-file` pour ces sept entrées : `aclocal.m4`, `configure`, `config.h.in`, `Makefile.in`, `src/Makefile.in`, `tools/Makefile.in` et `tests/Makefile.in`. `AM_MAKEFLAGS` transmet les mêmes options aux sous-`make`, car `-o` n’est pas propagé automatiquement. La présence de chaque entrée est contrôlée ; les sources C, objets, `config.status` et Makefiles de sortie conservent leurs dépendances normales. Les fichiers vendor et les empreintes du build ne sont pas modifiés. Cette version de libmobi ne fournit pas `AM_MAINTAINER_MODE` : ajouter `--disable-maintainer-mode` ne remplace pas ce traitement.
 
-L’audit `objdump` exige un exécutable PE x86_64 et refuse les DLL redistribuables MSYS, MinGW ou zlib. Seuls les imports système autorisés passent ce contrôle. Le rapport `sidecar-dependencies.log` accompagne les artefacts Windows ; il ne remplace pas un essai d’installation ou de GUI. Deux tests de fixture Libtool ont réussi sur Linux : ils contrôlent les arguments et le choix effectif de la bibliothèque statique face à une bibliothèque partagée concurrente. Ces deux tests ne constituent pas une exécution du sidecar Windows ; la CI doit encore auditer les imports du véritable PE et valider les paquets natifs.
+L’audit `objdump` exige un exécutable PE x86_64 et refuse les DLL redistribuables MSYS, MinGW ou zlib. Seuls les imports système autorisés passent ce contrôle. Le rapport `sidecar-dependencies.log` accompagne les artefacts Windows ; il ne remplace pas un essai d’installation ou de GUI. Trois tests du build-script ont réussi sous Linux : le choix statique face à une bibliothèque partagée concurrente, la dépendance transitive réelle `exécutable → libmobi.la → uncompress`, avec absence d’archive zlib imbriquée et de dépendance dynamique, et les prérequis Autotools figés sans masquer une erreur de compilation C. Ces tests ne constituent pas une exécution du sidecar Windows ; la CI doit encore auditer les imports du véritable PE et valider les paquets natifs.
 
 ### macOS
 
@@ -136,6 +136,35 @@ Pour le parcours signé, distinguer les contrôles suivants :
 4. Agrafage et validation du ticket du DMG avec `stapler`, puis contrôle `spctl --assess --type open --context context:primary-signature`.
 
 La présence de secrets ou la réussite de la compilation ne prouve aucun de ces résultats. `notarization-report.json` décrit les contrôles effectivement réussis pour le commit et les artefacts concernés. Un essai GUI macOS reste une preuve supplémentaire.
+
+## Publication vérifiée depuis le tag
+
+Le workflow [release.yml](../.github/workflows/release.yml) publie les artefacts construits par les CI du **commit exact du tag**. Il se déclenche au push d’un tag stable `vX.Y.Z`. Le déclenchement manuel accepte également un tag existant, avec les mêmes contrôles. Son exécution complète reste à valider pour la livraison 0.2.1 ; la présence du workflow ne prouve pas une publication réussie.
+
+Terminer et pousser les changements sur `main`, puis attendre la réussite des CI Linux, Windows, macOS ARM64/Intel et CodeQL sur ce même SHA avant de créer le tag. Les changements documentaires déclenchent aussi la CI Linux : les artefacts d’un commit précédent ne suffisent pas. Depuis le commit final de `main`, les commandes suivantes utilisent l’authentification SSH de Git :
+
+```sh
+git push git@github.com:QrCommunication/library-manager.git main
+# Attendre les CI réussies du SHA exact avant ces deux commandes.
+git tag v0.2.1 HEAD
+git push git@github.com:QrCommunication/library-manager.git refs/tags/v0.2.1
+```
+
+Ne pas déplacer un tag existant pour contourner un échec. Le workflow vérifie que le tag correspond au HEAD de `main`, que sa version concorde avec la configuration Tauri et que les jobs requis des CI et les quatre analyses CodeQL ont réussi sur ce commit. Il attend les CI en cours, mais refuse une CI terminée en échec.
+
+La préparation possède uniquement `contents: read` et `actions: read`. Le job de publication dépend de sa réussite et reçoit `contents: write` ainsi que `actions: read`. Les requêtes utilisent le `GITHUB_TOKEN` éphémère du job ; aucune session personnelle `gh` ni aucun jeton personnel GitHub n’est nécessaire. Les redirections vers les CDN ne reçoivent pas ce jeton.
+
+La préparation télécharge les archives CI et vérifie leurs SHA-256, chaque fichier de `SHA256SUMS`, les licences identiques aux sources du tag et le contenu complet de l’archive source. Les rapports de provenance doivent confirmer le commit, la version, l’architecture et l’exécution du moteur compagnon. Les paquets macOS doivent être signés, avec contrôles `codesign`, tickets validés, Gatekeeper et notarisation du DMG **`Accepted`**. Les MSI/EXE Windows sont explicitement **non signés** ; leur audit du sidecar doit refuser les DLL non système non embarquées.
+
+Le workflow installe ensuite le DEB CI dans une image Ubuntu 22.04 et lance quatre parcours, chacun avec un profil synthétique neuf et `--network none` : général DEB, assistant DEB, actions du catalogue DEB, puis parcours général via `AppRun` de l’AppImage extraite. Il exige respectivement au moins 10, 10, 9 et 10 contrôles réussis, aucun appel API payant ni écriture sur appareil physique. Les empreintes relient chaque rapport à l’exécutable réellement lancé et au paquet qui le contient. Trois mesures sont conservées : le binaire installé du DEB, le lanceur `AppRun` exécuté et le binaire ELF `usr/bin/library-manager` de l’AppImage extraite. Les trois parcours DEB doivent utiliser le même binaire ; le rapport AppImage doit correspondre au lanceur mesuré. La provenance et les sommes de contrôle identifient les paquets dont ces fichiers proviennent. Le packaging peut modifier le binaire ELF : son égalité octet par octet avec le binaire du DEB n’est pas requise. L’extraction de l’AppImage ne prouve pas son montage FUSE, ni un parcours graphique Windows ou macOS.
+
+Après ces validations, le manifeste, les rapports, les paquets, les licences, les sources et les sommes de contrôle sont transmis dans un artefact dont le job de publication vérifie l’identité, l’empreinte et l’appartenance à cette exécution. La publication suit cet ordre :
+
+1. Créer ou reprendre un brouillon compatible, téléverser les fichiers manquants et télécharger chaque fichier avec authentification pour vérifier son SHA-256. Un fichier divergent n’est jamais remplacé silencieusement.
+2. Rendre la version publique sans la marquer comme dernière version, puis télécharger tous ses fichiers sans authentification et vérifier leurs empreintes.
+3. Promouvoir la version comme dernière version seulement après réussite de tous les téléchargements publics, vérifier ce statut et conserver `PUBLIC_VERIFICATION.json` dans les artefacts du workflow.
+
+Un échec bloque les étapes suivantes. Si le contrôle anonyme échoue après ouverture de la version, celle-ci peut rester publique sans promotion comme dernière version ; consulter le run avant de la présenter comme une livraison validée.
 
 ## Tests natifs Linux sur profil isolé
 

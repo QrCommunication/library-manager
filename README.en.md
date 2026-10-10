@@ -17,7 +17,7 @@ Developed by QR Communication under **GPL-3.0**. The Rust engine, SQLite databas
 - Personal notes, favorites, ratings, reading progress, and file variants.
 - Immutable originals and normalized **Author → Series → numbered title** paths. Volume zero and decimal series positions are supported.
 
-The library and device book views share a selection bar with **Assistant**, **Verify metadata**, **Transfer**, and **Remove from library**. A selection can contain up to 200 books. Unavailable actions explain their requirements, such as a ready provider for analysis or a writable device for transfer.
+The library and device book views share a selection bar with **Assistant**, **Verify metadata**, **Send to ereader**, and **Remove from library**. A selection can contain up to 200 books. Unavailable actions explain their requirements, such as a ready provider for analysis or a writable device for transfer.
 
 **Remove from library** removes books from the local catalog after confirmation. It preserves original files, variants, and copies on devices. Removal is recorded in history and can be undone; restoration checks the retained files and any conflicts with the current catalog.
 
@@ -51,9 +51,9 @@ USB inventory progress follows the amount of data actually read. Detected books 
 
 The **CrossPoint** connector talks directly to the firmware's HTTP transfer service on your LAN. Enable file-transfer mode on the reader and enter its address. No Calibre installation is needed. Transfers verify their contents and do not silently overwrite existing files.
 
-To send several books, select them and choose **Transfer**. The dialog lets you choose a connected writable device and an optimization profile, then confirm the transfer. The job appears in Activity; files in the local library are preserved.
+To send several books, select them and choose **Send to ereader**. The **Prepare transfer** dialog lets you choose a connected writable device. If needed, enable **Optimize before transfer** and select an optimization profile, then confirm the transfer. The job appears in Activity; files in the local library are preserved.
 
-An **integrated Calibre wireless server** also accepts compatible clients such as KOReader's Calibre plugin. Start it explicitly in Readers, using the computer's LAN address and port 9090. This version uses an address configured manually; UDP discovery and physical trials of this wireless protocol are not yet validated. The protocol is implemented inside Library Manager, with no Calibre installation.
+An **integrated Calibre wireless server** also accepts compatible clients such as KOReader's Calibre plugin. Start it explicitly in **Ereaders**, using the computer's LAN address and port 9090. This version uses an address configured manually; UDP discovery and physical trials of this wireless protocol are not yet validated. The protocol is implemented inside Library Manager, with no Calibre installation.
 
 | EPUB profile | Purpose |
 | --- | --- |
@@ -89,6 +89,8 @@ The EPUB reader includes a table of contents and saved position. Book HTML is sa
 | macOS 13 or newer, Intel | DMG and x86_64 application |
 
 Windows and macOS builds, signing, and macOS notarization are being validated. This table describes release targets; it does not establish package availability or completed notarization. Release notes will identify published packages, completed checks, and SHA-256 checksums.
+
+The Windows MSI and EXE installers are planned without Authenticode signing. The macOS packages must be signed and receive an **Accepted** notarization status; this validation is still pending for the final artifacts.
 
 Linux packages use **Ubuntu 22.04 with glibc 2.35** as their build baseline. They require glibc 2.35 or newer and compatible GTK/WebKit system libraries. The following commands use **0.2.1** package names, to be used once those packages are published and downloaded.
 
@@ -132,7 +134,7 @@ French and English are included. The default follows your system language; setti
 Stack: **Tauri 2, Rust, Svelte 5, TypeScript, and bundled SQLite**. Build-tool versions are pinned in manifests and lockfiles. The core engine is independent of the WebView.
 
 ```sh
-pnpm install --frozen-lockfile
+pnpm install --frozen-lockfile --force --ignore-scripts
 pnpm tauri dev
 ```
 

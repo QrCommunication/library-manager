@@ -17,7 +17,7 @@ Library Manager est développé par QR Communication, sous licence **GPL-3.0**. 
 - Notes personnelles, favoris, évaluations, progression et variantes d’un même livre.
 - Originaux conservés intacts ; fichiers normalisés rangés selon **Auteur → Série → numéro et titre**. Le tome zéro et les numéros décimaux sont pris en charge.
 
-Les actions groupées utilisent la même barre de sélection dans la bibliothèque et les vues consacrées aux livres des appareils : **Assistant**, **Vérifier les métadonnées**, **Transférer** et **Retirer de la bibliothèque**. Une sélection peut contenir jusqu’à 200 livres. Les actions indisponibles indiquent leur condition, par exemple un fournisseur actif pour l’analyse ou un appareil accessible en écriture pour le transfert.
+Les actions groupées utilisent la même barre de sélection dans la bibliothèque et les vues consacrées aux livres des appareils : **Assistant**, **Vérifier les métadonnées**, **Envoyer à la liseuse** et **Retirer de la bibliothèque**. Une sélection peut contenir jusqu’à 200 livres. Les actions indisponibles indiquent leur condition, par exemple un fournisseur actif pour l’analyse ou un appareil accessible en écriture pour le transfert.
 
 **Retirer de la bibliothèque** enlève les livres du catalogue local après confirmation. Cette action conserve les fichiers originaux, les variantes et les copies présentes sur les appareils. Le retrait est enregistré dans l’historique et peut être annulé ; la restauration vérifie les fichiers conservés et les éventuels conflits avec le catalogue courant.
 
@@ -51,7 +51,7 @@ La barre de progression de l’inventaire USB suit la quantité de données rée
 
 Le connecteur **CrossPoint** utilise directement le transfert HTTP du firmware sur le réseau local. Activez le mode de transfert sur la liseuse puis indiquez son adresse dans l’application. L’installation de Calibre n’est pas nécessaire. Les copies sont vérifiées et les fichiers déjà présents ne sont pas écrasés implicitement.
 
-Pour envoyer plusieurs livres, cochez-les puis choisissez **Transférer**. La fenêtre de transfert permet de choisir un appareil connecté accessible en écriture et un profil d’optimisation, puis de confirmer l’envoi. Le traitement apparaît dans l’activité ; les fichiers de la bibliothèque locale restent conservés.
+Pour envoyer plusieurs livres, cochez-les puis choisissez **Envoyer à la liseuse**. La fenêtre de transfert permet de choisir un appareil connecté accessible en écriture et un profil d’optimisation, puis de confirmer l’envoi. Le traitement apparaît dans l’activité ; les fichiers de la bibliothèque locale restent conservés.
 
 Un serveur **Calibre sans fil intégré** permet aussi de connecter un client compatible tel que le module Calibre de KOReader. Il s’active explicitement dans le panneau Liseuses, sur l’adresse locale du PC et le port 9090. Cette version utilise une connexion configurée par adresse IP ; la découverte UDP et les essais matériels de ce protocole sans fil ne sont pas encore validés. Le protocole reste autonome, sans installer Calibre.
 
@@ -91,6 +91,8 @@ La **version 0.2.1 est en préparation**. Sa [page de livraison v0.2.1](https://
 | macOS 13 ou ultérieur, Intel | DMG et application x86_64 |
 
 Les builds Windows et macOS, la signature et la notarisation macOS sont en cours de validation. Cette liste décrit les cibles de livraison, sans attester leur disponibilité ni une notarisation accomplie. Les notes de version préciseront les paquets publiés, les essais effectués et leurs sommes SHA-256.
+
+Les installateurs Windows MSI et EXE sont prévus sans signature Authenticode. Les paquets macOS doivent être signés et obtenir le statut de notarisation **Accepted** ; cette validation reste attendue sur les artefacts finaux.
 
 Les paquets Linux utilisent Ubuntu 22.04, avec glibc 2.35, comme base de compilation. Les commandes suivantes correspondent aux noms des paquets **0.2.1**, à utiliser une fois ceux-ci publiés et téléchargés.
 
@@ -132,7 +134,7 @@ La langue suit le système par défaut et peut être choisie dans les paramètre
 Stack : **Tauri 2, Rust, Svelte 5, TypeScript et SQLite embarqué**. Les versions de compilation sont fixées dans les manifestes et les lockfiles. Le noyau métier ne dépend pas de la WebView.
 
 ```sh
-pnpm install --frozen-lockfile
+pnpm install --frozen-lockfile --force --ignore-scripts
 pnpm tauri dev
 ```
 

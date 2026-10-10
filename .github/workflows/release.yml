@@ -1,0 +1,714 @@
+name: Verified desktop release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag on the current main commit
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Verify exact CI packages and isolated native runtime
+    runs-on: ubuntu-22.04
+    timeout-minutes: 210
+    outputs:
+      artifact_id: ${{ steps.transport.outputs.artifact-id }}
+      artifact_digest: ${{ steps.transport.outputs.artifact-digest }}
+      helper_digest: ${{ steps.collect.outputs.helper_digest }}
+      source_sha: ${{ steps.collect.outputs.source_sha }}
+      tag: ${{ steps.collect.outputs.tag }}
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: Checkout the requested tag without persistent credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          persist-credentials: false
+
+      - name: Install the pinned native driver toolchain
+        uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1
+        with:
+          toolchain: 1.99.0
+
+      - name: Build the driver before network isolation
+        run: cargo install tauri-driver --version 2.1.0 --locked --root "$RUNNER_TEMP/native-driver"
+
+      - name: Gate CI, download verified artifacts, and assemble canonical packages
+        id: collect
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p release-transport/assets
+          cat > release-transport/release.py <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import stat
+          import subprocess
+          import sys
+          import tarfile
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import zipfile
+          from pathlib import Path
+
+          ROOT = Path(__file__).resolve().parent
+          ASSETS = ROOT / 'assets'
+          REPO = os.environ['GITHUB_REPOSITORY']
+          API = 'https://api.github.com/repos/' + REPO
+          TOKEN = os.environ.get('GH_TOKEN', '')
+          LIMIT = 1024 * 1024 * 1024
+          PUBLIC_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,199}\Z')
+
+          def require(value, message):
+              if not value:
+                  raise RuntimeError(message)
+
+          def sha(data):
+              return hashlib.sha256(data).hexdigest()
+
+          def file_sha(path):
+              digest = hashlib.sha256()
+              with path.open('rb') as source:
+                  while block := source.read(1024 * 1024):
+                      digest.update(block)
+              return digest.hexdigest()
+
+          def write_json(path, value):
+              path.write_text(json.dumps(value, sort_keys=True, indent=2) + '\n', encoding='utf-8')
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, response, code, message, headers, location):
+                  return None
+
+          def request(url, method='GET', data=None, accept='application/vnd.github+json', auth=True):
+              parsed = urllib.parse.urlsplit(url)
+              require(parsed.scheme == 'https' and not parsed.username and not parsed.password, 'Unsafe request URL')
+              headers = {'Accept': accept, 'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'library-manager-release'}
+              if auth:
+                  require(parsed.hostname in ('api.github.com', 'uploads.github.com'), 'Refusing credential forwarding')
+                  headers['Authorization'] = 'Bearer ' + TOKEN
+              if data is not None:
+                  headers['Content-Type'] = 'application/json'
+              try:
+                  return urllib.request.build_opener(NoRedirect()).open(
+                      urllib.request.Request(url, data=data, headers=headers, method=method), timeout=120)
+              except urllib.error.HTTPError as error:
+                  if error.code in (301, 302, 303, 307, 308):
+                      return error
+                  if error.code == 404:
+                      return None
+                  raise RuntimeError('GitHub request failed with HTTP ' + str(error.code)) from None
+              except urllib.error.URLError:
+                  raise RuntimeError('GitHub request could not connect') from None
+
+          def api(path, method='GET', value=None):
+              response = request(API + path, method, None if value is None else json.dumps(value).encode())
+              if response is None:
+                  return None
+              with response:
+                  require(response.status == 200 or response.status == 201, 'Unexpected API response')
+                  body = response.read(10 * 1024 * 1024 + 1)
+              require(len(body) <= 10 * 1024 * 1024, 'API response exceeds limit')
+              return json.loads(body)
+
+          def download(url, target, digest=None, auth=True):
+              response = request(url, accept='application/octet-stream', auth=auth)
+              require(response is not None, 'Download is missing')
+              redirects = 0
+              while response.status in (301, 302, 303, 307, 308):
+                  location = response.headers.get('Location', '')
+                  response.close()
+                  host = urllib.parse.urlsplit(location).hostname or ''
+                  require(any(host == domain or host.endswith('.' + domain) for domain in
+                              ('github.com', 'githubusercontent.com', 'blob.core.windows.net', 'amazonaws.com')),
+                          'Download redirect is outside trusted hosts')
+                  redirects += 1
+                  require(redirects <= 5, 'Too many download redirects')
+                  # Signed CDN URLs are followed WITHOUT the GitHub token.
+                  response = request(location, accept='application/octet-stream', auth=False)
+                  require(response is not None, 'Redirect download is missing')
+              require(response.status == 200, 'Download did not succeed')
+              total = 0
+              hasher = hashlib.sha256()
+              with response, target.open('xb') as output:
+                  while block := response.read(1024 * 1024):
+                      total += len(block)
+                      require(total <= LIMIT, 'Download exceeds size limit')
+                      output.write(block)
+                      hasher.update(block)
+              require(total > 0, 'Download is empty')
+              result = hasher.hexdigest()
+              if digest is not None:
+                  require(re.fullmatch('[a-f0-9]{64}', digest) and result == digest, 'Download digest mismatch')
+              return result
+
+          def extract_zip(path, destination, flat=True):
+              destination.mkdir(parents=True, exist_ok=False)
+              seen = set()
+              total = 0
+              with zipfile.ZipFile(path) as archive:
+                  require(0 < len(archive.infolist()) <= 10000, 'Archive entry count exceeds limit')
+                  for entry in archive.infolist():
+                      parts = Path(entry.filename).parts
+                      require(parts and not entry.filename.startswith('/') and '\\' not in entry.filename
+                              and all(part not in ('.', '..') for part in parts)
+                              and not re.match(r'^[A-Za-z]:', entry.filename), 'Unsafe archive path')
+                      require(not flat or len(parts) == 1, 'CI asset is not a flat archive')
+                      mode = entry.external_attr >> 16
+                      require(not stat.S_ISLNK(mode) and (stat.S_IFMT(mode) in (0, stat.S_IFREG, stat.S_IFDIR)),
+                              'Archive contains a link or special file')
+                      key = entry.filename.rstrip('/').casefold()
+                      require(key not in seen, 'Archive contains duplicate paths')
+                      seen.add(key)
+                      total += entry.file_size
+                      require(total <= LIMIT, 'Expanded archive exceeds size limit')
+                      output = destination.joinpath(*parts)
+                      if entry.is_dir():
+                          output.mkdir(parents=True, exist_ok=True)
+                      else:
+                          output.parent.mkdir(parents=True, exist_ok=True)
+                          with archive.open(entry) as source, output.open('xb') as target:
+                              actual = 0
+                              while block := source.read(1024 * 1024):
+                                  actual += len(block)
+                                  require(actual <= entry.file_size, 'Archive entry exceeds declared size')
+                                  target.write(block)
+                              require(actual == entry.file_size, 'Archive entry is truncated')
+
+          def verify_sums(directory):
+              entries = {}
+              for line in (directory / 'SHA256SUMS').read_text(encoding='utf-8').splitlines():
+                  match = re.fullmatch(r'([a-f0-9]{64}) [ *](.+)', line)
+                  require(match is not None, 'Invalid checksum record')
+                  digest, name = match.groups()
+                  require(Path(name).name == name and name not in entries and name != 'SHA256SUMS', 'Unsafe checksum name')
+                  entries[name] = digest
+              actual = {path.name for path in directory.iterdir() if path.is_file() and path.name != 'SHA256SUMS'}
+              require(actual == set(entries), 'Checksum coverage differs from artifact contents')
+              for name, digest in entries.items():
+                  require(file_sha(directory / name) == digest, 'CI asset checksum mismatch')
+              return entries
+
+          def pages(path, field=None):
+              result = []
+              for number in range(1, 21):
+                  separator = '&' if '?' in path else '?'
+                  data = api(path + separator + 'per_page=100&page=' + str(number))
+                  require(data is not None, 'GitHub list is missing')
+                  values = data[field] if field else data
+                  result.extend(values)
+                  if len(values) < 100:
+                      return result
+              raise RuntimeError('GitHub list exceeds pagination limit')
+
+          def collect():
+              tag = os.environ['RELEASE_TAG']
+              require(re.fullmatch(r'v\d+\.\d+\.\d+', tag), 'Release tag must be a stable semantic version')
+              version = tag[1:]
+              commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+              require(re.fullmatch('[a-f0-9]{40}', commit), 'Invalid source commit')
+              repo = api('')
+              require(repo and not repo['private'] and repo['default_branch'] == 'main', 'Release requires a public main repository')
+              branch = api('/branches/main')
+              require(branch['commit']['sha'] == commit, 'The tag must match current main; push workflow changes first')
+              reference = api('/git/ref/tags/' + tag)
+              require(reference is not None, 'Version tag has not been pushed')
+              obj = reference['object']
+              if obj['type'] == 'tag':
+                  obj = api('/git/tags/' + obj['sha'])['object']
+              require(obj['type'] == 'commit' and obj['sha'] == commit, 'Tag points to a different commit')
+              require(json.loads(Path('src-tauri/tauri.conf.json').read_text())['version'] == version,
+                      'Package version differs from tag')
+              if os.environ['GITHUB_EVENT_NAME'] == 'push':
+                  require(os.environ['GITHUB_SHA'] == commit, 'Tag trigger and checkout differ')
+              required = {
+                  'ci.yml': ['Standalone Linux build'],
+                  'desktop.yml': ['windows x64 native packages', 'macos arm64 native packages', 'macos x64 native packages'],
+                  'codeql': ['Analyze (actions)', 'Analyze (javascript-typescript)', 'Analyze (python)', 'Analyze (rust)'],
+              }
+              runs = {}
+              deadline = time.monotonic() + 150 * 60
+              while len(runs) != len(required):
+                  require(time.monotonic() < deadline, 'Timed out waiting for exact-commit CI')
+                  for workflow, names in required.items():
+                      endpoint = '/actions/runs' if workflow == 'codeql' else '/actions/workflows/' + workflow + '/runs'
+                      values = pages(endpoint + '?head_sha=' + commit, 'workflow_runs')
+                      values = [run for run in values if run['head_sha'] == commit and run['head_branch'] == 'main'
+                                and run['head_repository']['id'] == repo['id']
+                                and ((workflow == 'codeql' and run['event'] == 'dynamic'
+                                      and run['path'] == 'dynamic/github-code-scanning/codeql')
+                                     or (workflow != 'codeql' and run['event'] in ('push', 'workflow_dispatch')))]
+                      if not values:
+                          continue
+                      run = max(values, key=lambda item: (item['id'], item['run_attempt']))
+                      if run['status'] != 'completed':
+                          runs.pop(workflow, None)
+                          continue
+                      require(run['conclusion'] == 'success', 'Exact-commit build workflow failed: ' + workflow)
+                      jobs = pages('/actions/runs/' + str(run['id']) + '/attempts/' + str(run['run_attempt']) + '/jobs', 'jobs')
+                      for name in names:
+                          matches = [job for job in jobs if job['name'] == name]
+                          require(len(matches) == 1 and matches[0]['conclusion'] == 'success', 'Required native job did not pass: ' + name)
+                      runs[workflow] = run
+                  if len(runs) != len(required):
+                      time.sleep(30)
+              platforms = [
+                  ('linux', 'ci.yml', 'library-manager-linux-' + commit),
+                  ('windows-x64', 'desktop.yml', 'library-manager-windows-x64-unsigned-' + commit),
+                  ('macos-arm64', 'desktop.yml', 'library-manager-macos-arm64-signed-' + commit),
+                  ('macos-x64', 'desktop.yml', 'library-manager-macos-x64-signed-' + commit),
+              ]
+              provenance = []
+              for platform, workflow, name in platforms:
+                  run = runs[workflow]
+                  values = pages('/actions/runs/' + str(run['id']) + '/artifacts', 'artifacts')
+                  matches = [artifact for artifact in values if artifact['name'] == name and not artifact['expired']]
+                  require(len(matches) == 1, 'Required CI artifact is missing or ambiguous: ' + platform)
+                  artifact = matches[0]
+                  digest = artifact.get('digest', '')
+                  require(re.fullmatch('sha256:[a-f0-9]{64}', digest), 'CI ZIP has no SHA-256 provenance')
+                  archive = ROOT / (platform + '.zip')
+                  download(API + '/actions/artifacts/' + str(artifact['id']) + '/zip', archive, digest[7:])
+                  directory = ROOT / platform
+                  extract_zip(archive, directory)
+                  checksums = verify_sums(directory)
+                  provenance.append({'platform': platform, 'workflowRunId': run['id'], 'runAttempt': run['run_attempt'],
+                                     'artifactId': artifact['id'], 'artifactName': name, 'zipSha256': digest[7:],
+                                     'sourceAssetSha256': checksums})
+                  for common, source in [('LICENSE', Path('LICENSE')), ('THIRD_PARTY_NOTICES.md', Path('docs/THIRD_PARTY_NOTICES.md'))]:
+                      require((directory / common).read_bytes() == source.read_bytes(), 'Bundled common license differs from tag')
+                      if not (ASSETS / common).exists():
+                          (ASSETS / common).write_bytes(source.read_bytes())
+                  if platform == 'linux':
+                      rename = {
+                          '.deb': 'library-manager_' + version + '_amd64.deb',
+                          '.rpm': 'library-manager-' + version + '-1.x86_64.rpm',
+                          '.AppImage': 'library-manager_' + version + '_amd64.AppImage',
+                          '.tar.gz': 'library-manager-' + version + '-source.tar.gz',
+                      }
+                      require(len(checksums) == 6, 'Unexpected Linux artifact contents')
+                      for suffix, target in rename.items():
+                          matches = [path for path in directory.iterdir() if path.name.endswith(suffix)]
+                          require(len(matches) == 1, 'Linux package format is missing or ambiguous')
+                          (ASSETS / target).write_bytes(matches[0].read_bytes())
+                      source_archive = ASSETS / rename['.tar.gz']
+                      tracked = subprocess.check_output(['git', 'ls-files', '-z']).decode().split('\0')[:-1]
+                      with tarfile.open(source_archive, 'r:gz') as archive:
+                          seen = set()
+                          total = 0
+                          prefix = 'library-manager-' + commit + '/'
+                          for entry in archive:
+                              if entry.isdir() and entry.name.rstrip('/') == prefix.rstrip('/'):
+                                  continue
+                              require(entry.name.startswith(prefix), 'Source archive prefix differs from exact commit')
+                              relative = entry.name[len(prefix):].rstrip('/')
+                              require(not Path(relative).is_absolute() and '..' not in Path(relative).parts,
+                                      'Unsafe source archive path')
+                              if entry.isdir():
+                                  continue
+                              require(entry.isfile() and relative in tracked and relative not in seen,
+                                      'Source archive has an unexpected entry')
+                              total += entry.size
+                              require(total <= LIMIT, 'Source archive exceeds limit')
+                              require(sha(archive.extractfile(entry).read()) == file_sha(Path(relative)),
+                                      'Source archive bytes differ from tagged checkout')
+                              seen.add(relative)
+                          require(seen == set(tracked), 'Source archive does not include the complete tag')
+                  else:
+                      report = json.loads((directory / 'package-report.json').read_text())
+                      system, arch = platform.split('-')
+                      target = {'windows-x64': 'x86_64-pc-windows-msvc', 'macos-arm64': 'aarch64-apple-darwin',
+                                'macos-x64': 'x86_64-apple-darwin'}[platform]
+                      require(report['commit'] == commit and report['version'] == version and report['platform'] == system
+                              and report['architecture'] == arch and report['target'] == target
+                              and report['nativeSidecarExecuted'] is True, 'Native package provenance differs from tag')
+                      mode = 'unsigned' if system == 'windows' else 'signed'
+                      require(report['signingMode'] == mode, 'Required signing mode is missing')
+                      prefix = 'library-manager_' + version + '_' + system + '_' + arch + '_' + mode
+                      expected = {prefix + '.msi', prefix + '_setup.exe'} if system == 'windows' else {prefix + '.dmg', prefix + '.app.zip'}
+                      require(set(report['assets']) == expected and all(name in checksums for name in expected),
+                              'Native package names differ from canonical assets')
+                      for name in expected:
+                          (ASSETS / name).write_bytes((directory / name).read_bytes())
+                      write_json(ASSETS / ('package-report-' + platform + '.json'), report)
+                      if system == 'windows':
+                          audit = (directory / 'sidecar-dependencies.log').read_text()
+                          dlls = [match.lower() for match in re.findall(r'^\s*DLL Name:\s*(\S+)\s*$', audit, re.M)]
+                          require(dlls and all(dll in ('kernel32.dll', 'msvcrt.dll', 'ucrtbase.dll') or
+                                              dll.startswith(('api-ms-win-', 'ext-ms-win-')) for dll in dlls),
+                                  'Windows sidecar requires an unbundled non-system DLL')
+                          write_json(ASSETS / 'windows-sidecar-audit.json', {'architecture': arch, 'target': target,
+                                     'signingMode': 'unsigned', 'systemDlls': sorted(set(dlls)), 'passed': True})
+                      else:
+                          signed = json.loads((directory / 'notarization-report.json').read_text())
+                          flags = ['applicationCodesignVerified', 'applicationTeamMatched', 'sidecarCodesignVerified',
+                                   'sidecarTeamMatched', 'applicationStaplerValidated', 'applicationGatekeeperAccepted',
+                                   'diskImageCodesignVerified', 'diskImageStaplerValidated', 'diskImageGatekeeperAccepted']
+                          require(all(signed.get(flag) is True for flag in flags)
+                                  and signed.get('diskImageNotarizationStatus') == 'Accepted', 'Mac signature/notarization evidence is incomplete')
+                          write_json(ASSETS / ('notarization-report-' + platform + '.json'), signed)
+              write_json(ROOT / 'provenance.json', {'tag': tag, 'version': version, 'commit': commit,
+                         'repository': REPO, 'ciArtifacts': provenance,
+                         'codeql': {'workflowRunId': runs['codeql']['id'], 'runAttempt': runs['codeql']['run_attempt'],
+                                    'languages': ['actions', 'javascript-typescript', 'python', 'rust'], 'conclusion': 'success'}})
+              with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+                  output.write('source_sha=' + commit + '\ntag=' + tag + '\nhelper_digest=' + file_sha(Path(__file__)) + '\n')
+
+          def finalize():
+              manifest = json.loads((ROOT / 'provenance.json').read_text())
+              scenarios = [('deb-general', 10), ('deb-assistant', 10), ('deb-catalogue', 9), ('appimage-general', 10)]
+              evidence = []
+              for scenario, minimum in scenarios:
+                  report = json.loads((ROOT / 'qa' / (scenario + '.json')).read_text())
+                  require(report['status'] == 'passed' and report['version'] == manifest['version']
+                          and report.get('paidApiCalls') == 0 and report.get('physicalDeviceWrites') == 0,
+                          'Isolated native scenario did not pass: ' + scenario)
+                  checks = report['checks']
+                  require(len(checks) >= minimum and all(check['status'] == 'passed' for check in checks),
+                          'Native check coverage is incomplete: ' + scenario)
+                  for check in checks:
+                      require(re.fullmatch('[A-Za-z0-9_]{1,120}', check['name']), 'Unexpected native check name')
+                  safe = {key: report[key] for key in ('schemaVersion', 'status', 'version', 'binaryName', 'binarySha256',
+                                                       'paidApiCalls', 'physicalDeviceWrites', 'checks')}
+                  safe.update({'scenario': scenario, 'profileMode': 'freshSynthetic', 'dockerNetwork': 'none',
+                               'sourceCommit': manifest['commit']})
+                  write_json(ASSETS / ('native-' + scenario + '-report.json'), safe)
+                  evidence.append({'scenario': scenario, 'passedChecks': len(checks), 'binarySha256': report['binarySha256']})
+              require(len({item['binarySha256'] for item in evidence[:3]}) == 1, 'DEB scenarios exercised different binaries')
+              payload = json.loads((ROOT / 'qa' / 'payload-hashes.json').read_text())
+              require(all(re.fullmatch('[a-f0-9]{64}', payload[key]) for key in
+                          ('debBinarySha256', 'appImageLauncherSha256', 'appImageBinarySha256')),
+                      'Measured package payload digest is invalid')
+              # The AppImage bundler modifies ELF metadata, including RUNPATH.
+              # Bind each native report to its own verified package payload;
+              # retain the AppImage main binary hash without equating formats.
+              require(payload['debBinarySha256'] == evidence[0]['binarySha256']
+                      and payload['appImageLauncherSha256'] == evidence[3]['binarySha256'], 'QA binary identity mismatch')
+              manifest.update({'nativeQa': evidence, 'packagedBinaryIdentity': payload, 'paidApiCalls': 0,
+                               'physicalDeviceWrites': 0, 'nativeQaDockerNetwork': 'none',
+                               'macosGuiTested': False, 'windowsGuiTested': False})
+              manifest['assets'] = {path.name: file_sha(path) for path in sorted(ASSETS.iterdir())}
+              write_json(ASSETS / 'BUILD_MANIFEST.json', manifest)
+              sums = ''.join(file_sha(path) + '  ' + path.name + '\n' for path in sorted(ASSETS.iterdir()))
+              (ASSETS / 'SHA256SUMS').write_text(sums)
+              verify_sums(ASSETS)
+              for path in ASSETS.iterdir():
+                  require(PUBLIC_NAME.fullmatch(path.name), 'Public asset name is unsafe')
+
+          def publish():
+              checksums = verify_sums(ASSETS)
+              manifest = json.loads((ASSETS / 'BUILD_MANIFEST.json').read_text())
+              tag, commit = manifest['tag'], manifest['commit']
+              require(tag == os.environ['EXPECTED_TAG'] and commit == os.environ['EXPECTED_SHA']
+                      and manifest['repository'] == REPO, 'Prepared release provenance mismatch')
+              # Never silently retarget a tag or recreate a public release.
+              reference = api('/git/ref/tags/' + tag)['object']
+              if reference['type'] == 'tag':
+                  reference = api('/git/tags/' + reference['sha'])['object']
+              require(reference['type'] == 'commit' and reference['sha'] == commit, 'Release tag moved after validation')
+              release = api('/releases/tags/' + tag)
+              expected = dict(checksums)
+              expected['SHA256SUMS'] = file_sha(ASSETS / 'SHA256SUMS')
+              body = ('Library Manager ' + manifest['version'] + '\n\n'
+                      'Source commit: `' + commit + '`. Packages and checksums are bound to this commit in BUILD_MANIFEST.json.\n\n'
+                      'Linux DEB and extracted AppImage were tested with fresh synthetic profiles and no network. '
+                      'macOS ARM64 and Intel applications and disk images are signed, notarized, stapled, and assessed by Gatekeeper. '
+                      'Windows x64 MSI and NSIS packages are unsigned; the native sidecar dependency audit passed. '
+                      'Windows and macOS GUI operation is not covered by the Linux smoke tests.\n\n'
+                      'GPL-3.0 license, third-party notices, exact source archive, native test reports, and SHA256SUMS are attached.')
+              if release is None:
+                  release = api('/releases', 'POST', {'tag_name': tag, 'target_commitish': commit, 'name': 'Library Manager ' + manifest['version'],
+                                                     'body': body, 'draft': True, 'prerelease': False, 'make_latest': 'false'})
+              require(release['tag_name'] == tag and not release['prerelease'], 'Existing release has incompatible metadata')
+              assets = pages('/releases/' + str(release['id']) + '/assets')
+              names = [asset['name'] for asset in assets]
+              require(len(names) == len(set(names)) and set(names) <= set(expected), 'Existing release contains unexpected assets')
+              if not release['draft']:
+                  require(set(names) == set(expected), 'Refusing to alter an incomplete public release')
+              verify_dir = ROOT / 'authenticated-verification'
+              verify_dir.mkdir(exist_ok=False)
+              for asset in assets:
+                  require(asset['state'] == 'uploaded', 'Existing release upload is incomplete')
+                  digest = asset.get('digest')
+                  require(digest is None or digest == 'sha256:' + expected[asset['name']], 'Existing asset digest differs; clobber is forbidden')
+                  download(API + '/releases/assets/' + str(asset['id']), verify_dir / asset['name'], expected[asset['name']])
+              for name in sorted(set(expected) - set(names)):
+                  require(release['draft'], 'Public asset upload is forbidden')
+                  url = release['upload_url'].split('{')[0] + '?name=' + urllib.parse.quote(name, safe='')
+                  data = (ASSETS / name).read_bytes()
+                  req = urllib.request.Request(url, data=data, method='POST', headers={
+                      'Authorization': 'Bearer ' + TOKEN, 'Accept': 'application/vnd.github+json',
+                      'Content-Type': 'application/octet-stream', 'X-GitHub-Api-Version': '2022-11-28'})
+                  try:
+                      with urllib.request.build_opener(NoRedirect()).open(req, timeout=300) as response:
+                          require(response.status == 201, 'Release asset upload failed')
+                          asset = json.loads(response.read(1024 * 1024))
+                  except urllib.error.HTTPError as error:
+                      raise RuntimeError('Release asset upload failed with HTTP ' + str(error.code)) from None
+                  require(asset['name'] == name and asset['state'] == 'uploaded', 'Uploaded asset identity differs')
+                  download(API + '/releases/assets/' + str(asset['id']), verify_dir / name, expected[name])
+              assets = pages('/releases/' + str(release['id']) + '/assets')
+              require({asset['name'] for asset in assets} == set(expected) and len(assets) == len(expected), 'Release asset set is incomplete')
+              if release['draft']:
+                  release = api('/releases/' + str(release['id']), 'PATCH', {'draft': False, 'make_latest': 'false'})
+              public_dir = ROOT / 'anonymous-verification'
+              public_dir.mkdir(exist_ok=False)
+              # A draft cannot be downloaded anonymously. Publish without marking it
+              # latest, verify every public download, and only then promote it.
+              for asset in assets:
+                  url = 'https://github.com/' + REPO + '/releases/download/' + tag + '/' + urllib.parse.quote(asset['name'], safe='')
+                  for attempt in range(6):
+                      target = public_dir / asset['name']
+                      try:
+                          download(url, target, expected[asset['name']], auth=False)
+                          break
+                      except RuntimeError:
+                          target.unlink(missing_ok=True)
+                          if attempt == 5:
+                              raise
+                          time.sleep(10)
+              api('/releases/' + str(release['id']), 'PATCH', {'make_latest': 'true'})
+              require(api('/releases/latest')['id'] == release['id'], 'Verified release was not promoted to latest')
+              proof = {'tag': tag, 'commit': commit, 'releaseId': release['id'], 'assetCount': len(expected),
+                       'authenticatedDownloadsVerified': True, 'anonymousDownloadsVerified': True,
+                       'latestVerified': True, 'sha256': expected}
+              write_json(ROOT / 'PUBLIC_VERIFICATION.json', proof)
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+                  summary.write('Release [' + tag + '](https://github.com/' + REPO + '/releases/tag/' + tag + ') verified.\n\n'
+                                + str(len(expected)) + ' assets downloaded anonymously and checked against SHA-256.\n')
+
+          if __name__ == '__main__':
+              require(len(sys.argv) == 2 and sys.argv[1] in ('collect', 'finalize', 'publish'), 'Unknown release phase')
+              try:
+                  {'collect': collect, 'finalize': finalize, 'publish': publish}[sys.argv[1]]()
+              except Exception as error:
+                  # Do not print tracebacks, signed CDN URLs, or response bodies.
+                  detail = str(error) if type(error) is RuntimeError else type(error).__name__
+                  print('Release validation failed: ' + detail, file=sys.stderr)
+                  sys.exit(1)
+          PY
+          python3 release-transport/release.py collect
+
+      - name: Build an isolated Ubuntu 22.04 native QA image
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-native-image/scripts" release-transport/qa
+          cp scripts/native-smoke.py scripts/native-assistant-smoke.py "$RUNNER_TEMP/release-native-image/scripts/"
+          cp "$RUNNER_TEMP/native-driver/bin/tauri-driver" "$RUNNER_TEMP/release-native-image/tauri-driver"
+          cp release-transport/assets/*.deb "$RUNNER_TEMP/release-native-image/application.deb"
+          cp release-transport/assets/*.AppImage "$RUNNER_TEMP/release-native-image/application.AppImage"
+          cat > "$RUNNER_TEMP/release-native-image/Dockerfile" <<'DOCKER'
+          FROM ubuntu:22.04
+          ENV DEBIAN_FRONTEND=noninteractive
+          RUN apt-get update && apt-get install -y --no-install-recommends xvfb dbus-x11 webkit2gtk-driver python3 curl ca-certificates && rm -rf /var/lib/apt/lists/*
+          COPY application.deb /tmp/application.deb
+          RUN apt-get update && apt-get install -y /tmp/application.deb && rm -f /tmp/application.deb && rm -rf /var/lib/apt/lists/*
+          COPY application.AppImage /qa/application.AppImage
+          COPY tauri-driver /qa/tauri-driver
+          COPY scripts /qa/scripts
+          COPY run.sh /qa/run.sh
+          RUN chmod 755 /qa/tauri-driver /qa/application.AppImage /qa/run.sh
+          ENTRYPOINT ["/qa/run.sh"]
+          DOCKER
+          cat > "$RUNNER_TEMP/release-native-image/run.sh" <<'SH'
+          #!/bin/bash
+          set -euo pipefail
+          export DISPLAY=:77 TAURI_WEBVIEW_AUTOMATION=true
+          export XDG_DATA_HOME=/tmp/native-qa/data XDG_CONFIG_HOME=/tmp/native-qa/config XDG_CACHE_HOME=/tmp/native-qa/cache
+          mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"
+          Xvfb :77 -screen 0 1280x900x24 >/tmp/xvfb.log 2>&1 &
+          xvfb_pid=$!
+          dbus-run-session -- /qa/tauri-driver --port 4444 --native-port 4445 --native-driver /usr/bin/WebKitWebDriver >/tmp/driver.log 2>&1 &
+          driver_pid=$!
+          trap 'kill "$driver_pid" "$xvfb_pid" 2>/dev/null || true' EXIT
+          for attempt in {1..100}; do
+            if curl -fsS http://127.0.0.1:4444/status >/dev/null; then break; fi
+            sleep 0.2
+          done
+          binary=/usr/bin/library-manager
+          scenario="$1"
+          if [[ "$scenario" == appimage-general ]]; then
+            mkdir /tmp/appimage
+            cd /tmp/appimage
+            /qa/application.AppImage --appimage-extract >/tmp/appimage-extraction.log
+            binary=/tmp/appimage/squashfs-root/AppRun
+            test -x "$binary"
+            python3 - <<'PY' > /reports/appimage-payload.json
+          import hashlib, json
+          from pathlib import Path
+          root = Path('/tmp/appimage/squashfs-root')
+          print(json.dumps({'appImageLauncherSha256': hashlib.sha256((root/'AppRun').read_bytes()).hexdigest(),
+                            'appImageBinarySha256': hashlib.sha256((root/'usr/bin/library-manager').read_bytes()).hexdigest()}))
+          PY
+          fi
+          if [[ "$scenario" == deb-general ]]; then
+            sha256sum /usr/bin/library-manager | cut -d' ' -f1 > /reports/deb-payload.sha256
+          fi
+          script=/qa/scripts/native-smoke.py
+          args=()
+          if [[ "$scenario" == deb-assistant || "$scenario" == deb-catalogue ]]; then
+            script=/qa/scripts/native-assistant-smoke.py
+          fi
+          if [[ "$scenario" == deb-catalogue ]]; then args+=(--catalogue-actions); fi
+          python3 "$script" --binary "$binary" --profile-root "$XDG_DATA_HOME" --driver-url http://127.0.0.1:4444 --timeout 600 --report "/reports/$scenario.json" "${args[@]}" >/tmp/native-smoke.log
+          SH
+          docker build --tag library-manager-release-native "$RUNNER_TEMP/release-native-image"
+
+      - name: Exercise actual DEB and extracted AppImage without network
+        run: |
+          set -euo pipefail
+          for scenario in deb-general deb-assistant deb-catalogue appimage-general; do
+            container="release-native-$scenario-${GITHUB_RUN_ID}"
+            docker create --name "$container" --network none --mount "type=bind,src=$GITHUB_WORKSPACE/release-transport/qa,dst=/reports" library-manager-release-native "$scenario" >/dev/null
+            test "$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$container")" = none
+            if ! timeout 720 docker start --attach "$container"; then
+              docker rm --force "$container" >/dev/null
+              exit 1
+            fi
+            test "$(docker inspect --format '{{.State.ExitCode}}' "$container")" = 0
+            docker rm "$container" >/dev/null
+          done
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          root = Path('release-transport/qa')
+          payload = json.loads((root/'appimage-payload.json').read_text())
+          payload['debBinarySha256'] = (root/'deb-payload.sha256').read_text().strip()
+          (root/'payload-hashes.json').write_text(json.dumps(payload) + '\n')
+          PY
+          python3 release-transport/release.py finalize
+
+      - name: Upload validated release transport
+        id: transport
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: validated-release-${{ steps.collect.outputs.tag }}-${{ steps.collect.outputs.source_sha }}
+          path: |
+            release-transport/assets/*
+            release-transport/release.py
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Keep native QA diagnostics when a check fails
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: release-native-qa-diagnostics-${{ github.run_id }}
+          path: release-transport/qa/*.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  publish:
+    name: Publish only hash-verified packages and verify anonymous downloads
+    needs: prepare
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      EXPECTED_TAG: ${{ needs.prepare.outputs.tag }}
+      EXPECTED_SHA: ${{ needs.prepare.outputs.source_sha }}
+      TRANSPORT_ID: ${{ needs.prepare.outputs.artifact_id }}
+      TRANSPORT_DIGEST: ${{ needs.prepare.outputs.artifact_digest }}
+      HELPER_DIGEST: ${{ needs.prepare.outputs.helper_digest }}
+    steps:
+      - name: Verify this run's immutable transport before executing its helper
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, re, stat, urllib.error, urllib.parse, urllib.request, zipfile
+          from pathlib import Path
+          def require(condition, diagnostic):
+              if not condition: raise RuntimeError(diagnostic)
+          artifact_id = os.environ['TRANSPORT_ID']
+          require(artifact_id.isdecimal(), 'Invalid transport artifact id')
+          repo = os.environ['GITHUB_REPOSITORY']
+          api = 'https://api.github.com/repos/' + repo + '/actions/artifacts/' + artifact_id
+          headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json',
+                     'X-GitHub-Api-Version': '2022-11-28'}
+          with urllib.request.urlopen(urllib.request.Request(api, headers=headers), timeout=120) as response:
+              artifact = json.load(response)
+          require(not artifact['expired'] and artifact['workflow_run']['id'] == int(os.environ['GITHUB_RUN_ID'])
+                  and artifact['name'] == 'validated-release-' + os.environ['EXPECTED_TAG'] + '-' + os.environ['EXPECTED_SHA'],
+                  'Transport was not produced by this run')
+          digest = os.environ['TRANSPORT_DIGEST'].removeprefix('sha256:')
+          require(re.fullmatch('[a-f0-9]{64}', digest) and artifact.get('digest') == 'sha256:' + digest,
+                  'Transport digest provenance is missing')
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args): return None
+          try:
+              response = urllib.request.build_opener(NoRedirect()).open(
+                  urllib.request.Request(api + '/zip', headers=headers), timeout=120)
+          except urllib.error.HTTPError as error:
+              require(error.code == 302, 'Artifact redirect was not received')
+              location = error.headers['Location']
+              error.close()
+              parsed = urllib.parse.urlsplit(location)
+              host = parsed.hostname or ''
+              require(parsed.scheme == 'https' and not parsed.username and not parsed.password and
+                      any(host == domain or host.endswith('.' + domain) for domain in
+                          ('githubusercontent.com', 'blob.core.windows.net', 'amazonaws.com')),
+                      'Untrusted artifact download location')
+              response = urllib.request.urlopen(location, timeout=120)
+          size = 0
+          hasher = hashlib.sha256()
+          with response, Path('transport.zip').open('xb') as output:
+              while block := response.read(1024 * 1024):
+                  size += len(block)
+                  require(size <= 1024 * 1024 * 1024, 'Transport exceeds limit')
+                  output.write(block); hasher.update(block)
+          require(hasher.hexdigest() == digest, 'Transport ZIP digest mismatch')
+          total = 0
+          seen = set()
+          with zipfile.ZipFile('transport.zip') as archive:
+              require(len(archive.infolist()) <= 100, 'Unexpected transport entries')
+              for entry in archive.infolist():
+                  name = entry.filename
+                  if name == 'assets/' and entry.is_dir():
+                      continue
+                  require(name == 'release.py' or re.fullmatch(r'assets/[A-Za-z0-9][A-Za-z0-9._-]{0,199}', name),
+                          'Unsafe transport path')
+                  require(not stat.S_ISLNK(entry.external_attr >> 16) and not entry.is_dir()
+                          and stat.S_IFMT(entry.external_attr >> 16) in (0, stat.S_IFREG)
+                          and name.casefold() not in seen, 'Unexpected transport file type or duplicate')
+                  seen.add(name.casefold()); total += entry.file_size
+                  require(total <= 1024 * 1024 * 1024, 'Transport expansion exceeds limit')
+                  target = Path('verified-transport') / name
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  with archive.open(entry) as source, target.open('xb') as output:
+                      written = 0
+                      while block := source.read(1024 * 1024):
+                          written += len(block)
+                          require(written <= entry.file_size, 'Transport entry exceeds size')
+                          output.write(block)
+                      require(written == entry.file_size, 'Truncated transport entry')
+          helper = Path('verified-transport/release.py')
+          require(hashlib.sha256(helper.read_bytes()).hexdigest() == os.environ['HELPER_DIGEST'], 'Helper source digest mismatch')
+          PY
+          python3 verified-transport/release.py publish
+
+      - name: Save final public download verification
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: public-release-verification-${{ needs.prepare.outputs.tag }}-${{ needs.prepare.outputs.source_sha }}
+          path: verified-transport/PUBLIC_VERIFICATION.json
+          if-no-files-found: error
+          retention-days: 90
