@@ -23,10 +23,10 @@ library-core = { path = "../crates/library-core" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-tauri-plugin-dialog = "2.8.1"
-tauri-plugin-opener = "2.7.0"
-tauri-plugin-single-instance = "2.5.2"
+tauri-plugin-dialog = "2.8.4"
+tauri-plugin-opener = "2.7.2"
+tauri-plugin-single-instance = "2.5.5"
 
 [build-dependencies]
 sha2.workspace = true
-tauri-build = { version = "2.7.1", features = [] }
+tauri-build = { version = "2.7.4", features = [] }

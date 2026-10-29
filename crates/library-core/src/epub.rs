@@ -57,7 +57,9 @@ pub fn read_inventory_metadata_file(file: File, fallback: &str) -> Result<BookMe
     }
     let mut names = HashSet::new();
     for name in archive.file_names() {
-        validate_archive_name(name)?;
+        // zip 9 decodes entry names fallibly instead of yielding raw strings.
+        let name = name?;
+        validate_archive_name(&name)?;
         if !names.insert(name.trim_end_matches('/').to_lowercase()) {
             return Err(invalid("ZIP contains duplicate or case-colliding paths"));
         }
@@ -2150,7 +2152,7 @@ mod tests {
         document.write(&path, 9).unwrap();
         let mut archive = ZipArchive::new(File::open(&path).unwrap()).unwrap();
         let first = archive.by_index(0).unwrap();
-        assert_eq!(first.name(), "mimetype");
+        assert_eq!(first.name().unwrap(), "mimetype");
         assert_eq!(first.compression(), CompressionMethod::Stored);
         let start = first.data_start().unwrap() as usize;
         drop(first);
