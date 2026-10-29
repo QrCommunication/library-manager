@@ -2,7 +2,7 @@
 
 <img src="public/library-manager.png" width="96" height="96" alt="Library Manager" />
 
-**Your library, wherever you read.** A standalone application for organizing ebooks, reading EPUBs, and preparing files for ereaders. Version **0.2.1** includes native packaging for Linux, Windows, and macOS.
+**Your library, wherever you read.** A standalone application for organizing ebooks, reading EPUBs, and preparing files for ereaders. Version **0.2.2** includes native packaging for Linux, Windows, and macOS.
 
 [Français](README.md) · [Downloads](https://github.com/QrCommunication/library-manager/releases) · [User guide (French)](docs/USER_GUIDE.md) · [Architecture](docs/BLUEPRINT.md) · [Issues](https://github.com/QrCommunication/library-manager/issues)
 
@@ -79,14 +79,14 @@ The EPUB reader includes a table of contents and saved position. Book HTML is sa
 
 ## Installation
 
-Use the [v0.2.1 release page](https://github.com/QrCommunication/library-manager/releases/tag/v0.2.1) for packages and their verification reports. Choose the package matching your operating system and processor.
+Use the [v0.2.2 release page](https://github.com/QrCommunication/library-manager/releases/tag/v0.2.2) for packages and their verification reports. Choose the package matching your operating system and processor.
 
 | Platform | Package names |
 | --- | --- |
-| Linux x86_64 (64-bit) | `library-manager_0.2.1_amd64.deb`, `library-manager-0.2.1-1.x86_64.rpm`, `library-manager_0.2.1_amd64.AppImage` |
-| Windows 11 x64 | `library-manager_0.2.1_windows_x64_unsigned.msi`, `library-manager_0.2.1_windows_x64_unsigned_setup.exe` |
-| macOS 13 or newer, Apple Silicon | `library-manager_0.2.1_macos_arm64_signed.dmg`, `library-manager_0.2.1_macos_arm64_signed.app.zip` |
-| macOS 13 or newer, Intel | `library-manager_0.2.1_macos_x64_signed.dmg`, `library-manager_0.2.1_macos_x64_signed.app.zip` |
+| Linux x86_64 (64-bit) | `library-manager_0.2.2_amd64.deb`, `library-manager-0.2.2-1.x86_64.rpm`, `library-manager_0.2.2_amd64.AppImage` |
+| Windows 11 x64 | `library-manager_0.2.2_windows_x64_unsigned.msi`, `library-manager_0.2.2_windows_x64_unsigned_setup.exe` |
+| macOS 13 or newer, Apple Silicon | `library-manager_0.2.2_macos_arm64_signed.dmg`, `library-manager_0.2.2_macos_arm64_signed.app.zip` |
+| macOS 13 or newer, Intel | `library-manager_0.2.2_macos_x64_signed.dmg`, `library-manager_0.2.2_macos_x64_signed.app.zip` |
 
 The release workflow requires successful checks for the exact source commit before publishing packages. macOS publication additionally requires verified application and DMG signatures, **Accepted** notarization, validated stapled tickets, and successful Gatekeeper assessments. The Windows MSI and EXE installers have **no Authenticode signature**.
 
@@ -104,18 +104,18 @@ macOS **13.0 or later** is required. Choose the **ARM64** package for Apple Sili
 
 ### Linux installation
 
-Linux packages use **Ubuntu 22.04 with glibc 2.35** as their build baseline. They require glibc 2.35 or newer and compatible GTK/WebKit system libraries. Run the following commands from the directory containing the downloaded **0.2.1** package.
+Linux packages use **Ubuntu 22.04 with glibc 2.35** as their build baseline. They require glibc 2.35 or newer and compatible GTK/WebKit system libraries. Run the following commands from the directory containing the downloaded **0.2.2** package.
 
 On Debian, Ubuntu, and derivatives, install the downloaded DEB:
 
 ```sh
-sudo apt install ./library-manager_0.2.1_amd64.deb
+sudo apt install ./library-manager_0.2.2_amd64.deb
 ```
 
 On Fedora and compatible RPM distributions:
 
 ```sh
-sudo dnf install ./library-manager-0.2.1-1.x86_64.rpm
+sudo dnf install ./library-manager-0.2.2-1.x86_64.rpm
 ```
 
 The package manager installs required GTK/WebKit system libraries and `ca-certificates` for HTTPS connections. Launch **Library Manager** from the applications menu.
@@ -123,14 +123,14 @@ The package manager installs required GTK/WebKit system libraries and `ca-certif
 For the AppImage, make the downloaded file executable and start it:
 
 ```sh
-chmod +x ./library-manager_0.2.1_amd64.AppImage
-./library-manager_0.2.1_amd64.AppImage
+chmod +x ./library-manager_0.2.2_amd64.AppImage
+./library-manager_0.2.2_amd64.AppImage
 ```
 
 The AppImage uses the host operating system's libraries, services, and trusted certificate store. If FUSE is unavailable, start it in extraction mode:
 
 ```sh
-APPIMAGE_EXTRACT_AND_RUN=1 ./library-manager_0.2.1_amd64.AppImage
+APPIMAGE_EXTRACT_AND_RUN=1 ./library-manager_0.2.2_amd64.AppImage
 ```
 
 It needs no Calibre installation or Node, Rust, or Python runtime. Release assets include SHA-256 checksums.
@@ -139,7 +139,7 @@ It needs no Calibre installation or Node, Rust, or Python runtime. Release asset
 
 Close Library Manager before upgrading. Closing its only window quits this version; there is no tray mode. Install the new package for the same architecture and, on Windows, use the same installer type as your previous installation. On macOS, replace the application in **Applications** with the matching new version. On Linux, install the new DEB/RPM with the package manager or replace the AppImage. Keep your library profile when replacing the application.
 
-Reopen Library Manager and check **Settings → About** and the version shown in the sidebar. Both should show **0.2.1**. If an older version opens, check which installed copy or AppImage your shortcut launches.
+Reopen Library Manager and check **Settings → About** and the version shown in the sidebar. Both should show **0.2.2**. If an older version opens, check which installed copy or AppImage your shortcut launches.
 
 See [the validation report](docs/QUALITY.md) for the environments actually tested and the remaining limits.
 

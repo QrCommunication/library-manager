@@ -2,6 +2,18 @@
 
 Les notes détaillées sont en français, suivies d’un résumé en anglais.
 
+## 0.2.2 — 2026-10-29
+
+### Français
+
+- Mise à jour de sécurité des dépendances, sans changement fonctionnel : `zip` 9 (avis RUSTSEC-2026-0367/0368/0369 sur `ZipArchive::extract`, fonction que l’application n’utilise pas), `ammonia` 4.2.4 (nettoyage HTML des contenus lus, RUSTSEC-2021-0157/0158 et RUSTSEC-2026-0373), `rustls` 0.23.46, `rustls-webpki` 0.103.16 et certificats racine `webpki-root-certs` 1.0.11. `cargo audit` ne signale plus aucune vulnérabilité.
+- Mises à jour de Tauri 2.12.5 et de ses extensions, `rusqlite` 0.41, `tokio` 1.54, Svelte 5.57.3, Vite 8.3.5 et des icônes Lucide. Les noms d’entrées ZIP sont désormais décodés avec contrôle d’erreur lors de l’inventaire des EPUB.
+- Inventaire des licences tierces régénéré pour les nouvelles versions.
+
+### English summary
+
+Security dependency update with no functional change: `zip` 9 (advisories on `ZipArchive::extract`, which the application does not call), `ammonia` 4.2.4 (HTML sanitization), `rustls` 0.23.46, `rustls-webpki` 0.103.16 and refreshed root certificates; `cargo audit` reports no vulnerability. Tauri 2.12.5 and plugins, `rusqlite` 0.41, `tokio` 1.54, Svelte, Vite and Lucide icons are updated. ZIP entry names are now decoded fallibly during EPUB inventory. Third-party notices are regenerated.
+
 ## 0.2.1 — 2026-10-10
 
 ### Français

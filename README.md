@@ -2,7 +2,7 @@
 
 <img src="public/library-manager.png" width="96" height="96" alt="Library Manager" />
 
-**Votre bibliothèque, partout où vous lisez.** Application autonome pour organiser les livres numériques, lire les EPUB et préparer des fichiers adaptés aux liseuses. Ce document décrit la version **0.2.1**.
+**Votre bibliothèque, partout où vous lisez.** Application autonome pour organiser les livres numériques, lire les EPUB et préparer des fichiers adaptés aux liseuses. Ce document décrit la version **0.2.2**.
 
 [English](README.en.md) · [Téléchargements](https://github.com/QrCommunication/library-manager/releases) · [Guide utilisateur](docs/USER_GUIDE.md) · [Architecture](docs/BLUEPRINT.md) · [Signaler un problème](https://github.com/QrCommunication/library-manager/issues)
 
@@ -79,16 +79,16 @@ La conversion de documents à mise en page complexe peut aplatir le style. Les a
 
 Le lecteur EPUB propose un sommaire et une position sauvegardée. Le contenu du livre est assaini et isolé, avec scripts et ressources distantes bloqués.
 
-## Télécharger 0.2.1
+## Télécharger 0.2.2
 
-Consultez la [page de livraison v0.2.1](https://github.com/QrCommunication/library-manager/releases/tag/v0.2.1) pour les fichiers publiés, puis choisissez le paquet correspondant à votre système et à son architecture.
+Consultez la [page de livraison v0.2.2](https://github.com/QrCommunication/library-manager/releases/tag/v0.2.2) pour les fichiers publiés, puis choisissez le paquet correspondant à votre système et à son architecture.
 
-| Plateforme | Noms des paquets 0.2.1 |
+| Plateforme | Noms des paquets 0.2.2 |
 | --- | --- |
-| Linux x86_64 (64 bits) | `library-manager_0.2.1_amd64.deb` · `library-manager-0.2.1-1.x86_64.rpm` · `library-manager_0.2.1_amd64.AppImage` |
-| Windows 11 x64 | `library-manager_0.2.1_windows_x64_unsigned.msi` · `library-manager_0.2.1_windows_x64_unsigned_setup.exe` |
-| macOS 13 ou ultérieur, Apple Silicon | `library-manager_0.2.1_macos_arm64_signed.dmg` · `library-manager_0.2.1_macos_arm64_signed.app.zip` |
-| macOS 13 ou ultérieur, Intel | `library-manager_0.2.1_macos_x64_signed.dmg` · `library-manager_0.2.1_macos_x64_signed.app.zip` |
+| Linux x86_64 (64 bits) | `library-manager_0.2.2_amd64.deb` · `library-manager-0.2.2-1.x86_64.rpm` · `library-manager_0.2.2_amd64.AppImage` |
+| Windows 11 x64 | `library-manager_0.2.2_windows_x64_unsigned.msi` · `library-manager_0.2.2_windows_x64_unsigned_setup.exe` |
+| macOS 13 ou ultérieur, Apple Silicon | `library-manager_0.2.2_macos_arm64_signed.dmg` · `library-manager_0.2.2_macos_arm64_signed.app.zip` |
+| macOS 13 ou ultérieur, Intel | `library-manager_0.2.2_macos_x64_signed.dmg` · `library-manager_0.2.2_macos_x64_signed.app.zip` |
 
 Avant l’installation, vérifiez l’empreinte du téléchargement dans **SHA256SUMS**. Consultez **BUILD_MANIFEST.json** et les rapports joints à la page de livraison pour le commit source, la provenance des paquets et les contrôles réalisés. Les notes de version précisent le périmètre des essais.
 
@@ -99,13 +99,13 @@ Les paquets Linux utilisent Ubuntu 22.04, avec glibc 2.35, comme base de compila
 Debian, Ubuntu et dérivés :
 
 ```sh
-sudo apt install ./library-manager_0.2.1_amd64.deb
+sudo apt install ./library-manager_0.2.2_amd64.deb
 ```
 
 Fedora et distributions RPM :
 
 ```sh
-sudo dnf install ./library-manager-0.2.1-1.x86_64.rpm
+sudo dnf install ./library-manager-0.2.2-1.x86_64.rpm
 ```
 
 Le gestionnaire de paquets installe les bibliothèques système GTK/WebKit, leurs dépendances et le magasin de certificats TLS `ca-certificates`, nécessaire aux connexions HTTPS. Après installation, lancez **Library Manager** depuis le menu des applications. Aucun environnement Node, Python, Rust ou Calibre n’est requis.
@@ -113,14 +113,14 @@ Le gestionnaire de paquets installe les bibliothèques système GTK/WebKit, leur
 AppImage, sans installation du paquet :
 
 ```sh
-chmod +x ./library-manager_0.2.1_amd64.AppImage
-./library-manager_0.2.1_amd64.AppImage
+chmod +x ./library-manager_0.2.2_amd64.AppImage
+./library-manager_0.2.2_amd64.AppImage
 ```
 
 L’AppImage utilise les bibliothèques compatibles et le magasin de certificats du système. Son montage classique nécessite FUSE. Si FUSE n’est pas disponible, essayez le mode d’extraction et d’exécution :
 
 ```sh
-APPIMAGE_EXTRACT_AND_RUN=1 ./library-manager_0.2.1_amd64.AppImage
+APPIMAGE_EXTRACT_AND_RUN=1 ./library-manager_0.2.2_amd64.AppImage
 ```
 
 ### Windows
@@ -139,7 +139,7 @@ Consultez le rapport de notarisation correspondant à votre architecture sur la 
 
 Fermez Library Manager : la fermeture de son unique fenêtre quitte l’application, sans la laisser active dans une icône de notification. Téléchargez le nouveau paquet pour la même plateforme et la même architecture. Sous Linux ou Windows, installez-le avec le même format de paquet ; sous macOS, remplacez l’application dans **Applications**. Pour une AppImage, remplacez le fichier utilisé pour la lancer.
 
-Rouvrez l’application et vérifiez la version dans **Paramètres → À propos**, également affichée en bas de la barre latérale. Après installation du paquet 0.2.1, elle doit indiquer **0.2.1**. Cette mise à jour remplace l’application ; il n’est pas nécessaire de retirer les livres du catalogue ni de supprimer son profil local.
+Rouvrez l’application et vérifiez la version dans **Paramètres → À propos**, également affichée en bas de la barre latérale. Après installation du paquet 0.2.2, elle doit indiquer **0.2.2**. Cette mise à jour remplace l’application ; il n’est pas nécessaire de retirer les livres du catalogue ni de supprimer son profil local.
 
 Consultez le [rapport de qualité](docs/QUALITY.md) pour les vérifications effectuées et les limites des essais.
 
